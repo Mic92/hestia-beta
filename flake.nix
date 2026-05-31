@@ -41,6 +41,13 @@
         }
       );
 
+      packages = eachSystem (
+        { pkgs, ... }:
+        {
+          default = pkgs.callPackage ./nix/package.nix { };
+        }
+      );
+
       formatter = eachSystem ({ system, ... }: treefmt.${system}.config.build.wrapper);
 
       checks = eachSystem (

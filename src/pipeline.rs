@@ -228,17 +228,22 @@ impl PipelineContext {
             return Ok(stats);
         }
 
-        let current = self.load_manifest().await?;
+        let (loaded_version, loaded) = self.load_manifest_versioned().await?;
 
         // Read-your-writes (PLAN.md Decision 28): cache lookups may lag
         // behind this daemon's own commits, so fold in the manifest we are
-        // currently serving (it is at least as new as anything we wrote)
-        // and remember its version as the reservation floor.
+        // currently serving (it is at least as new as anything we wrote).
         let (known_version, known) = match &self.publish {
             Some(store) => store.versioned(),
             None => (0, Manifest::new()),
         };
-        let current = current.merge(known.clone());
+        // `current` is the basis for every dedup decision below; the commit
+        // at the end must include all of it (see the merge closure).
+        let current = loaded.merge(known);
+        // Reservation floor: never reserve at or below a version we have
+        // already seen, even when commit-time lookups regress below it
+        // (non-monotonic eventually consistent reads).
+        let floor = known_version.max(loaded_version);
 
         // Blocking sqlite I/O happens off the async runtime.
         let store = self.store.clone();
@@ -392,15 +397,21 @@ impl PipelineContext {
         let mut committed: Option<Manifest> = None;
         let version = self
             .save_mutable()
-            .save_with_floor(known_version, |existing| {
+            .save_with_floor(floor, |existing| {
                 // A corrupt base manifest is replaced, not merged with: the
                 // commit must not fail because of it (never crash CI).
                 let base = match existing {
                     Some(entry) => decode_manifest_or_empty(&entry.data),
                     None => Manifest::new(),
                 };
-                // `known` covers the gap when `existing` is a stale read.
-                let merged = base.merge(known.clone()).merge(delta.clone());
+                // `current` covers the gap when `existing` is a stale read:
+                // the commit must contain everything the dedup decisions
+                // above were based on. Merging anything less can drop a
+                // concurrent writer's paths and leave this delta's entries
+                // referencing chunks whose locations are missing (dangling,
+                // unservable, and never healed because later drains see the
+                // path as already stored).
+                let merged = base.merge(current.clone()).merge(delta.clone());
                 let encoded = merged
                     .encode()
                     .map_err(|err| GhaError::InvalidResponse(err.to_string()))?;

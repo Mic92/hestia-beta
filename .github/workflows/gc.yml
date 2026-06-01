@@ -34,14 +34,24 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
+      # With dogfood variables set, run GC with the released binary: no nix
+      # build, the nightly job takes seconds. Without them, build from
+      # source and use the action in token-capture-only mode (GC needs the
+      # cache API tokens, not the daemon).
+      - name: Install hestia (released binary)
+        if: vars.HESTIA_DOGFOOD == 'true'
+        uses: ./action
+        with:
+          version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
+          sha256: ${{ vars.HESTIA_DOGFOOD_SHA256 }}
       - name: Build hestia
+        if: vars.HESTIA_DOGFOOD != 'true'
         run: nix build .# -o hestia-bin
-      # Token-capture-only mode: GC needs the cache API tokens
-      # (ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL) but no daemon.
       - uses: ./action
+        if: vars.HESTIA_DOGFOOD != 'true'
       - name: Run garbage collection
         run: |
-          ./hestia-bin/bin/hestia gc \
+          "${HESTIA_BIN:-./hestia-bin/bin/hestia}" gc \
             ${{ inputs.dry-run && '--dry-run' || '' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}

@@ -29,9 +29,26 @@ jobs:
           - runner: ubuntu-24.04-arm
             system: aarch64-linux
     runs-on: ${{ matrix.runner }}
+    permissions:
+      # GHA cache writes when dogfooding is enabled.
+      actions: write
+      contents: read
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
+      # Cache the static toolchain and build through hestia itself (same
+      # repository variables as ci.yml). Note GHA cache scoping: a tag
+      # build READS the default branch scope but its writes land in the
+      # tag's own scope, which no later tag can see. To make releases
+      # fast, seed main's scope once by running this workflow via
+      # workflow_dispatch (dry run on main) after the nixpkgs pin or the
+      # toolchain changes.
+      - name: Start hestia cache (dogfood)
+        if: vars.HESTIA_DOGFOOD == 'true'
+        uses: ./action
+        with:
+          version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
+          sha256: ${{ matrix.system == 'aarch64-linux' && vars.HESTIA_DOGFOOD_SHA256_AARCH64 || vars.HESTIA_DOGFOOD_SHA256 }}
       - name: System diagnostics
         run: |
           uname -a

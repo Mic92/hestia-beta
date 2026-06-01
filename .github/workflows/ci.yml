@@ -20,6 +20,8 @@ jobs:
   #   HESTIA_DOGFOOD          "true"
   #   HESTIA_DOGFOOD_VERSION  release tag, e.g. "v0.1.0-alpha.1"
   #   HESTIA_DOGFOOD_SHA256   sha256 of that release's hestia-x86_64-linux
+  #   HESTIA_DOGFOOD_SHA256_AARCH64  same for hestia-aarch64-linux
+  #                           (used by release.yml's arm64 leg)
   build:
     runs-on: ubuntu-latest
     permissions:

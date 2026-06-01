@@ -1,0 +1,180 @@
+//! Regression tests for the GitHub REST client (`gha::rest`) against
+//! realistic server behavior that the friendly fake backend
+//! (`tests/support/fake_gha.rs`) does not exhibit:
+//!
+//! * GitHub's default listing order is `last_accessed_at desc`, which is
+//!   *mutable*: every cache download (by any concurrent CI job) bumps an
+//!   entry's `last_accessed_at` and reorders the listing between page
+//!   fetches. Page-numbered pagination over a reordering collection skips
+//!   and duplicates entries.
+
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::Router;
+use axum::extract::{Query, State};
+use axum::response::Json;
+use axum::routing::get;
+use serde_json::json;
+
+use hestia::gha::rest::{RestClient, format_timestamp};
+
+const TEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone)]
+struct Entry {
+    key: String,
+    created_at: u64,
+    last_accessed_at: u64,
+}
+
+/// A GitHub-like cache listing endpoint: honors `key`, `page`, `per_page`,
+/// `sort` and `direction` query parameters with GitHub's documented
+/// defaults (`sort=last_accessed_at`, `direction=desc`).
+struct GitHubLike {
+    entries: Vec<Entry>,
+    /// When true, a concurrent download bumps the least-recently-used
+    /// entry's `last_accessed_at` after every list request (the LRU
+    /// reordering a busy repository exhibits while GC paginates).
+    concurrent_downloads: bool,
+}
+
+impl GitHubLike {
+    fn bump_least_recently_used(&mut self) {
+        let Some(max) = self.entries.iter().map(|e| e.last_accessed_at).max() else {
+            return;
+        };
+        if let Some(entry) = self.entries.iter_mut().min_by_key(|e| e.last_accessed_at) {
+            entry.last_accessed_at = max + 1;
+        }
+    }
+}
+
+async fn list_handler(
+    State(state): State<Arc<Mutex<GitHubLike>>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let mut inner = state.lock().unwrap();
+
+    let key_prefix = params.get("key").cloned().unwrap_or_default();
+    let per_page: usize = params
+        .get("per_page")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let page: usize = params.get("page").and_then(|v| v.parse().ok()).unwrap_or(1);
+    // GitHub's documented defaults for this endpoint.
+    let sort = params
+        .get("sort")
+        .cloned()
+        .unwrap_or_else(|| "last_accessed_at".to_string());
+    let direction = params
+        .get("direction")
+        .cloned()
+        .unwrap_or_else(|| "desc".to_string());
+
+    let mut matching: Vec<Entry> = inner
+        .entries
+        .iter()
+        .filter(|e| e.key.starts_with(key_prefix.as_str()))
+        .cloned()
+        .collect();
+    matching.sort_by_key(|e| match sort.as_str() {
+        "created_at" => e.created_at,
+        _ => e.last_accessed_at,
+    });
+    if direction == "desc" {
+        matching.reverse();
+    }
+
+    let page_entries: Vec<serde_json::Value> = matching
+        .iter()
+        .skip((page - 1) * per_page)
+        .take(per_page)
+        .enumerate()
+        .map(|(i, e)| {
+            json!({
+                "id": i,
+                "ref": "refs/heads/main",
+                "key": e.key,
+                "version": "v",
+                "created_at": format_timestamp(e.created_at),
+                "last_accessed_at": format_timestamp(e.last_accessed_at),
+                "size_in_bytes": 1,
+            })
+        })
+        .collect();
+
+    // Simulate concurrent CI jobs downloading packs while we paginate:
+    // every download bumps last_accessed_at, reordering the default
+    // listing between this page fetch and the next one.
+    if inner.concurrent_downloads {
+        inner.bump_least_recently_used();
+    }
+
+    Json(json!({
+        "total_count": matching.len(),
+        "actions_caches": page_entries,
+    }))
+}
+
+async fn start_server(router: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub listener");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn start_github_like(entries: Vec<Entry>, concurrent_downloads: bool) -> String {
+    let state = Arc::new(Mutex::new(GitHubLike {
+        entries,
+        concurrent_downloads,
+    }));
+    let router = Router::new()
+        .route("/repos/{owner}/{repo}/actions/caches", get(list_handler))
+        .with_state(state);
+    start_server(router).await
+}
+
+#[tokio::test]
+async fn pagination_returns_every_entry_despite_concurrent_lru_reordering() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        // 250 entries → 3 pages at the client's page size. Each entry has a
+        // distinct creation and access time.
+        let entries: Vec<Entry> = (0..250u64)
+            .map(|i| Entry {
+                key: format!("pack-{i:03}"),
+                created_at: 1_000 + i,
+                last_accessed_at: 1_000_000 + i,
+            })
+            .collect();
+        let expected: BTreeSet<String> = entries.iter().map(|e| e.key.clone()).collect();
+
+        let url = start_github_like(entries, true).await;
+        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token");
+
+        let listed = rest.list_caches("pack-").await.unwrap();
+        let unique: BTreeSet<String> = listed.iter().map(|e| e.key.clone()).collect();
+
+        // Every entry must be listed exactly once: GC treats packs missing
+        // from this listing as evicted and drops the paths that reference
+        // them, so a skipped entry means losing live data.
+        let missing: Vec<&String> = expected.difference(&unique).collect();
+        assert!(
+            missing.is_empty(),
+            "pagination skipped {} entries: {missing:?}",
+            missing.len()
+        );
+        assert_eq!(
+            listed.len(),
+            expected.len(),
+            "pagination duplicated entries"
+        );
+    })
+    .await
+    .expect("test timed out");
+}

@@ -231,6 +231,13 @@ impl RestClient {
 
     /// List all cache entries whose key starts with `key_prefix`
     /// (empty prefix lists everything). Follows pagination.
+    ///
+    /// Pages are requested sorted by `created_at` ascending: GitHub's
+    /// default order (`last_accessed_at` descending) is mutable — every
+    /// cache download by any concurrent CI job bumps an entry's
+    /// `last_accessed_at` and reorders the listing between page fetches,
+    /// which makes page-numbered pagination skip and duplicate entries.
+    /// `created_at` never changes, so the page boundaries stay stable.
     pub async fn list_caches(&self, key_prefix: &str) -> Result<Vec<CacheEntry>, Error> {
         let url = self.caches_url();
         let mut entries = Vec::new();
@@ -239,6 +246,8 @@ impl RestClient {
             let mut request = self.request(reqwest::Method::GET, &url).query(&[
                 ("per_page", PER_PAGE.to_string()),
                 ("page", page.to_string()),
+                ("sort", "created_at".to_string()),
+                ("direction", "asc".to_string()),
             ]);
             if !key_prefix.is_empty() {
                 request = request.query(&[("key", key_prefix)]);

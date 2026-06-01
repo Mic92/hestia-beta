@@ -7,7 +7,7 @@
 //!   `ACTIONS_RESULTS_URL`. Only available inside Actions jobs.
 //! * **Azure blob** ([`blob`]): the actual data transfer. The Twirp API hands
 //!   out pre-signed SAS URLs; uploads/downloads are plain `PUT`/`GET`.
-//! * **GitHub REST** ([`rest`]): list / usage / delete, authenticated with
+//! * **GitHub REST** ([`rest`]): list / delete, authenticated with
 //!   `GITHUB_TOKEN`. Used by `hestia gc`.
 
 pub mod blob;

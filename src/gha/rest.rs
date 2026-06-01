@@ -1,12 +1,11 @@
 //! GitHub REST API client for Actions cache management.
 //!
 //! Used by `hestia gc`: unlike the Twirp API (runtime token, job-scoped),
-//! the REST API is authenticated with `GITHUB_TOKEN` and can list, inspect
-//! and **delete** cache entries:
+//! the REST API is authenticated with `GITHUB_TOKEN` and can list and
+//! **delete** cache entries:
 //!
 //! ```text
 //! GET    /repos/{repo}/actions/caches?key={prefix}&per_page=&page=
-//! GET    /repos/{repo}/actions/cache/usage
 //! DELETE /repos/{repo}/actions/caches?key={key}
 //! ```
 //!
@@ -33,16 +32,12 @@ fn caches_url(api_url: &str, repo: &str) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Timestamps
-//
 // The REST API reports `created_at` / `last_accessed_at` as RFC 3339 UTC
 // strings ("2019-01-24T22:45:36.000Z"). GC compares them against unix-second
 // clocks, so both directions of the conversion live here (the fake GHA
 // backend uses the formatter so tests exercise the same parser as
 // production). Calendar math follows Howard Hinnant's civil-date algorithms;
 // no chrono/time dependency needed for one fixed format.
-// ---------------------------------------------------------------------------
 
 /// Days since 1970-01-01 for a proleptic Gregorian calendar date.
 fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {

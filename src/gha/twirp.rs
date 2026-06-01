@@ -27,7 +27,6 @@ pub const CACHE_VERSION: &str = "7a32118639289175533829e84c9aaa9fa781f6a5f1b18a9
 
 const SERVICE_PATH: &str = "twirp/github.actions.results.api.v1.CacheService";
 
-/// Build the full URL for one Twirp RPC method.
 fn rpc_url(base_url: &str, method: &str) -> String {
     format!("{}/{SERVICE_PATH}/{method}", base_url.trim_end_matches('/'))
 }

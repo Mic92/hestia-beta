@@ -17,7 +17,7 @@ pub use harmonia_store_path::{StorePath, StorePathHash};
 
 /// Window inside which two root updates are considered concurrent and get
 /// unioned instead of newest-wins (10 minutes).
-pub const ROOT_UNION_WINDOW_SECS: u64 = 600;
+const ROOT_UNION_WINDOW_SECS: u64 = 600;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -98,23 +98,6 @@ impl<'de> Deserialize<'de> for Hash32 {
                 let array: [u8; 32] = v
                     .try_into()
                     .map_err(|_| E::invalid_length(v.len(), &self))?;
-                Ok(Hash32(array))
-            }
-
-            // Accept sequences too (e.g. JSON arrays in debugging tools).
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<Hash32, A::Error> {
-                let mut array = [0u8; 32];
-                for (i, slot) in array.iter_mut().enumerate() {
-                    *slot = seq
-                        .next_element()?
-                        .ok_or_else(|| A::Error::invalid_length(i, &self))?;
-                }
-                if seq.next_element::<u8>()?.is_some() {
-                    return Err(A::Error::invalid_length(33, &self));
-                }
                 Ok(Hash32(array))
             }
         }
@@ -270,15 +253,10 @@ pub struct Manifest {
 // so the result does not depend on who wins the race.
 
 impl PathEntry {
-    /// The manifest key this entry should be stored under.
-    pub fn path_hash(&self) -> PathHash {
-        PathHash::from_store_path(&self.store_path)
-    }
-
     /// Manifest keys of all referenced paths (used by the reachability
     /// walk; upstream references resolve to keys not present in the
     /// manifest, which the walk treats as holes).
-    pub fn reference_hashes(&self) -> impl Iterator<Item = PathHash> + '_ {
+    fn reference_hashes(&self) -> impl Iterator<Item = PathHash> + '_ {
         self.references.iter().map(PathHash::from_store_path)
     }
 

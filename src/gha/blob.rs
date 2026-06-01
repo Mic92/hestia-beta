@@ -17,10 +17,10 @@ use bytes::Bytes;
 use crate::gha::Error;
 
 /// `x-ms-blob-type` header value for single-shot uploads.
-pub const BLOB_TYPE: &str = "BlockBlob";
+const BLOB_TYPE: &str = "BlockBlob";
 
 /// Azure storage API version header (matches what actions/toolkit sends).
-pub const API_VERSION: &str = "2020-04-08";
+const API_VERSION: &str = "2020-04-08";
 
 /// Format a half-open byte range as an HTTP `Range` header value
 /// (inclusive on both ends per RFC 9110).

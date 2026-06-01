@@ -12,12 +12,12 @@
 //!
 //! The workflow needs `permissions: actions: write` for deletion.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::gha::Error;
 
-/// Default GitHub API endpoint; overridable for tests and GHES.
-pub const DEFAULT_API_URL: &str = "https://api.github.com";
+/// Default GitHub API endpoint; `GITHUB_API_URL` overrides it (GHES).
+const DEFAULT_API_URL: &str = "https://api.github.com";
 
 pub const ENV_GITHUB_TOKEN: &str = "GITHUB_TOKEN";
 pub const ENV_GITHUB_REPOSITORY: &str = "GITHUB_REPOSITORY";
@@ -131,14 +131,9 @@ pub fn format_timestamp(seconds: u64) -> String {
 ///
 /// `last_accessed_at` is the LRU clock: downloads through the Twirp/Azure
 /// path bump it, which is what makes 1-byte Range reads work as GC touches.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CacheEntry {
-    pub id: u64,
-    #[serde(rename = "ref", default)]
-    pub git_ref: String,
     pub key: String,
-    #[serde(default)]
-    pub version: String,
     #[serde(default)]
     pub last_accessed_at: String,
     #[serde(default)]
@@ -159,7 +154,7 @@ impl CacheEntry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CacheList {
     pub total_count: u64,
     #[serde(default)]
@@ -358,7 +353,6 @@ mod tests {
         let list: CacheList = serde_json::from_str(json).unwrap();
         assert_eq!(list.total_count, 1);
         assert_eq!(list.actions_caches[0].key, "pack-abc123");
-        assert_eq!(list.actions_caches[0].git_ref, "refs/heads/main");
         assert_eq!(list.actions_caches[0].size_in_bytes, 1024);
     }
 }

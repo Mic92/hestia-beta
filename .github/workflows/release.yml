@@ -31,47 +31,44 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
-      # The hosted runners (especially arm64) have little free disk; the
-      # musl cross toolchain plus the cargo build fills the root filesystem
-      # and the runner agent dies with "received a shutdown signal".
-      # Removing preinstalled toolchains we never use frees several GB.
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /usr/local/share/boost /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
-            "$AGENT_TOOLSDIRECTORY" || true
-      # Swap absorbs rustc memory spikes that previously OOM-killed the
-      # 16 GB runner VMs. zram is compressed RAM-backed swap: unlike a disk
-      # swapfile it costs zero disk space (an 8 GB /swapfile made the
-      # disk-exhaustion failure above strictly worse).
-      - name: Enable zram swap
-        run: |
-          # The Azure kernels on hosted runners do not ship zram in the
-          # default modules package; it lives in linux-modules-extra.
-          if ! sudo modprobe zram; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)"
-            sudo modprobe zram
-          fi
-          echo 8G | sudo tee /sys/block/zram0/disksize
-          sudo mkswap /dev/zram0
-          sudo swapon -p 100 /dev/zram0
       - uses: NixOS/nix-installer-action@main
-      - name: Resource diagnostics
+      - name: System diagnostics
         run: |
-          df -h
+          uname -a
+          nproc
           free -h
-          swapon --show
+          swapon --show || true
+          df -h
       - name: Build static binary
+        # The arm64 runner has died with "The runner has received a
+        # shutdown signal" in every release run so far: 60-130s after job
+        # start, across three Azure regions (eastus2, westus2, westus3),
+        # once even before any build had started. Stream kernel messages,
+        # memory/disk headroom, and Azure scheduled events (IMDS) during
+        # the build, so the next death shows whether the cause is OOM,
+        # disk exhaustion, or VM preemption.
         run: |
-          # Background monitor: if the runner dies mid-build, the last
-          # samples in the log show whether disk or memory ran out.
-          (while true; do
-            echo "--- monitor $(date -u +%T) ---"; df -h /; free -m
-            sleep 15
-          done) &
-          trap 'kill %1' EXIT
-          nix build .#static --cores 2
+          sudo dmesg --follow --nopager 2>/dev/null | sed 's/^/[dmesg] /' &
+          (
+            while true; do
+              mem=$(awk '/MemAvailable/{printf "%.1f", $2/1048576}' /proc/meminfo)
+              disk=$(df -BG --output=avail / | tail -1 | tr -d ' G')
+              load=$(cut -d' ' -f1-3 /proc/loadavg)
+              echo "[monitor $(date -u +%H:%M:%S)] mem_avail=${mem}G disk_avail=${disk}G load=${load}"
+              # Azure maintenance/preemption notice for this VM, if any.
+              ev=$(curl -sf --max-time 2 -H Metadata:true \
+                "http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01" || true)
+              case "$ev" in
+                "" | *'"Events":[]'*) ;;
+                *) echo "[monitor] AZURE SCHEDULED EVENT: $ev" ;;
+              esac
+              sleep 10
+            done
+          ) &
+          # Background monitors hold stdout open; kill them when the build
+          # exits or the step would hang forever.
+          trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
+          nix build .#static
       - name: Prepare release asset
         run: |
           set -euo pipefail

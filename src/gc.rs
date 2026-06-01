@@ -58,10 +58,6 @@ pub enum Error {
     Chunker(#[from] chunker::Error),
 }
 
-// ---------------------------------------------------------------------------
-// Policy
-// ---------------------------------------------------------------------------
-
 /// GC policy knobs (defaults from PLAN.md / the handoff design).
 #[derive(Debug, Clone)]
 pub struct GcPolicy {
@@ -101,10 +97,6 @@ impl Default for GcPolicy {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Observations (REST list of "pack-*")
-// ---------------------------------------------------------------------------
-
 /// Parse a `pack-<sha256 hex>` cache key back into the pack hash.
 pub fn parse_pack_key(key: &str) -> Option<PackHash> {
     let hex = key.strip_prefix("pack-")?;
@@ -142,10 +134,6 @@ impl PackObservation {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Plan
-// ---------------------------------------------------------------------------
 
 /// One chunk to copy out of a source pack during repack.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,7 +313,7 @@ pub fn plan(
         .filter_map(|observation| observation.pack.map(|pack| (pack, observation)))
         .collect();
 
-    // ---- ① Reconcile: packs GitHub already evicted -------------------------
+    // ① Reconcile: packs GitHub already evicted
     // Packs younger than min_age are never judged evicted: they may have been
     // uploaded after the REST listing was taken (concurrent push).
     plan.evicted_packs = work
@@ -346,7 +334,7 @@ pub fn plan(
         work.paths.remove(path);
     }
 
-    // ---- ③a Sweep expired roots (before mark: dead roots must not mark) ----
+    // ③a Sweep expired roots (before mark: dead roots must not mark)
     plan.drop_roots = work
         .roots
         .iter()
@@ -357,7 +345,7 @@ pub fn plan(
         work.roots.remove(key);
     }
 
-    // ---- ② Mark + ③b sweep paths -------------------------------------------
+    // ② Mark + ③b sweep paths
     let reachable = work.reachable();
     plan.drop_paths = work
         .paths
@@ -373,7 +361,7 @@ pub fn plan(
         work.paths.remove(path);
     }
 
-    // ---- ④ Pack liveness ----------------------------------------------------
+    // ④ Pack liveness
     let live_chunks = referenced_chunks(&work);
     let mut stats: BTreeMap<PackHash, PackStats> = work
         .packs
@@ -437,7 +425,7 @@ pub fn plan(
         }
     }
 
-    // ---- ④b Repack jobs, split by output tier -------------------------------
+    // ④b Repack jobs, split by output tier
     let mut copies: Vec<ChunkCopy> = repack_sources
         .iter()
         .flat_map(|pack| stats[pack].live.iter().cloned())
@@ -466,7 +454,7 @@ pub fn plan(
         .collect();
     plan.delete_packs.sort();
 
-    // ---- ④c Touch: referenced packs going idle ------------------------------
+    // ④c Touch: referenced packs going idle
     // Anything we keep referencing must not fall victim to the 7-day-idle
     // eviction. Touch least valuable first so the most valuable packs end up
     // most recently used (evicted last under quota pressure).
@@ -484,7 +472,7 @@ pub fn plan(
     touch.sort();
     plan.touch_packs = touch.into_iter().map(|(_, _, pack)| pack).collect();
 
-    // ---- Orphans: in GitHub but in no manifest -------------------------------
+    // Orphans: in GitHub but in no manifest
     plan.orphan_keys = observations
         .iter()
         .filter(|observation| {
@@ -499,10 +487,6 @@ pub fn plan(
 
     plan
 }
-
-// ---------------------------------------------------------------------------
-// Apply: plan (+ executed repacks) → manifest to commit
-// ---------------------------------------------------------------------------
 
 /// Result of executing a plan's repack jobs.
 #[derive(Debug, Clone, Default)]
@@ -591,10 +575,6 @@ pub fn apply(
 
     (manifest, deletable)
 }
-
-// ---------------------------------------------------------------------------
-// Execute
-// ---------------------------------------------------------------------------
 
 /// Filter orphan keys: anything the committed manifest references is not an
 /// orphan, no matter what the pre-commit plan thought. Without this, a GC
@@ -1001,10 +981,6 @@ impl GcContext {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CLI entry point
-// ---------------------------------------------------------------------------
-
 pub async fn run(args: &GcArgs) -> ExitCode {
     let http = reqwest::Client::new();
     let twirp = match TwirpClient::from_env(http.clone()) {
@@ -1059,10 +1035,6 @@ pub async fn run(args: &GcArgs) -> ExitCode {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1223,10 +1195,6 @@ mod tests {
         assert_eq!(parse_pack_key(&format!("pack-{}", "0".repeat(63))), None);
     }
 
-    // -----------------------------------------------------------------------
-    // Mark / sweep
-    // -----------------------------------------------------------------------
-
     #[test]
     fn expired_roots_are_dropped() {
         let manifest = ManifestBuilder::new()
@@ -1306,10 +1274,6 @@ mod tests {
         assert_eq!(plan.delete_packs, vec![pack_hash(1)]);
     }
 
-    // -----------------------------------------------------------------------
-    // Reconcile (eviction healing)
-    // -----------------------------------------------------------------------
-
     #[test]
     fn evicted_packs_drop_their_paths() {
         let old = NOW - 10 * SECS_PER_DAY;
@@ -1359,10 +1323,6 @@ mod tests {
         assert!(plan.evicted_packs.is_empty());
         assert!(plan.heal_paths.is_empty());
     }
-
-    // -----------------------------------------------------------------------
-    // Repack / touch / liveness
-    // -----------------------------------------------------------------------
 
     #[test]
     fn mostly_dead_pack_is_repacked() {
@@ -1569,10 +1529,6 @@ mod tests {
         };
         assert_eq!(plan, noop, "{}", plan.summary());
     }
-
-    // -----------------------------------------------------------------------
-    // Apply
-    // -----------------------------------------------------------------------
 
     /// Fake repack execution: pretend every copy landed in a new pack.
     fn fake_repack_output(plan: &GcPlan) -> RepackOutput {

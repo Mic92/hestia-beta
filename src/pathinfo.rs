@@ -80,7 +80,6 @@ pub enum Lookup {
     Malformed { reason: String },
 }
 
-/// Convert harmonia's database record into hestia's [`PathInfo`].
 fn convert(path: StorePath, info: UnkeyedValidPathInfo) -> PathInfo {
     PathInfo {
         nar_hash: Hash32(

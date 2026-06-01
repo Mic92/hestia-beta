@@ -42,10 +42,9 @@ use crate::manifest::{
 };
 use crate::pipeline::AccessLog;
 
-/// Substituter priority advertised in /nix-cache-info. Lower wins; 30 places
-/// hestia behind cache.nixos.org (40 is the default for http caches, 30 for
-/// the local hestia cache so locally-built paths are preferred over a slow
-/// rebuild but upstream still serves what it has).
+/// Priority advertised in /nix-cache-info. Lower wins: 30 puts hestia ahead
+/// of cache.nixos.org (40), so Nix asks the local cache first and only falls
+/// through to upstream on a miss.
 const PRIORITY: u32 = 30;
 
 /// How long a signed pack download URL is reused before asking Twirp for a
@@ -61,10 +60,6 @@ const CHUNK_CACHE_BUDGET: usize = 256 * 1024 * 1024;
 /// (connection drop, timeout, 5xx) before the whole NAR request gives up
 /// and returns 404.
 const TRANSIENT_READ_RETRIES: u32 = 2;
-
-// ---------------------------------------------------------------------------
-// Shared manifest slot
-// ---------------------------------------------------------------------------
 
 /// One manifest version plus the indexes the substituter needs.
 #[derive(Default)]
@@ -136,10 +131,6 @@ impl ManifestStore {
         self.view().manifest.paths.len()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Chunk fetching
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
 enum FetchError {
@@ -387,10 +378,6 @@ impl ChunkFetcher {
         Ok(fetched)
     }
 }
-
-// ---------------------------------------------------------------------------
-// HTTP server
-// ---------------------------------------------------------------------------
 
 /// Callback invoked on every substituter request (the daemon uses it to
 /// reset its idle-exit timer: an actively substituting Nix counts as

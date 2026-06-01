@@ -47,10 +47,6 @@ pub enum Error {
     PathInfo(#[from] PathInfoError),
 }
 
-// ---------------------------------------------------------------------------
-// Access log (substituter integration point, populated from Phase 4 on)
-// ---------------------------------------------------------------------------
-
 /// Shared record of paths served through the substituter.
 ///
 /// narinfo hits double as the liveness signal: an accessed path joins this
@@ -83,10 +79,6 @@ impl AccessLog {
         self.inner.lock().expect("access log lock poisoned").clone()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Environment detection
-// ---------------------------------------------------------------------------
 
 /// The Nix system string for the machine hestia runs on
 /// (`x86_64-linux`, `aarch64-darwin`, …).
@@ -133,11 +125,8 @@ pub fn decode_manifest_or_empty(data: &[u8]) -> Manifest {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pack upload (shared by the write pipeline and GC repack)
-// ---------------------------------------------------------------------------
-
-/// Upload one pack blob (Twirp reserve → Azure PUT → finalize). Returns
+/// Upload one pack blob (Twirp reserve → Azure PUT → finalize); shared by
+/// the write pipeline and GC repack. Returns
 /// `false` when the cache already has it: pack keys are content-addressed,
 /// so an existing entry is guaranteed to hold identical content.
 pub async fn upload_pack(
@@ -168,10 +157,6 @@ pub async fn upload_pack(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Pipeline
-// ---------------------------------------------------------------------------
 
 /// Everything the pipeline needs to talk to the world.
 pub struct PipelineContext {
@@ -255,13 +240,12 @@ impl PipelineContext {
         };
         let current = current.merge(known.clone());
 
-        // ---- query the store database (blocking sqlite I/O) -----------------
+        // Blocking sqlite I/O happens off the async runtime.
         let store = self.store.clone();
         let lookups = tokio::task::spawn_blocking(move || store.query_batch(paths))
             .await
             .expect("store database query task panicked")?;
 
-        // ---- classify paths -------------------------------------------------
         let mut root_paths: BTreeSet<PathHash> = accessed;
         // Existing entries whose last_pushed clock gets bumped (dedup-skips).
         let mut bumped: BTreeMap<PathHash, PathEntry> = BTreeMap::new();
@@ -304,7 +288,6 @@ impl PipelineContext {
             to_push.push((path, info));
         }
 
-        // ---- chunk + verify new paths ---------------------------------------
         let mut prepared: Vec<PreparedPath> = Vec::new();
         // Chunks of earlier prepared paths in this batch (cross-path dedup).
         let mut batch_chunks: BTreeSet<crate::manifest::ChunkHash> = BTreeSet::new();
@@ -353,7 +336,6 @@ impl PipelineContext {
             });
         }
 
-        // ---- build + upload the pack -----------------------------------------
         let mut delta = Manifest::new();
 
         let mut builder = PackBuilder::new();
@@ -386,7 +368,6 @@ impl PipelineContext {
             );
         }
 
-        // ---- assemble the manifest delta -------------------------------------
         for path in prepared {
             stats.pushed += 1;
             delta.paths.insert(path.hash, path.entry);
@@ -406,7 +387,6 @@ impl PipelineContext {
             },
         );
 
-        // ---- commit (re-merge on conflict) ------------------------------------
         // The merge closure keeps the manifest it encoded so the committed
         // version can be published without re-loading it from the cache.
         let mut committed: Option<Manifest> = None;

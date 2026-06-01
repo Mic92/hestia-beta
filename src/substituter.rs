@@ -557,6 +557,12 @@ async fn nar(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    // A NAR download is an access (the GC liveness signal), just like a
+    // narinfo hit. Nix caches narinfo lookups locally and may fetch a NAR
+    // without re-requesting the narinfo, so recording only narinfo hits
+    // would let GC collect paths that are actively being substituted.
+    state.access_log.record(path_hash);
+
     // Fetch all chunks; any failure means 404 (Nix rebuilds or falls
     // through), never partial data.
     let chunks = match state

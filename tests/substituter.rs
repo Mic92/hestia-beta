@@ -836,6 +836,51 @@ async fn transient_blob_failure_is_retried_transparently() {
 }
 
 #[tokio::test]
+async fn nar_downloads_record_access_without_a_narinfo_hit() {
+    timed(async {
+        // Nix caches positive narinfo lookups on disk
+        // (~/.cache/nix/binary-cache-v6.sqlite) and may fetch a NAR without
+        // re-requesting the narinfo. A NAR download is the strongest
+        // possible evidence a path is in use, so it must be recorded in the
+        // access log (the GC liveness signal) just like a narinfo hit --
+        // otherwise an actively substituted path never joins the root and
+        // can be garbage collected out from under its users.
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        let fixture = store.add_fixture("nar-access", 149);
+
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
+        let substituter = RunningSubstituter::start(&fake, &http, &store).await;
+
+        let path_hash = path_hash_of(&fixture);
+        let entry = &manifest.paths[&path_hash];
+
+        // Fetch the NAR directly, both with and without the ?hash= parameter
+        // a narinfo URL would carry. No narinfo request is ever made.
+        for nar_url in [
+            format!("nar/{}.nar?hash={}", entry.nar_hash.to_hex(), path_hash),
+            format!("nar/{}.nar", entry.nar_hash.to_hex()),
+        ] {
+            let response = substituter.get(&http, &nar_url).await;
+            assert_eq!(response.status(), 200);
+            assert_eq!(
+                Hash32::digest(response.bytes().await.unwrap()),
+                entry.nar_hash
+            );
+        }
+
+        assert!(
+            substituter.access_log.snapshot().contains(&path_hash),
+            "a served NAR must be recorded as an access (GC liveness signal)"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn persistent_blob_failures_yield_404_then_recover() {
     timed(async {
         // When Azure keeps dropping connections (outage), the NAR request

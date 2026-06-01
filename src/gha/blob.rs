@@ -72,6 +72,14 @@ pub async fn put(http: &reqwest::Client, url: &str, data: Bytes) -> Result<(), E
 }
 
 /// Download a blob (or a byte range of it) from a pre-signed Azure URL.
+///
+/// When `range` is given, the response is validated to actually be that
+/// range: the server must answer `206 Partial Content` with exactly
+/// `range.end - range.start` bytes. Anything else (a server/proxy that
+/// ignores `Range` and sends the whole blob with `200 OK`, or a blob that
+/// is shorter than the caller believes) is an error — callers slice the
+/// returned buffer at offsets relative to `range.start`, so handing them
+/// different bytes silently corrupts every chunk they extract.
 pub async fn get(
     http: &reqwest::Client,
     url: &str,
@@ -82,11 +90,33 @@ pub async fn get(
         request = request.header(reqwest::header::RANGE, format_range(range));
     }
     let response = request.send().await?;
-    if response.status().is_success() {
-        Ok(response.bytes().await?)
-    } else {
-        Err(status_error(url, response).await)
+    let status = response.status();
+    if !status.is_success() {
+        return Err(status_error(url, response).await);
     }
+    let Some(range) = range else {
+        return Ok(response.bytes().await?);
+    };
+    if status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(Error::InvalidResponse(format!(
+            "range request bytes {}..{} to {url} got HTTP {} instead of 206 Partial Content; \
+             refusing to treat the response as the requested range",
+            range.start,
+            range.end,
+            status.as_u16(),
+        )));
+    }
+    let body = response.bytes().await?;
+    let expected = range.end.saturating_sub(range.start);
+    if body.len() as u64 != expected {
+        return Err(Error::InvalidResponse(format!(
+            "range request bytes {}..{} to {url} returned {} bytes instead of {expected}",
+            range.start,
+            range.end,
+            body.len(),
+        )));
+    }
+    Ok(body)
 }
 
 /// Like [`put`], but when the SAS URL has expired (401/403), ask `refresh`

@@ -16,6 +16,9 @@ permissions:
 jobs:
   build:
     strategy:
+      # One architecture failing should not cancel the other; partial
+      # results make failures easier to debug.
+      fail-fast: false
       matrix:
         include:
           - runner: ubuntu-latest
@@ -26,16 +29,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
-      # The hosted runners have 16 GB RAM and no swap; parallel rustc
+      # The arm64 hosted runners have 16 GB RAM and no swap; parallel rustc
       # invocations during the static build have OOM-killed the runner VM
       # (it reports "received a shutdown signal" mid-build). Swap turns the
-      # spike into slowdown instead of a dead runner.
+      # spike into slowdown instead of a dead runner. The x86_64 runners
+      # already ship a /swapfile, so use a separate path and keep the step
+      # idempotent.
       - name: Add swap
         run: |
-          sudo fallocate -l 8G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo fallocate -l 8G /swapfile-hestia
+          sudo chmod 600 /swapfile-hestia
+          sudo mkswap /swapfile-hestia
+          sudo swapon /swapfile-hestia
       - name: Build static binary
         run: nix build .#static
       - name: Prepare release asset

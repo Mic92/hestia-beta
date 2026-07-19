@@ -159,6 +159,56 @@ async fn closure_expansion_pushes_dependencies() {
 }
 
 #[tokio::test]
+async fn registered_drv_is_pushed_with_its_input_closure() {
+    // Eval-only jobs register .drv paths from nix-eval-jobs via
+    // `hestia hook`; the drain must cache the drv plus its input closure
+    // so build jobs can run `nix build /nix/store/<hash>-x.drv^*`.
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let drv = store.instantiate_drv("eval-only");
+
+    // Oracle: the drv's registered references (input drv + source).
+    let references = match store
+        .database()
+        .query(&drv.to_string_lossy())
+        .expect("store database query failed")
+    {
+        hestia::pathinfo::Lookup::Found(info) => info.references,
+        other => panic!("drv must be valid in the store database, got {other:?}"),
+    };
+    assert!(
+        references.len() >= 2,
+        "drv must reference its input drv and input source, got {references:?}"
+    );
+
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let ctx = context(&fake, &http, store.database());
+
+    let stats = ctx
+        .run(to_path_set(&[&drv]), BTreeSet::new(), now_unix())
+        .await
+        .expect("pipeline run failed");
+
+    assert_eq!(stats.paths_received, 1);
+    assert_eq!(stats.pushed as usize, 1 + references.len());
+
+    let (_, manifest) = committed_manifest(&fake, &http)
+        .await
+        .expect("manifest committed");
+    assert!(manifest.paths.contains_key(&path_hash_of(&drv)));
+    for reference in &references {
+        let path = store.store_dir_path().join(reference.to_string());
+        assert!(
+            manifest.paths.contains_key(&path_hash_of(&path)),
+            "input {reference} must be cached"
+        );
+    }
+    assert_all_chunks_locatable(&manifest);
+}
+
+#[tokio::test]
 async fn no_closure_pushes_only_hooked_paths() {
     let Some(store) = ScratchStore::create() else {
         return;

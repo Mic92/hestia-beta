@@ -193,6 +193,43 @@ impl ScratchStore {
         (top, dep)
     }
 
+    /// Instantiate (not build) a derivation whose `.drv` references an
+    /// input derivation and an input source, like an eval-only
+    /// nix-eval-jobs run leaves behind. Returns the `.drv` store path.
+    pub fn instantiate_drv(&self, label: &str) -> PathBuf {
+        let expr = format!(
+            r#"let
+                 dep = derivation {{
+                   name = "{label}-dep";
+                   system = "x86_64-linux";
+                   builder = "/bin/sh";
+                   args = [ "-c" "echo dep > $out" ];
+                 }};
+                 src = builtins.toFile "{label}-src" "source for {label}";
+               in derivation {{
+                 name = "{label}";
+                 system = "x86_64-linux";
+                 builder = "/bin/sh";
+                 args = [ "-c" "cat ${{src}} > $out" ];
+                 inherit dep;
+               }}"#
+        );
+        let output = Command::new("nix-instantiate")
+            .arg("--store")
+            .arg(self.store_uri())
+            .args(["--expr", &expr])
+            .output()
+            .expect("running nix-instantiate failed");
+        assert!(
+            output.status.success(),
+            "nix-instantiate failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Newer nix appends a `!<output>` suffix; strip it.
+        let drv = String::from_utf8(output.stdout).unwrap();
+        PathBuf::from(drv.trim().split('!').next().unwrap())
+    }
+
     /// Sign a store path with a freshly generated key of the given name.
     /// Used to simulate upstream (cache.nixos.org) signatures hermetically.
     pub fn sign_path(&self, path: &Path, key_name: &str) {

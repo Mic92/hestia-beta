@@ -793,12 +793,36 @@ async fn assemble_verified_nar(
 /// (nix's `exportMagic`).
 const EXPORT_MAGIC: u64 = 0x4558494e;
 
-/// How many paths of a closure export share one chunk-fetch batch. Batching
-/// across paths matters: a drv closure is thousands of tiny paths whose
-/// chunks sit next to each other in the same packs, so per-path fetches
-/// would issue thousands of small Range requests where a batch needs a
-/// handful of large ones.
-const CLOSURE_EXPORT_WINDOW: usize = 64;
+/// NAR-byte budget of one closure-export window (one chunk-fetch batch).
+/// Batching across paths matters: a drv closure is thousands of tiny paths
+/// whose chunks sit next to each other in the same packs, so small batches
+/// issue thousands of latency-bound Range requests where a large one needs
+/// a handful. Sizing by bytes instead of path count keeps the peak memory
+/// (assembled frames plus their chunks, times the stream lookahead of 2)
+/// bounded regardless of how the closure splits into tiny and huge paths.
+const CLOSURE_EXPORT_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Split a closure into windows of roughly [`CLOSURE_EXPORT_WINDOW_BYTES`]
+/// of NAR data, keeping the closure order (a path bigger than the budget
+/// gets its own window).
+fn export_windows(manifest: &Manifest, order: &[PathHash]) -> Vec<Vec<PathHash>> {
+    let mut windows = Vec::new();
+    let mut window = Vec::new();
+    let mut window_bytes = 0u64;
+    for &path_hash in order {
+        let nar_size = manifest.paths[&path_hash].nar_size;
+        if !window.is_empty() && window_bytes + nar_size > CLOSURE_EXPORT_WINDOW_BYTES {
+            windows.push(std::mem::take(&mut window));
+            window_bytes = 0;
+        }
+        window.push(path_hash);
+        window_bytes += nar_size;
+    }
+    if !window.is_empty() {
+        windows.push(window);
+    }
+    windows
+}
 
 /// Append a u64 in Nix wire format (8-byte little endian).
 fn export_u64(out: &mut Vec<u8>, value: u64) {
@@ -936,10 +960,7 @@ async fn closure(State(state): State<Arc<Substituter>>, Path(hashes): Path<Strin
     // mid-transfer, which fails the client's import (never a silently
     // truncated but well-formed stream).
     use futures_util::StreamExt as _;
-    let windows: Vec<Vec<PathHash>> = order
-        .chunks(CLOSURE_EXPORT_WINDOW)
-        .map(<[PathHash]>::to_vec)
-        .collect();
+    let windows = export_windows(&view.manifest, &order);
     let frames = futures_util::stream::iter(windows)
         .map(move |window| {
             let state = state.clone();
@@ -1046,6 +1067,38 @@ mod tests {
         ready_tx.send(true).unwrap();
         let response = request.await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn export_windows_split_by_nar_bytes() {
+        let mut manifest = Manifest::default();
+        let sizes = [
+            CLOSURE_EXPORT_WINDOW_BYTES / 2,
+            CLOSURE_EXPORT_WINDOW_BYTES / 2, // fills the first window
+            CLOSURE_EXPORT_WINDOW_BYTES * 3, // oversized: its own window
+            1,
+            1,
+        ];
+        let order: Vec<PathHash> = sizes
+            .iter()
+            .enumerate()
+            .map(|(seed, &nar_size)| {
+                let hash = test_path_hash(seed as u8);
+                let mut entry = test_entry(seed as u8);
+                entry.nar_size = nar_size;
+                manifest.paths.insert(hash, entry);
+                hash
+            })
+            .collect();
+        let windows = export_windows(&manifest, &order);
+        assert_eq!(
+            windows,
+            vec![
+                vec![order[0], order[1]],
+                vec![order[2]],
+                vec![order[3], order[4]],
+            ]
+        );
     }
 
     #[test]

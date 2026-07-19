@@ -13,6 +13,10 @@
 //!   failure (evicted pack, missing chunk, hash mismatch) turns into a 404
 //!   so Nix falls through to the next substituter — never partial or
 //!   corrupt data.
+//! * `GET /closure/{hashes}` — the closure of the given path hashes
+//!   (comma-separated), restricted to manifest members, streamed in
+//!   `nix-store --export` format for a one-request prefetch via
+//!   `nix-store --import`.
 //!
 //! A semaphore caps concurrent pack reads so parallel narinfo queries
 //! from Nix (`WantMassQuery: 1`) do not flood the GHA cache API.
@@ -319,10 +323,6 @@ impl ChunkFetcher {
     }
 
     /// Fetch all chunks of `entry`, using cached chunks where possible.
-    ///
-    /// Missing chunks are grouped by pack; adjacent chunks within a pack are
-    /// coalesced into single Range requests; packs are fetched in parallel.
-    /// Every chunk is hash-verified during extraction.
     async fn fetch_path_chunks(
         &self,
         manifest: &Manifest,
@@ -333,17 +333,19 @@ impl ChunkFetcher {
         // path do the work once.
         let lock = self.path_lock(path);
         let _guard = lock.lock().await;
+        self.fetch_chunks(manifest, entry_chunks(entry)).await
+    }
 
-        // All chunks the path's tree references (deduplicated).
-        let needed: BTreeSet<ChunkHash> = flatten_tree(&entry.tree)
-            .into_iter()
-            .filter_map(|(_, node)| match node {
-                FileSystemObject::Regular(regular) => Some(regular.contents.chunks.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-
+    /// Fetch a set of chunks, using cached chunks where possible.
+    ///
+    /// Missing chunks are grouped by pack; adjacent chunks within a pack are
+    /// coalesced into single Range requests; packs are fetched in parallel.
+    /// Every chunk is hash-verified during extraction.
+    async fn fetch_chunks(
+        &self,
+        manifest: &Manifest,
+        needed: BTreeSet<ChunkHash>,
+    ) -> Result<BTreeMap<ChunkHash, Bytes>, FetchError> {
         let mut result: BTreeMap<ChunkHash, Bytes> = BTreeMap::new();
         let mut missing: BTreeMap<PackHash, Vec<(ChunkHash, ChunkLocation)>> = BTreeMap::new();
         {
@@ -520,6 +522,7 @@ impl Substituter {
             .route("/nix-cache-info", get(nix_cache_info))
             .route("/{file}", get(narinfo))
             .route("/nar/{file}", get(nar))
+            .route("/closure/{hashes}", get(closure))
             .with_state(state)
     }
 
@@ -697,33 +700,7 @@ async fn nar(
     // multi-hundred-MiB path would otherwise pin every worker thread and
     // starve the hook socket (whose client times out and silently drops
     // path registrations).
-    let tree = entry.tree.clone();
-    let nar_size = entry.nar_size;
-    let expected_hash = entry.nar_hash;
-    // Reference occurrences normalized out on the write side (dedup v2) are
-    // restored from the path's own references; v1 entries carry no rewrites,
-    // so the table is unused for them.
-    let refs = RefTable::new(&entry.references);
-    let nar = tokio::task::spawn_blocking(move || {
-        use futures_util::FutureExt as _;
-        let nar = nar_from_chunks(&tree, &chunks, &refs)
-            .now_or_never()
-            .expect("NAR synthesis into a Vec sink never pends")
-            .map_err(|err| format!("NAR synthesis failed: {err}"))?;
-        // Final integrity gate: the response must hash to exactly the NAR
-        // hash the manifest (and the narinfo we served) promised.
-        if nar.len() as u64 != nar_size || Hash32::digest(&nar) != expected_hash {
-            return Err(
-                "synthesized NAR does not match its recorded hash/size; refusing to serve \
-                 corrupt data"
-                    .to_string(),
-            );
-        }
-        Ok(nar)
-    })
-    .await
-    .expect("NAR synthesis task panicked");
-    let nar = match nar {
+    let nar = match assemble_verified_nar(&entry, chunks).await {
         Ok(nar) => nar,
         Err(err) => {
             eprintln!("hestia substituter: cannot serve NAR for {path_hash}: {err}");
@@ -735,6 +712,241 @@ async fn nar(
     // fully assembled and verified before responding, the length is always
     // exact (= nar_size, asserted above).
     ([(header::CONTENT_TYPE, "application/x-nix-nar")], nar).into_response()
+}
+
+/// All chunks referenced by an entry's file tree (deduplicated).
+fn entry_chunks(entry: &PathEntry) -> BTreeSet<ChunkHash> {
+    flatten_tree(&entry.tree)
+        .into_iter()
+        .filter_map(|(_, node)| match node {
+            FileSystemObject::Regular(regular) => Some(regular.contents.chunks.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// Assemble the full NAR of `entry` from its fetched chunks and verify it
+/// against the recorded hash/size.
+///
+/// CPU-bound and a single non-yielding poll (the Vec sink never pends), so
+/// it runs off the runtime workers: with many NARs assembling at once, a
+/// multi-hundred-MiB path would otherwise pin every worker thread and
+/// starve the hook socket.
+async fn assemble_verified_nar(
+    entry: &PathEntry,
+    chunks: BTreeMap<ChunkHash, Bytes>,
+) -> Result<Vec<u8>, String> {
+    let tree = entry.tree.clone();
+    let nar_size = entry.nar_size;
+    let expected_hash = entry.nar_hash;
+    // Reference occurrences normalized out on the write side (dedup v2) are
+    // restored from the path's own references; v1 entries carry no rewrites,
+    // so the table is unused for them.
+    let refs = RefTable::new(&entry.references);
+    tokio::task::spawn_blocking(move || {
+        use futures_util::FutureExt as _;
+        let nar = nar_from_chunks(&tree, &chunks, &refs)
+            .now_or_never()
+            .expect("NAR synthesis into a Vec sink never pends")
+            .map_err(|err| format!("NAR synthesis failed: {err}"))?;
+        // Final integrity gate: the served bytes must hash to exactly the
+        // NAR hash the manifest (and the narinfo we served) promised.
+        if nar.len() as u64 != nar_size || Hash32::digest(&nar) != expected_hash {
+            return Err(
+                "synthesized NAR does not match its recorded hash/size; refusing to serve \
+                 corrupt data"
+                    .to_string(),
+            );
+        }
+        Ok(nar)
+    })
+    .await
+    .expect("NAR synthesis task panicked")
+}
+
+// ---------------------------------------------------------------------------
+// Closure export (prefetch)
+// ---------------------------------------------------------------------------
+
+/// Magic marker between the NAR and the metadata of one exported path
+/// (nix's `exportMagic`).
+const EXPORT_MAGIC: u64 = 0x4558494e;
+
+/// How many paths of a closure export share one chunk-fetch batch. Batching
+/// across paths matters: a drv closure is thousands of tiny paths whose
+/// chunks sit next to each other in the same packs, so per-path fetches
+/// would issue thousands of small Range requests where a batch needs a
+/// handful of large ones.
+const CLOSURE_EXPORT_WINDOW: usize = 64;
+
+/// Append a u64 in Nix wire format (8-byte little endian).
+fn export_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Append a string in Nix wire format (length, bytes, zero-padded to 8).
+fn export_str(out: &mut Vec<u8>, value: &str) {
+    export_u64(out, value.len() as u64);
+    out.extend_from_slice(value.as_bytes());
+    out.resize(out.len() + (8 - value.len() % 8) % 8, 0);
+}
+
+/// One path framed for the export stream: entry marker, NAR, then path
+/// metadata (what `nix-store --import` expects per path).
+fn export_frame(store_dir: &StoreDir, entry: &PathEntry, nar: &[u8]) -> Vec<u8> {
+    let full_path = |path: &crate::manifest::StorePath| format!("{store_dir}/{path}");
+    let mut out = Vec::with_capacity(nar.len() + 512);
+    export_u64(&mut out, 1);
+    out.extend_from_slice(nar);
+    export_u64(&mut out, EXPORT_MAGIC);
+    export_str(&mut out, &full_path(&entry.store_path));
+    export_u64(&mut out, entry.references.len() as u64);
+    for reference in &entry.references {
+        export_str(&mut out, &full_path(reference));
+    }
+    export_str(
+        &mut out,
+        &entry.deriver.as_ref().map(&full_path).unwrap_or_default(),
+    );
+    // Legacy signature slot, always empty.
+    export_u64(&mut out, 0);
+    out
+}
+
+/// The closure of `roots` restricted to manifest members, references
+/// before referrers (`nix-store --import` registers paths in stream
+/// order). References pointing outside the manifest (upstream paths) are
+/// skipped. Iterative DFS: drv chains can be deep.
+fn closure_order(manifest: &Manifest, roots: &[PathHash]) -> Vec<PathHash> {
+    let mut order = Vec::new();
+    let mut seen = BTreeSet::new();
+    for &root in roots {
+        let mut stack = vec![(root, false)];
+        while let Some((hash, children_done)) = stack.pop() {
+            let Some(entry) = manifest.paths.get(&hash) else {
+                continue;
+            };
+            if children_done {
+                order.push(hash);
+                continue;
+            }
+            if !seen.insert(hash) {
+                continue;
+            }
+            stack.push((hash, true));
+            for reference in &entry.references {
+                let child = PathHash::from_store_path(reference);
+                if child != hash && !seen.contains(&child) {
+                    stack.push((child, false));
+                }
+            }
+        }
+    }
+    order
+}
+
+/// Fetch and frame one window of a closure export.
+async fn export_window(
+    state: &Substituter,
+    view: &ManifestView,
+    window: &[PathHash],
+) -> Result<Vec<u8>, String> {
+    let entries: Vec<(PathHash, &PathEntry)> = window
+        .iter()
+        .map(|hash| (*hash, &view.manifest.paths[hash]))
+        .collect();
+    let needed: BTreeSet<ChunkHash> = entries
+        .iter()
+        .flat_map(|(_, entry)| entry_chunks(entry))
+        .collect();
+    let chunks = state
+        .fetcher
+        .fetch_chunks(&view.manifest, needed)
+        .await
+        .map_err(|err| {
+            eprintln!("hestia substituter: closure export chunk fetch failed: {err}");
+            err.to_string()
+        })?;
+
+    let mut out = Vec::new();
+    for (path_hash, entry) in entries {
+        // Prefetched paths are accesses (GC liveness), same as narinfo hits.
+        state.access_log.record(path_hash);
+        // Bytes clones are refcounts; each path only reads its own subset.
+        let nar = assemble_verified_nar(entry, chunks.clone())
+            .await
+            .map_err(|err| {
+                eprintln!("hestia substituter: closure export failed at {path_hash}: {err}");
+                err
+            })?;
+        out.extend_from_slice(&export_frame(&state.store_dir, entry, &nar));
+    }
+    Ok(out)
+}
+
+async fn closure(State(state): State<Arc<Substituter>>, Path(hashes): Path<String>) -> Response {
+    let _activity = state.touch();
+    state.manifest_ready().await;
+
+    let mut roots = Vec::new();
+    for part in hashes.split(',').filter(|part| !part.is_empty()) {
+        match part.parse::<PathHash>() {
+            Ok(hash) => roots.push(hash),
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+    let view = state.manifest.view();
+    // Every requested root must be servable; a partial closure would make
+    // the import succeed and the subsequent build fail confusingly.
+    if roots.is_empty()
+        || !roots
+            .iter()
+            .all(|root| view.manifest.paths.contains_key(root))
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let order = closure_order(&view.manifest, &roots);
+
+    // Stream the closure in windows: each window's chunks are fetched as
+    // one batch (grouped by pack, ranges coalesced across paths), its
+    // frames are emitted in closure order, and the next window downloads
+    // while the current one is being sent. The end-of-stream marker
+    // follows the last window. A fetch/assembly failure ends the stream
+    // mid-transfer, which fails the client's import (never a silently
+    // truncated but well-formed stream).
+    use futures_util::StreamExt as _;
+    let windows: Vec<Vec<PathHash>> = order
+        .chunks(CLOSURE_EXPORT_WINDOW)
+        .map(<[PathHash]>::to_vec)
+        .collect();
+    let frames = futures_util::stream::iter(windows)
+        .map(move |window| {
+            let state = state.clone();
+            let view = view.clone();
+            async move {
+                let result = export_window(&state, &view, &window).await;
+                result.map(Bytes::from).map_err(std::io::Error::other)
+            }
+        })
+        .buffered(2)
+        .chain(futures_util::stream::once(async {
+            // End-of-stream marker.
+            Ok(Bytes::from_static(&[0u8; 8]))
+        }));
+    // Stop after the first error: everything behind it (including the end
+    // marker) is dropped so the client sees a truncated stream.
+    let stream = frames.scan(false, |failed, item| {
+        let stop = *failed;
+        *failed = *failed || item.is_err();
+        futures_util::future::ready((!stop).then_some(item))
+    });
+
+    (
+        [(header::CONTENT_TYPE, "application/x-nix-export")],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

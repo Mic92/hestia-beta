@@ -150,6 +150,11 @@ impl ManifestStore {
         Arc::clone(&self.inner.read().expect("manifest lock poisoned"))
     }
 
+    /// SaveMutable version of the served manifest (0 = none loaded yet).
+    pub fn version(&self) -> u64 {
+        self.view().version
+    }
+
     /// Number of paths currently servable.
     pub fn path_count(&self) -> usize {
         self.view().manifest.paths.len()

@@ -396,11 +396,25 @@ impl ChunkFetcher {
         mut chunks: Vec<(ChunkHash, ChunkLocation)>,
     ) -> Result<Vec<(ChunkHash, Bytes)>, FetchError> {
         chunks.sort_by_key(|(_, location)| location.offset);
+        let chunk_count = chunks.len();
 
         // Coalesce adjacent chunks into runs.
         let runs = coalesce_adjacent(chunks, |(_, location)| {
             (location.offset, location.compressed_size)
         });
+
+        // One line per pack fetch (= per burst of GHA cache traffic):
+        // confirms whether chunks coalesce into few large Range reads or
+        // degrade into many small ones.
+        let started = Instant::now();
+        let range_count = runs.len();
+        let range_bytes: u64 = runs
+            .iter()
+            .map(|run| {
+                let last = &run[run.len() - 1].1;
+                last.offset + u64::from(last.compressed_size) - run[0].1.offset
+            })
+            .sum();
 
         let mut fetched = Vec::new();
         for run in runs {
@@ -432,6 +446,12 @@ impl ChunkFetcher {
             .expect("chunk extraction task panicked")?;
             fetched.extend(extracted);
         }
+        eprintln!(
+            "hestia substituter: pack {}: {chunk_count} chunks in {range_count} range reads \
+             ({range_bytes} bytes, {} ms)",
+            pack_cache_key(&pack),
+            started.elapsed().as_millis(),
+        );
         Ok(fetched)
     }
 }

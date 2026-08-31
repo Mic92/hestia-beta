@@ -91,9 +91,9 @@ async fn real_blob_round_trip_range_read_and_delete() {
         .await
         .unwrap();
 
-    // Reserving the same key again must report AlreadyExists (CAS dedup).
-    // Unlike lookups, reservations are strongly consistent: this is what
-    // SaveMutable's conflict detection relies on.
+    // Reserving the same key again must report AlreadyExists: unlike
+    // lookups, reservations are strongly consistent, which is what makes
+    // `Backend::put` create-only.
     let reservation = twirp.create_cache_entry(&key).await.unwrap();
     assert_eq!(reservation, Reservation::AlreadyExists);
 

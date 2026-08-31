@@ -22,8 +22,8 @@ use crate::protocol::{self, Request};
 const DEFAULT_RUNNERS: &[(&str, &str)] = &[
     ("x86_64-linux", "ubuntu-24.04"),
     ("aarch64-linux", "ubuntu-24.04-arm"),
-    ("x86_64-darwin", "macos-13"),
-    ("aarch64-darwin", "macos-14"),
+    ("x86_64-darwin", "macos-15-intel"),
+    ("aarch64-darwin", "macos-15"),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -178,6 +178,9 @@ pub struct MatrixRow {
     pub drv_path: String,
     /// Space-separated `<drvPath>^*` list, ready for `nix build`.
     pub installables: String,
+    /// Head under which this row's system got its drvs (`wait-head`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub head: String,
 }
 
 /// Turn eval jobs into matrix rows: dedup by drvPath, drop cached jobs,
@@ -243,6 +246,7 @@ pub fn build_rows(
             attr,
             drv_path: job.drv_path.clone(),
             installables: installable,
+            head: String::new(),
         });
     }
     Ok(rows)
@@ -256,44 +260,53 @@ fn prefixed(prefix: &str, attr: &str) -> String {
     }
 }
 
-/// The step outputs: `matrix`, `any-jobs`, `manifest-version`.
-pub fn outputs(rows: &[MatrixRow], manifest_version: u64) -> Vec<(String, String)> {
+/// The step outputs: `matrix`, `any-jobs`, `head` (and its old name).
+pub fn outputs(rows: &[MatrixRow], head: &str) -> Vec<(String, String)> {
     let matrix = serde_json::json!({ "include": rows });
     vec![
         ("matrix".to_string(), matrix.to_string()),
         ("any-jobs".to_string(), (!rows.is_empty()).to_string()),
-        ("manifest-version".to_string(), manifest_version.to_string()),
+        ("head".to_string(), head.to_string()),
+        ("manifest-version".to_string(), head.to_string()),
     ]
 }
 
-/// Register the drv paths with the daemon and drain, returning the
-/// committed manifest version. Never fatal: the matrix still works without
-/// a reachable daemon (`nix build .#$attr` mode), so a warning beats
-/// failing the eval job.
-async fn register_and_drain(args: &MatrixArgs, drv_paths: Vec<String>) -> u64 {
-    if drv_paths.is_empty() {
-        return 0;
+/// Register the drv paths with the daemon, per system so each build leg
+/// finds them under its own `<branch>-<system>` root, and drain. Never
+/// fatal: the matrix still works without a reachable daemon (`nix build
+/// .#$attr` mode), so a warning beats failing the eval job.
+async fn register_and_drain(
+    args: &MatrixArgs,
+    by_system: BTreeMap<String, Vec<String>>,
+) -> Option<crate::protocol::DrainStats> {
+    if by_system.is_empty() {
+        return None;
     }
-    let count = drv_paths.len();
-    let request = Request::Add { paths: drv_paths };
-    if let Err(err) = protocol::roundtrip(&args.socket, &request).await {
-        eprintln!(
-            "hestia matrix: cannot register {count} drv path(s) with the daemon at {}: {err} \
-             (matrix is still emitted; drv closures will not be cached)",
-            args.socket.display()
-        );
-        return 0;
+    for (system, drv_paths) in by_system {
+        let count = drv_paths.len();
+        let request = Request::Add {
+            paths: drv_paths,
+            system: Some(system),
+        };
+        if let Err(err) = protocol::roundtrip(&args.socket, &request).await {
+            eprintln!(
+                "hestia matrix: cannot register {count} drv path(s) with the daemon at {}: {err} \
+                 (matrix is still emitted; drv closures will not be cached)",
+                args.socket.display()
+            );
+            return None;
+        }
     }
     let drain = protocol::roundtrip(&args.socket, &Request::Drain);
     match tokio::time::timeout(Duration::from_secs(args.drain_timeout), drain).await {
         Ok(Ok(response)) => {
             let stats = response.stats.unwrap_or_default();
             eprintln!("hestia matrix: {}", crate::drain::summarize(&stats));
-            stats.manifest_version
+            Some(stats)
         }
         Ok(Err(err)) => {
             eprintln!("hestia matrix: drain failed: {err} (matrix is still emitted)");
-            0
+            None
         }
         Err(_) => {
             eprintln!(
@@ -301,7 +314,7 @@ async fn register_and_drain(args: &MatrixArgs, drv_paths: Vec<String>) -> u64 {
                  (matrix is still emitted)",
                 args.drain_timeout
             );
-            0
+            None
         }
     }
 }
@@ -382,17 +395,34 @@ async fn run_inner(args: &MatrixArgs) -> Result<(), Error> {
     // Register every distinct drv (cached outputs included: their drv may
     // still be missing from the cache) so build jobs can substitute the
     // drv closure.
-    let mut drv_paths: Vec<String> = jobs.iter().map(|job| job.drv_path.clone()).collect();
-    drv_paths.sort();
-    drv_paths.dedup();
-    let manifest_version = register_and_drain(args, drv_paths).await;
+    let mut by_system: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for job in &jobs {
+        by_system
+            .entry(job.system.clone())
+            .or_default()
+            .push(job.drv_path.clone());
+    }
+    for v in by_system.values_mut() {
+        v.sort();
+        v.dedup();
+    }
+    let stats = register_and_drain(args, by_system)
+        .await
+        .unwrap_or_default();
+    let mut rows = rows;
+    for row in &mut rows {
+        if let Some(h) = stats.heads.get(&row.system).or(stats.head.as_ref()) {
+            row.head = h.clone();
+        }
+    }
+    let head = stats.head.unwrap_or_default();
 
     eprintln!(
         "hestia matrix: {} job(s) to build ({} evaluated)",
         rows.len(),
         jobs.len()
     );
-    emit_outputs(&outputs(&rows, manifest_version))
+    emit_outputs(&outputs(&rows, &head))
 }
 
 #[cfg(test)]
@@ -481,7 +511,7 @@ mod tests {
     fn runner_map_defaults_overrides_and_meta_os() {
         let runners = runner_map(&["x86_64-linux=self-hosted, big".to_string()]).unwrap();
         let mut meta_os = job("c", "x86_64-linux");
-        meta_os.runner_override = Some(vec!["macos-15".to_string()]);
+        meta_os.runner_override = Some(vec!["macos-26".to_string()]);
         let rows = build_rows(
             &[
                 job("a", "x86_64-linux"),
@@ -494,8 +524,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows[0].os, vec!["self-hosted", "big"]);
-        assert_eq!(rows[1].os, vec!["macos-14"]);
-        assert_eq!(rows[2].os, vec!["macos-15"], "meta.hestia.os wins");
+        assert_eq!(rows[1].os, vec!["macos-15"]);
+        assert_eq!(rows[2].os, vec!["macos-26"], "meta.hestia.os wins");
 
         assert!(matches!(
             runner_map(&["nonsense".to_string()]),
@@ -572,21 +602,18 @@ mod tests {
     }
 
     #[test]
-    fn outputs_are_matrix_any_jobs_and_manifest_version() {
+    fn outputs_are_matrix_any_jobs_and_head() {
         let rows = build_rows(&[job("a", "x86_64-linux")], &default_runners(), false, "").unwrap();
-        let outputs = outputs(&rows, 7);
+        let outputs = outputs(&rows, "h-abc");
         assert_eq!(outputs[1], ("any-jobs".to_string(), "true".to_string()));
-        assert_eq!(
-            outputs[2],
-            ("manifest-version".to_string(), "7".to_string())
-        );
+        assert_eq!(outputs[2], ("head".to_string(), "h-abc".to_string()));
         let matrix: Value = serde_json::from_str(&outputs[0].1).unwrap();
         assert_eq!(matrix["include"][0]["name"], "a");
         assert_eq!(matrix["include"][0]["drvPath"], rows[0].drv_path);
         assert_eq!(matrix["include"][0]["os"][0], "ubuntu-24.04");
 
-        let empty = super::outputs(&[], 0);
+        let empty = super::outputs(&[], "");
         assert_eq!(empty[1].1, "false");
-        assert_eq!(empty[2].1, "0");
+        assert_eq!(empty[2].1, "");
     }
 }

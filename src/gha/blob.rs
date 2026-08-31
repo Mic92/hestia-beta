@@ -12,23 +12,17 @@
 //! Transient failures (5xx, dropped connections) are retried with backoff.
 
 use std::ops::Range;
-use std::time::Duration;
 
 use bytes::Bytes;
 
 use crate::gha::Error;
+use crate::gha::retry::{Backoff, is_transient};
 
 /// `x-ms-blob-type` header value for single-shot uploads.
 const BLOB_TYPE: &str = "BlockBlob";
 
 /// Azure storage API version header (matches what actions/toolkit sends).
 const API_VERSION: &str = "2020-04-08";
-
-/// Retries for transient failures (503 ServerBusy, dropped connections).
-const TRANSIENT_RETRIES: u32 = 3;
-
-/// First retry delay; doubles per attempt.
-const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Format a half-open byte range as an HTTP `Range` header value
 /// (inclusive on both ends per RFC 9110).
@@ -38,20 +32,6 @@ fn format_range(range: &Range<u64>) -> String {
 
 fn url_expired(status: u16) -> bool {
     status == 403 || status == 401
-}
-
-/// Whether a transfer error is worth retrying with the same URL: network
-/// failures (connection drops, timeouts, truncated bodies) and server-side
-/// 5xx responses. Auth failures (401/403) are *not* transient — they need a
-/// fresh signed URL instead.
-pub fn is_transient(error: &Error) -> bool {
-    match error {
-        // Builder and redirect-policy failures are deterministic: retrying
-        // them only burns the whole backoff budget on the same outcome.
-        Error::Http(err) => !err.is_builder() && !err.is_redirect(),
-        Error::Status { status, .. } => *status >= 500,
-        _ => false,
-    }
 }
 
 async fn status_error(url: &str, response: reqwest::Response) -> Error {
@@ -144,18 +124,13 @@ where
 {
     let mut url = url.to_string();
     let mut refresh = Some(refresh);
-    let mut transient_left = TRANSIENT_RETRIES;
-    let mut delay = TRANSIENT_RETRY_DELAY;
+    let mut backoff = Backoff::default();
     loop {
         match put(http, &url, data.clone()).await {
             Err(Error::Status { status, .. }) if url_expired(status) && refresh.is_some() => {
                 url = refresh.take().expect("checked above")().await?;
             }
-            Err(err) if is_transient(&err) && transient_left > 0 => {
-                transient_left -= 1;
-                tokio::time::sleep(delay).await;
-                delay *= 2;
-            }
+            Err(err) if backoff.retry(is_transient(&err)).await => {}
             result => return result,
         }
     }
@@ -173,18 +148,13 @@ where
 {
     let mut url = url.to_string();
     let mut refresh = Some(refresh);
-    let mut transient_left = TRANSIENT_RETRIES;
-    let mut delay = TRANSIENT_RETRY_DELAY;
+    let mut backoff = Backoff::default();
     loop {
         match get(http, &url, range.clone()).await {
             Err(Error::Status { status, .. }) if url_expired(status) && refresh.is_some() => {
                 url = refresh.take().expect("checked above")().await?;
             }
-            Err(err) if is_transient(&err) && transient_left > 0 => {
-                transient_left -= 1;
-                tokio::time::sleep(delay).await;
-                delay *= 2;
-            }
+            Err(err) if backoff.retry(is_transient(&err)).await => {}
             result => return result,
         }
     }
@@ -207,24 +177,5 @@ mod tests {
         assert!(url_expired(401));
         assert!(!url_expired(404));
         assert!(!url_expired(500));
-    }
-
-    #[test]
-    fn transient_errors_are_server_side_failures_not_auth_or_client_errors() {
-        let status = |status: u16| Error::Status {
-            status,
-            url: "http://blob/x".into(),
-            body: String::new(),
-        };
-        assert!(is_transient(&status(500)));
-        assert!(is_transient(&status(503)));
-        // Auth failures need a URL refresh, not a retry.
-        assert!(!is_transient(&status(401)));
-        assert!(!is_transient(&status(403)));
-        // Missing blobs (eviction) never come back by retrying.
-        assert!(!is_transient(&status(404)));
-        // Non-transfer errors are never transient.
-        assert!(!is_transient(&Error::MissingEnv("X")));
-        assert!(!is_transient(&Error::InvalidResponse("bad".into())));
     }
 }

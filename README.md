@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read # optional: detect evicted cache entries upfront
+      actions: read # find what earlier jobs cached
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
@@ -41,11 +41,10 @@ jobs:
 Everything built in your workflow gets cached; later runs (and PRs) pull
 from the cache instead of rebuilding.
 
-Build jobs need no extra permissions for the cache itself: uploads
-authenticate with the runner-injected `ACTIONS_RUNTIME_TOKEN`, which the
-`permissions:` block does not scope. The optional `actions: read` lets
-the daemon check upfront which cached packs GitHub has evicted, so
-affected paths are rebuilt without a failed download attempt first.
+Uploads authenticate with the runner-injected `ACTIONS_RUNTIME_TOKEN`,
+which the `permissions:` block does not scope. Finding what earlier jobs
+published takes a cache listing, which needs `actions: read` on the
+job token: without it the job still pushes but substitutes nothing.
 
 You will also want a daily GC workflow on the default branch to stay within
 the cache quota; copy [`.github/workflows/gc.yml`](.github/workflows/gc.yml)
@@ -57,8 +56,9 @@ See [Configuration](#configuration) for all action inputs.
 
 `Mic92/hestia/matrix` turns a flake's checks into a GitHub Actions build
 matrix: one runner per check, evaluated only once. The eval job runs
-`nix-eval-jobs`, uploads each check's `.drv` closure to the cache, and
-outputs the matrix of checks that are not cached yet. Each build job then
+`nix-eval-jobs`, uploads each check's `.drv` closure to the cache under
+that check's system (so a darwin leg finds it under `<branch>-aarch64-darwin`),
+and outputs the matrix of checks that are not cached yet. Each build job then
 fetches its derivation from the cache and builds it by store path — no
 per-job evaluation, no flake changes, and no job at all for checks whose
 results are already cached.
@@ -70,7 +70,6 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       any-jobs: ${{ steps.matrix.outputs.any-jobs }}
-      manifest-version: ${{ steps.matrix.outputs.manifest-version }}
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
@@ -82,7 +81,7 @@ jobs:
           nix-eval-jobs: "nix run nixpkgs#nix-eval-jobs --"
           # runner-map: |
           #   x86_64-linux=ubuntu-24.04
-          #   aarch64-darwin=macos-14,self-hosted
+          #   aarch64-darwin=macos-15,self-hosted
 
   build:
     needs: eval
@@ -96,7 +95,7 @@ jobs:
       - uses: NixOS/nix-installer-action@main
       - uses: Mic92/hestia@v3
         with:
-          wait-manifest-version: ${{ needs.eval.outputs.manifest-version }}
+          wait-head: ${{ matrix.head }}
       - name: Prefetch drv closure
         run: "$HESTIA_BIN" prefetch ${{ matrix.installables }}
       - run: nix build -L ${{ matrix.installables }}
@@ -187,13 +186,15 @@ rebuild, never wrong build inputs.
 Every job records the paths it pushed and the paths it downloaded under a
 *root* named `<branch>-<system>`, e.g. `main-x86_64-linux`. The branch part
 comes from `$GITHUB_REF_NAME` (override with `--branch`), the system part is
-detected (override with `--system`). Anything reachable from a root survives
-garbage collection; everything else is deleted once it falls out of the push
-grace period.
+detected (override with `--system`). A job serves its own root plus the
+default branch's (`--serve-branch`; the action passes the repository's
+default branch, the CLI defaults to `main`). What the roots hold
+survives garbage collection; everything else is deleted.
 
-Matrix jobs of one workflow run share their root: their closures are
-unioned, however far apart the jobs finish. A new run replaces the root, so
-old closures become collectable.
+Each GC run resets a root to what the jobs since the previous run pushed
+or downloaded, so matrix jobs and re-runs union while closures no job
+uses any more become collectable. A root no job touched keeps its last
+contents until it expires.
 
 Pull requests get their own roots (`123/merge-x86_64-linux`), so a PR cannot
 evict paths the default branch still needs. Roots that stop being updated
@@ -212,7 +213,7 @@ All inputs are optional; the defaults work for the quick start above.
 |---|---|---|
 | `binary` | — | Path to a pre-built hestia binary. Takes precedence over `version`. |
 | `version` | latest release | Release tag to download (e.g. `v1.0.0`). The download is verified against GitHub's build attestations. |
-| `github-token` | `${{ github.token }}` | Token for the attestation API lookup. |
+| `github-token` | `${{ github.token }}` | Token for listing cache entries (`actions: read`) and the attestation API lookup. |
 | `listen` | `127.0.0.1:37515` | Substituter listen address. |
 | `socket` | `/tmp/hestia/hook.sock` | Post-build-hook unix socket path. |
 | `drain-timeout` | `300` | Seconds the post-job step waits for the final upload. |
@@ -299,11 +300,15 @@ when the branch is deleted. In practice this means:
   bounded by the 10 GB repository quota that GitHub evicts by LRU anyway.
 * `pull_request_target` / fork PRs never get write tokens for the base
   scope; the standard GitHub Actions security guidance applies unchanged.
+* hestia lists and deletes per scope: a job sees the heads of the scopes
+  its token can read (its own, a PR's base branch, the default branch),
+  and `hestia gc` deletes only in the scope it runs in. PR scopes are
+  left to GitHub, which drops them with the branch.
 
 ### What hestia itself enforces
 
-Pack blobs are content-addressed (BLAKE3-named, hash-verified on every
-read), and NARs are verified against the manifest's SHA-256 NAR hash
+Pack blobs are content-addressed (SHA-256-named, chunks hash-verified on every
+read), and NARs are verified against the recorded SHA-256 NAR hash
 before being served. Anything that doesn't check out is treated as a cache miss and gets
 rebuilt.
 

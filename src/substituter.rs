@@ -28,7 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::sync::Semaphore;
 
@@ -44,25 +44,21 @@ use harmonia_store_nar_info::{build_narinfo, format_narinfo_txt};
 use harmonia_store_path::StoreDir;
 use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
 
+use crate::backend::Backend;
 use crate::chunker::{self, extract_chunk, flatten_tree, nar_from_chunks, pack_cache_key};
-use crate::gha::rest::RestClient;
-use crate::gha::twirp::{DownloadUrl, TwirpClient};
-use crate::gha::{Error as GhaError, blob};
+use crate::gha::Error as GhaError;
 use crate::manifest::{
-    ChunkHash, ChunkLocation, FileSystemObject, Hash32, Manifest, PackHash, PathEntry, PathHash,
+    ChunkHash, ChunkLocation, FileSystemObject, Hash32, PackKey, PathEntry, PathHash,
 };
 use crate::pipeline::AccessLog;
 use crate::refnorm::RefTable;
+use crate::segment::PackIndex;
+use crate::store::{ChunkMap, Resolved, Snapshot};
 
 /// Priority advertised in /nix-cache-info. Lower wins: 30 puts hestia ahead
 /// of cache.nixos.org (40), so Nix asks the local cache first and only falls
 /// through to upstream on a miss.
 const PRIORITY: u32 = 30;
-
-/// How long a signed pack download URL is reused before asking Twirp for a
-/// fresh one. Real SAS URLs live much longer; the 403-refresh path is the
-/// backstop for when this estimate is wrong.
-const PACK_URL_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Upper bound for decompressed chunks kept in memory across NAR requests.
 /// Oldest chunks are dropped first.
@@ -87,103 +83,59 @@ const PACK_READ_AHEAD_BYTES: u64 = 4 * 1024 * 1024;
 /// matter how the packs distribute over paths.
 const MAX_CONCURRENT_PACK_FETCHES: usize = 8;
 
-/// How many times a pack Range read is retried after a transient failure
-/// (connection drop, timeout, 5xx) before the whole NAR request gives up
-/// and returns 404.
-const TRANSIENT_READ_RETRIES: u32 = 2;
-
-/// One pack's chunk locations sorted by offset. Lets the fetcher answer
-/// "which chunks live in this byte range" (read-ahead) with a range scan;
-/// the manifest itself only indexes chunks by hash.
-struct PackChunkIndex {
-    /// End of the last known chunk; reads are never extended past it.
-    end: u64,
-    /// (offset, compressed size, hash), sorted by offset.
-    chunks: Vec<(u64, u32, ChunkHash)>,
-}
-
-/// One manifest version plus the indexes the substituter needs.
+/// What the substituter serves from.
 #[derive(Default)]
 struct ManifestView {
-    manifest: Manifest,
-    /// NAR hash → manifest path key, for `/nar/{narhash}.nar` requests that
-    /// arrive without the `?hash=` parameter.
-    by_nar_hash: BTreeMap<Hash32, PathHash>,
-    /// Per-pack chunk layout, for read-ahead.
-    pack_index: HashMap<PackHash, Arc<PackChunkIndex>>,
-    /// SaveMutable index this manifest was loaded from / committed as
-    /// (0 = unknown or no manifest yet).
-    version: u64,
+    snapshot: Option<Arc<Snapshot>>,
     /// Packs observed to be evicted from the cache. Affected paths 404
-    /// already at narinfo time. Lives inside the view so every manifest
+    /// already at narinfo time. Lives inside the view so every snapshot
     /// replacement starts from an empty set.
-    missing_packs: Mutex<BTreeSet<PackHash>>,
+    missing_packs: Mutex<BTreeSet<PackKey>>,
 }
 
 impl ManifestView {
-    fn mark_pack_missing(&self, pack: PackHash) {
+    fn mark_pack_missing(&self, pack: PackKey) {
         self.missing_packs
             .lock()
             .expect("missing pack set poisoned")
             .insert(pack);
     }
 
-    /// Whether no chunk of `entry` lives in a known-missing pack. The
-    /// chunk walk only runs after an eviction was actually observed.
-    fn entry_available(&self, entry: &PathEntry) -> bool {
+    /// Whether no chunk of `hash` lives in a known-missing pack. The
+    /// tree walk only runs after an eviction was actually observed.
+    async fn available(&self, hash: &PathHash) -> bool {
         let missing = self
             .missing_packs
             .lock()
-            .expect("missing pack set poisoned");
-        if missing.is_empty() {
+            .expect("missing pack set poisoned")
+            .clone();
+        let Some(snapshot) = self.snapshot.as_ref().filter(|_| !missing.is_empty()) else {
             return true;
-        }
-        entry_chunks(entry).iter().all(|chunk| {
-            self.manifest
-                .chunks
-                .get(chunk)
-                .is_none_or(|location| !missing.contains(&location.pack))
-        })
+        };
+        snapshot
+            .packs_of(hash)
+            .await
+            .is_ok_and(|packs| packs.is_disjoint(&missing))
     }
 
-    fn new(manifest: Manifest, version: u64) -> Self {
-        let by_nar_hash = manifest
-            .paths
-            .iter()
-            .map(|(path_hash, entry)| (entry.nar_hash, *path_hash))
-            .collect();
-        let mut by_pack: HashMap<PackHash, Vec<(u64, u32, ChunkHash)>> = HashMap::new();
-        for (hash, location) in &manifest.chunks {
-            by_pack.entry(location.pack).or_default().push((
-                location.offset,
-                location.compressed_size,
-                *hash,
-            ));
-        }
-        let pack_index = by_pack
-            .into_iter()
-            .map(|(pack, mut chunks)| {
-                chunks.sort_unstable_by_key(|(offset, ..)| *offset);
-                let end = chunks
-                    .last()
-                    .map_or(0, |(offset, size, _)| offset + u64::from(*size));
-                (pack, Arc::new(PackChunkIndex { end, chunks }))
-            })
-            .collect();
-        Self {
-            manifest,
-            by_nar_hash,
-            pack_index,
-            version,
-            missing_packs: Mutex::new(BTreeSet::new()),
-        }
+    fn lookup(&self, hash: &PathHash) -> Option<PathEntry> {
+        self.snapshot.as_ref()?.lookup(hash)
+    }
+
+    fn contains(&self, hash: &PathHash) -> bool {
+        self.snapshot.as_ref().is_some_and(|s| s.contains(hash))
+    }
+
+    async fn resolve(&self, hash: &PathHash) -> Result<Option<Resolved>, FetchError> {
+        let Some(s) = &self.snapshot else {
+            return Ok(None);
+        };
+        Ok(s.resolve(hash).await?)
     }
 }
 
-/// Shared, replaceable manifest: the substituter reads it on every request,
-/// the daemon replaces it at startup and after every successful drain.
-///
-/// Cloning is cheap (shared state).
+/// Shared, replaceable view: the substituter reads it on every request,
+/// the daemon replaces it at startup and after every drain.
 #[derive(Clone, Default)]
 pub struct ManifestStore {
     inner: Arc<RwLock<Arc<ManifestView>>>,
@@ -194,49 +146,24 @@ impl ManifestStore {
         Self::default()
     }
 
-    /// Replace the served manifest (version unknown).
-    pub fn set(&self, manifest: Manifest) {
-        self.set_version(manifest, 0);
+    pub fn set_snapshot(&self, snapshot: Arc<Snapshot>) {
+        *self.inner.write().expect("manifest lock poisoned") = Arc::new(ManifestView {
+            snapshot: Some(snapshot),
+            missing_packs: Mutex::default(),
+        });
     }
 
-    /// Replace the served manifest, recording the SaveMutable index it came
-    /// from. The version is what the pipeline uses for read-your-writes:
-    /// it merges this manifest into every commit base and never reserves an
-    /// index at or below it.
-    pub fn set_version(&self, manifest: Manifest, version: u64) {
-        *self.inner.write().expect("manifest lock poisoned") =
-            Arc::new(ManifestView::new(manifest, version));
-    }
-
-    /// Replace the served manifest only if `version` is newer than the
-    /// served one. Used by the startup load, which runs concurrently with
-    /// the daemon: a drain may commit (and publish) a newer manifest before
-    /// the initial load finishes, and that newer version must win.
-    pub fn set_version_if_newer(&self, manifest: Manifest, version: u64) {
-        let mut inner = self.inner.write().expect("manifest lock poisoned");
-        if version > inner.version {
-            *inner = Arc::new(ManifestView::new(manifest, version));
-        }
-    }
-
-    /// The served manifest and its version (clone; manifests are small).
-    pub fn versioned(&self) -> (u64, Manifest) {
-        let view = self.view();
-        (view.version, view.manifest.clone())
+    pub fn snapshot(&self) -> Option<Arc<Snapshot>> {
+        self.view().snapshot.clone()
     }
 
     fn view(&self) -> Arc<ManifestView> {
         Arc::clone(&self.inner.read().expect("manifest lock poisoned"))
     }
 
-    /// SaveMutable version of the served manifest (0 = none loaded yet).
-    pub fn version(&self) -> u64 {
-        self.view().version
-    }
-
     /// Number of paths currently servable.
     pub fn path_count(&self) -> usize {
-        self.view().manifest.paths.len()
+        self.view().snapshot.as_ref().map_or(0, |s| s.path_count())
     }
 }
 
@@ -245,14 +172,26 @@ enum FetchError {
     #[error("GHA cache error: {0}")]
     Gha(#[from] GhaError),
 
-    #[error("chunk {0} has no location in the manifest")]
+    #[error("chunk {0} has no known location")]
     UnknownChunk(ChunkHash),
 
     #[error("pack {} is not in the cache (evicted?)", pack_cache_key(.0))]
-    PackUnavailable(PackHash),
+    PackUnavailable(PackKey),
 
     #[error("chunk extraction failed: {0}")]
     Chunker(#[from] chunker::Error),
+
+    #[error(transparent)]
+    Store(crate::store::Error),
+}
+
+impl From<crate::store::Error> for FetchError {
+    fn from(err: crate::store::Error) -> Self {
+        match err {
+            crate::store::Error::MissingPack(p) => FetchError::PackUnavailable(p),
+            err => FetchError::Store(err),
+        }
+    }
 }
 
 /// Decompressed chunks kept in memory, evicted least-recently-used first
@@ -296,12 +235,9 @@ impl ChunkCache {
     }
 }
 
-/// Fetches chunks from pack blobs in the GHA cache.
+/// Fetches chunks from pack blobs.
 struct ChunkFetcher {
-    twirp: TwirpClient,
-    http: reqwest::Client,
-    /// Signed download URLs per pack, with issue time (TTL-based reuse).
-    url_cache: Mutex<HashMap<PackHash, (String, Instant)>>,
+    backend: Backend,
     /// Decompressed chunks (filled by NAR requests).
     chunk_cache: Mutex<ChunkCache>,
     /// Per-path serialization: concurrent NAR requests for the same path
@@ -315,11 +251,9 @@ struct ChunkFetcher {
 }
 
 impl ChunkFetcher {
-    fn new(twirp: TwirpClient, http: reqwest::Client) -> Self {
+    fn new(backend: Backend) -> Self {
         Self {
-            twirp,
-            http,
-            url_cache: Mutex::new(HashMap::new()),
+            backend,
             chunk_cache: Mutex::new(ChunkCache::default()),
             path_locks: Mutex::new(HashMap::new()),
             fetch_semaphore: Semaphore::new(MAX_CONCURRENT_PACK_FETCHES),
@@ -334,81 +268,29 @@ impl ChunkFetcher {
         Arc::clone(locks.entry(path).or_default())
     }
 
-    /// Get a signed download URL for a pack, reusing a cached one if it is
-    /// fresh enough. `force` bypasses the cache (after a 403).
-    async fn pack_url(&self, pack: PackHash, force: bool) -> Result<String, FetchError> {
-        if !force {
-            let cache = self.url_cache.lock().expect("url cache poisoned");
-            if let Some((url, issued)) = cache.get(&pack)
-                && issued.elapsed() < PACK_URL_TTL
-            {
-                return Ok(url.clone());
-            }
-        }
-        let key = pack_cache_key(&pack);
-        match self.twirp.get_download_url(&key, &[]).await? {
-            DownloadUrl::Hit { url, .. } => {
-                let mut cache = self.url_cache.lock().expect("url cache poisoned");
-                // Expired entries are only ever bypassed, never overwritten
-                // unless the same pack is fetched again — prune them here so
-                // URLs of packs GC has repacked away do not accumulate for
-                // the process lifetime.
-                cache.retain(|_, (_, issued)| issued.elapsed() < PACK_URL_TTL);
-                cache.insert(pack, (url.clone(), Instant::now()));
-                Ok(url)
-            }
-            DownloadUrl::Miss => Err(FetchError::PackUnavailable(pack)),
-        }
-    }
-
-    /// Range-read one byte range of a pack.
-    ///
-    /// Two failure modes are recovered from, everything else propagates
-    /// (and ultimately turns the NAR request into a 404):
-    ///
-    /// * expired signed URL (401/403) → refresh via Twirp, once;
-    /// * transient network/server failure (connection drop, timeout, 5xx)
-    ///   → retry the same URL up to [`TRANSIENT_READ_RETRIES`] times.
     async fn read_pack_range(
         &self,
-        pack: PackHash,
+        pack: PackKey,
         range: std::ops::Range<u64>,
     ) -> Result<Bytes, FetchError> {
-        let mut url = self.pack_url(pack, false).await?;
-        let mut refreshed = false;
-        let mut transient_left = TRANSIENT_READ_RETRIES;
-        loop {
-            match blob::get(&self.http, &url, Some(range.clone())).await {
-                Err(GhaError::Status { status, .. })
-                    if (status == 403 || status == 401) && !refreshed =>
-                {
-                    refreshed = true;
-                    url = self.pack_url(pack, true).await?;
-                }
-                Err(err) if blob::is_transient(&err) && transient_left > 0 => {
-                    transient_left -= 1;
-                    eprintln!(
-                        "hestia substituter: transient error reading pack {}, retrying: {err}",
-                        pack_cache_key(&pack)
-                    );
-                }
-                result => return Ok(result?),
-            }
-        }
+        self.backend
+            .get(&pack_cache_key(&pack), Some(range))
+            .await?
+            .ok_or(FetchError::PackUnavailable(pack))
     }
 
     /// Fetch all chunks of `entry`, using cached chunks where possible.
     async fn fetch_path_chunks(
         &self,
-        view: &ManifestView,
         path: PathHash,
-        entry: &PathEntry,
+        resolved: &Resolved,
     ) -> Result<BTreeMap<ChunkHash, Bytes>, FetchError> {
         // Serialize per path so concurrent NAR requests for the same
         // path do the work once.
         let lock = self.path_lock(path);
         let _guard = lock.lock().await;
-        self.fetch_chunks(view, entry_chunks(entry)).await
+        self.fetch_chunks(&resolved.map, entry_chunks(&resolved.entry))
+            .await
     }
 
     /// Fetch a set of chunks, using cached chunks where possible.
@@ -419,11 +301,11 @@ impl ChunkFetcher {
     /// chunk is hash-verified during extraction.
     async fn fetch_chunks(
         &self,
-        view: &ManifestView,
+        source: &ChunkMap,
         needed: BTreeSet<ChunkHash>,
     ) -> Result<BTreeMap<ChunkHash, Bytes>, FetchError> {
         let mut result: BTreeMap<ChunkHash, Bytes> = BTreeMap::new();
-        let mut missing: BTreeMap<PackHash, Vec<(ChunkHash, ChunkLocation)>> = BTreeMap::new();
+        let mut missing: BTreeMap<PackKey, Vec<(ChunkHash, ChunkLocation)>> = BTreeMap::new();
         {
             let mut cache = self.chunk_cache.lock().expect("chunk cache poisoned");
             for chunk in needed {
@@ -431,8 +313,7 @@ impl ChunkFetcher {
                     result.insert(chunk, data);
                     continue;
                 }
-                let location = view
-                    .manifest
+                let location = source
                     .chunks
                     .get(&chunk)
                     .ok_or(FetchError::UnknownChunk(chunk))?;
@@ -447,10 +328,7 @@ impl ChunkFetcher {
         // while it talks to the GHA cache API. The semaphore is never
         // closed, so acquire only fails after close.
         let fetches = missing.into_iter().map(|(pack, chunks)| {
-            // Present by construction: the index covers every pack the
-            // manifest's chunk table mentions, and the locations above came
-            // from that table.
-            let index = Arc::clone(&view.pack_index[&pack]);
+            let index = Arc::clone(&source.packs[&pack]);
             async move {
                 let _permit = self
                     .fetch_semaphore
@@ -479,9 +357,9 @@ impl ChunkFetcher {
     /// caches all of them.
     async fn fetch_from_pack(
         &self,
-        pack: PackHash,
+        pack: PackKey,
         mut chunks: Vec<(ChunkHash, ChunkLocation)>,
-        index: Arc<PackChunkIndex>,
+        index: Arc<PackIndex>,
     ) -> Result<Vec<(ChunkHash, Bytes)>, FetchError> {
         chunks.sort_by_key(|(_, location)| location.offset);
         let chunk_count = chunks.len();
@@ -489,7 +367,7 @@ impl ChunkFetcher {
             .iter()
             .map(|(_, location)| (location.offset, location.compressed_size))
             .collect();
-        let ranges = plan_pack_reads(&spans, index.end);
+        let ranges = plan_pack_reads(&spans, index.size());
 
         let started = Instant::now();
         let range_count = ranges.len();
@@ -582,31 +460,34 @@ fn plan_pack_reads(spans: &[(u64, u32)], pack_end: u64) -> Vec<std::ops::Range<u
 /// All chunks of a pack that lie fully inside `range`, as
 /// `(offset, size, hash)`.
 fn chunks_in_range<'a>(
-    index: &'a PackChunkIndex,
+    index: &'a PackIndex,
     range: &'a std::ops::Range<u64>,
 ) -> impl Iterator<Item = (u64, u32, ChunkHash)> + 'a {
-    let start = index
-        .chunks
-        .partition_point(|(offset, ..)| *offset < range.start);
-    index.chunks[start..]
+    let start = index.entries.partition_point(|e| e.offset < range.start);
+    index.entries[start..]
         .iter()
-        .take_while(move |(offset, ..)| *offset < range.end)
-        .filter(move |(offset, size, _)| offset + u64::from(*size) <= range.end)
-        .copied()
+        .take_while(move |e| e.offset < range.end)
+        .filter(move |e| e.offset + u64::from(e.compressed_size) <= range.end)
+        .map(|e| (e.offset, e.compressed_size, e.hash))
 }
 
 /// Mark manifest packs missing from one REST listing of `pack-*` entries
 /// as evicted. Bails out above `max_entries`: a partial listing can prove
 /// presence but never absence. Errors are logged, not fatal: the NAR
 /// handler's lazy negative cache remains the backstop.
-pub async fn verify_packs(rest: &RestClient, store: &ManifestStore, max_entries: u64) {
+pub async fn verify_packs(backend: &Backend, store: &ManifestStore, max_entries: u64) {
     // One view for the whole comparison: marks must land on the same
-    // manifest generation the listing was compared against.
+    // generation the listing was compared against.
     let view = store.view();
-    if view.pack_index.is_empty() {
+    let packs = view
+        .snapshot
+        .as_ref()
+        .map(|s| s.pack_hashes())
+        .unwrap_or_default();
+    if packs.is_empty() {
         return;
     }
-    let listed = match rest.list_caches_bounded("pack-", max_entries).await {
+    let listed = match backend.list("pack-", Some(max_entries)).await {
         Ok(Some(entries)) => entries,
         Ok(None) => {
             eprintln!(
@@ -615,6 +496,9 @@ pub async fn verify_packs(rest: &RestClient, store: &ManifestStore, max_entries:
             );
             return;
         }
+        // Listing needs GITHUB_TOKEN, which build jobs may not grant. The NAR
+        // handler's lazy negative cache still catches evictions.
+        Err(GhaError::MissingEnv(_)) => return,
         Err(err) => {
             eprintln!("hestia substituter: upfront pack verification failed: {err}");
             return;
@@ -622,7 +506,7 @@ pub async fn verify_packs(rest: &RestClient, store: &ManifestStore, max_entries:
     };
     let present: BTreeSet<&str> = listed.iter().map(|entry| entry.key.as_str()).collect();
     let mut evicted = 0usize;
-    for pack in view.pack_index.keys() {
+    for pack in &packs {
         if !present.contains(pack_cache_key(pack).as_str()) {
             view.mark_pack_missing(*pack);
             evicted += 1;
@@ -630,19 +514,16 @@ pub async fn verify_packs(rest: &RestClient, store: &ManifestStore, max_entries:
     }
     if evicted > 0 {
         eprintln!(
-            "hestia substituter: {evicted} of {} packs the manifest references were \
-             evicted from the cache; their paths will be rebuilt or fetched upstream",
-            view.pack_index.len()
+            "hestia substituter: {evicted} of {} referenced packs were evicted from the \
+             cache; their paths will be rebuilt or fetched upstream",
+            packs.len()
         );
     }
 }
 
-/// Reloads the served manifest from the cache backend (the daemon wires
-/// this to a SaveMutable load + ManifestStore::set_version_if_newer). The
-/// NAR handler invokes it when a pack the current view points at is gone:
-/// a concurrent gc repack moves live chunks into new packs and deletes the
-/// old ones, so the committed manifest knows where the data went while the
-/// daemon's view does not.
+/// Reloads the served view from the backend. The NAR handler invokes it
+/// when a pack the current view points at is gone: a concurrent GC repack
+/// moved live chunks into new packs, which only a fresh listing shows.
 pub type ManifestReload =
     Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
@@ -653,8 +534,7 @@ pub type ManifestReload =
 /// idle clock once at request start.
 pub type ActivityHook = Arc<dyn Fn() -> Box<dyn Send> + Send + Sync>;
 
-/// Signals that the startup manifest load (including a
-/// `--wait-manifest-version` wait) has finished. Narinfo requests block on
+/// Signals that the startup load has finished. Narinfo requests block on
 /// it so an early `nix build` cannot race the load and see spurious misses.
 pub type ManifestReady = tokio::sync::watch::Receiver<bool>;
 
@@ -674,14 +554,13 @@ impl Substituter {
         store_dir: StoreDir,
         manifest: ManifestStore,
         access_log: AccessLog,
-        twirp: TwirpClient,
-        http: reqwest::Client,
+        backend: Backend,
     ) -> Self {
         Self {
             store_dir,
             manifest,
             access_log,
-            fetcher: ChunkFetcher::new(twirp, http),
+            fetcher: ChunkFetcher::new(backend),
             activity_hook: None,
             manifest_reload: None,
             manifest_ready: None,
@@ -796,15 +675,14 @@ async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>
     };
 
     let view = state.manifest.view();
-    let Some(entry) = view.manifest.paths.get(&path_hash) else {
-        // Miss: Nix falls through to the next substituter.
+    let Some(entry) = view.lookup(&path_hash) else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
     // A needed pack is evicted: miss, so Nix falls through instead of
     // attempting a doomed copy. No access recorded: an unservable path
     // must not join the GC root.
-    if !view.entry_available(entry) {
+    if !view.available(&path_hash).await {
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -812,7 +690,7 @@ async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>
     // run's GC root at the next drain.
     state.access_log.record(path_hash);
 
-    let body = narinfo_for_entry(&state.store_dir, entry, hash_str);
+    let body = narinfo_for_entry(&state.store_dir, &entry, hash_str);
     ([(header::CONTENT_TYPE, "text/x-nix-narinfo")], body).into_response()
 }
 
@@ -852,19 +730,20 @@ async fn nar(
             Ok(path_hash) => path_hash,
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
         },
-        None => match view.by_nar_hash.get(&nar_hash) {
-            Some(path_hash) => *path_hash,
+        None => match view
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.by_nar_hash(&nar_hash))
+        {
+            Some(path_hash) => path_hash,
             None => return StatusCode::NOT_FOUND.into_response(),
         },
     };
-    let Some(entry) = view.manifest.paths.get(&path_hash) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if entry.nar_hash != nar_hash {
-        // The URL's NAR hash does not match the entry: stale URL.
+    // A pack already seen evicted: miss without another round trip, and
+    // without recording an access for an unservable path.
+    if !view.contains(&path_hash) || !view.available(&path_hash).await {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let mut entry = entry.clone();
     let mut manifest_view = view;
 
     // A NAR download is an access (the GC liveness signal), just like a
@@ -878,26 +757,31 @@ async fn nar(
     // data. A missing pack gets one retry against a freshly loaded
     // manifest (see [`ManifestReload`]).
     let mut reloaded = false;
-    let chunks = loop {
-        match state
-            .fetcher
-            .fetch_path_chunks(&manifest_view, path_hash, &entry)
-            .await
-        {
-            Ok(chunks) => break chunks,
+    let (resolved, chunks) = loop {
+        let attempt = async {
+            let Some(resolved) = manifest_view
+                .resolve(&path_hash)
+                .await?
+                .filter(|r| r.entry.nar_hash == nar_hash)
+            else {
+                return Ok(None);
+            };
+            let chunks = state
+                .fetcher
+                .fetch_path_chunks(path_hash, &resolved)
+                .await?;
+            Ok::<_, FetchError>(Some((resolved, chunks)))
+        };
+        match attempt.await {
+            Ok(Some(done)) => break done,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
             Err(err @ (FetchError::PackUnavailable(_) | FetchError::UnknownChunk(_)))
                 if !reloaded && state.manifest_reload.is_some() =>
             {
                 reloaded = true;
-                eprintln!(
-                    "hestia substituter: {err}; reloading the manifest (concurrent gc repack?)"
-                );
+                eprintln!("hestia substituter: {err}; reloading (concurrent gc repack?)");
                 (state.manifest_reload.as_ref().expect("checked above"))().await;
                 manifest_view = state.manifest.view();
-                match manifest_view.manifest.paths.get(&path_hash) {
-                    Some(fresh) if fresh.nar_hash == nar_hash => entry = fresh.clone(),
-                    _ => return StatusCode::NOT_FOUND.into_response(),
-                }
             }
             Err(err) => {
                 // Later narinfos for paths in this pack miss upfront.
@@ -910,7 +794,7 @@ async fn nar(
         }
     };
 
-    let nar = match assemble_verified_nar(&entry, Arc::new(chunks)).await {
+    let nar = match assemble_verified_nar(&resolved.entry, Arc::new(chunks)).await {
         Ok(nar) => nar,
         Err(err) => {
             eprintln!("hestia substituter: cannot serve NAR for {path_hash}: {err}");
@@ -993,12 +877,13 @@ const CLOSURE_EXPORT_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 /// Split a closure into windows of roughly [`CLOSURE_EXPORT_WINDOW_BYTES`]
 /// of NAR data, keeping the closure order (a path bigger than the budget
 /// gets its own window).
-fn export_windows(manifest: &Manifest, order: &[PathHash]) -> Vec<Vec<PathHash>> {
+fn export_windows(order: &[(PathHash, PathEntry)]) -> Vec<Vec<PathHash>> {
     let mut windows = Vec::new();
     let mut window = Vec::new();
     let mut window_bytes = 0u64;
-    for &path_hash in order {
-        let nar_size = manifest.paths[&path_hash].nar_size;
+    for (path_hash, entry) in order {
+        let path_hash = *path_hash;
+        let nar_size = entry.nar_size;
         if !window.is_empty() && window_bytes + nar_size > CLOSURE_EXPORT_WINDOW_BYTES {
             windows.push(std::mem::take(&mut window));
             window_bytes = 0;
@@ -1050,17 +935,17 @@ fn export_frame(store_dir: &StoreDir, entry: &PathEntry, nar: &[u8]) -> Vec<u8> 
 /// before referrers (`nix-store --import` registers paths in stream
 /// order). References pointing outside the manifest (upstream paths) are
 /// skipped. Iterative DFS: drv chains can be deep.
-fn closure_order(manifest: &Manifest, roots: &[PathHash]) -> Vec<PathHash> {
+fn closure_order(view: &ManifestView, roots: &[PathHash]) -> Vec<(PathHash, PathEntry)> {
     let mut order = Vec::new();
     let mut seen = BTreeSet::new();
     for &root in roots {
         let mut stack = vec![(root, false)];
         while let Some((hash, children_done)) = stack.pop() {
-            let Some(entry) = manifest.paths.get(&hash) else {
+            let Some(entry) = view.lookup(&hash) else {
                 continue;
             };
             if children_done {
-                order.push(hash);
+                order.push((hash, entry));
                 continue;
             }
             if !seen.insert(hash) {
@@ -1078,15 +963,14 @@ fn closure_order(manifest: &Manifest, roots: &[PathHash]) -> Vec<PathHash> {
     order
 }
 
-fn closure_roots(manifest: &Manifest, hashes: &str) -> Option<Vec<PathHash>> {
+fn closure_roots(view: &ManifestView, hashes: &str) -> Option<Vec<PathHash>> {
     let roots: Vec<PathHash> = hashes
         .split(',')
         .filter(|part| !part.is_empty())
         .map(str::parse)
         .collect::<Result<_, _>>()
         .ok()?;
-    (!roots.is_empty() && roots.iter().all(|root| manifest.paths.contains_key(root)))
-        .then_some(roots)
+    (!roots.is_empty() && roots.iter().all(|root| view.contains(root))).then_some(roots)
 }
 
 /// Fetch and frame one window of a closure export.
@@ -1095,10 +979,18 @@ async fn export_window(
     view: &ManifestView,
     window: &[PathHash],
 ) -> Result<Vec<u8>, String> {
-    let entries: Vec<(PathHash, &PathEntry)> = window
-        .iter()
-        .map(|hash| (*hash, &view.manifest.paths[hash]))
-        .collect();
+    let mut entries = Vec::with_capacity(window.len());
+    let mut source = ChunkMap::default();
+    for hash in window {
+        let r = view
+            .resolve(hash)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("path vanished")?;
+        source.chunks.extend(r.map.chunks);
+        source.packs.extend(r.map.packs);
+        entries.push((*hash, r.entry));
+    }
     let needed: BTreeSet<ChunkHash> = entries
         .iter()
         .flat_map(|(_, entry)| entry_chunks(entry))
@@ -1106,7 +998,7 @@ async fn export_window(
     let chunks = Arc::new(
         state
             .fetcher
-            .fetch_chunks(view, needed)
+            .fetch_chunks(&source, needed)
             .await
             .map_err(|err| {
                 eprintln!("hestia substituter: closure export chunk fetch failed: {err}");
@@ -1118,13 +1010,13 @@ async fn export_window(
     for (path_hash, entry) in entries {
         // Prefetched paths are accesses (GC liveness), same as narinfo hits.
         state.access_log.record(path_hash);
-        let nar = assemble_verified_nar(entry, Arc::clone(&chunks))
+        let nar = assemble_verified_nar(&entry, Arc::clone(&chunks))
             .await
             .map_err(|err| {
                 eprintln!("hestia substituter: closure export failed at {path_hash}: {err}");
                 err
             })?;
-        out.extend_from_slice(&export_frame(&state.store_dir, entry, &nar));
+        out.extend_from_slice(&export_frame(&state.store_dir, &entry, &nar));
     }
     Ok(out)
 }
@@ -1136,10 +1028,10 @@ async fn closure(State(state): State<Arc<Substituter>>, Path(hashes): Path<Strin
     let view = state.manifest.view();
     // Every requested root must be servable; a partial closure would make
     // the import succeed and the subsequent build fail confusingly.
-    let Some(roots) = closure_roots(&view.manifest, &hashes) else {
+    let Some(roots) = closure_roots(&view, &hashes) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let order = closure_order(&view.manifest, &roots);
+    let order = closure_order(&view, &roots);
 
     // Stream the closure in windows: each window's chunks are fetched as
     // one batch, and the next window downloads while the current one is
@@ -1147,7 +1039,7 @@ async fn closure(State(state): State<Arc<Substituter>>, Path(hashes): Path<Strin
     // which fails the client's import (never a silently truncated but
     // well-formed stream).
     use futures_util::StreamExt as _;
-    let windows = export_windows(&view.manifest, &order);
+    let windows = export_windows(&order);
     let frames = futures_util::stream::iter(windows)
         .map(move |window| {
             let state = state.clone();
@@ -1185,16 +1077,11 @@ async fn closure_external_references(
     state.manifest_ready().await;
 
     let view = state.manifest.view();
-    let roots = closure_roots(&view.manifest, &hashes).ok_or(StatusCode::NOT_FOUND)?;
-    Ok(closure_order(&view.manifest, &roots)
-        .into_iter()
-        .flat_map(|hash| view.manifest.paths[&hash].references.iter())
-        .filter(|reference| {
-            !view
-                .manifest
-                .paths
-                .contains_key(&PathHash::from_store_path(reference))
-        })
+    let roots = closure_roots(&view, &hashes).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(closure_order(&view, &roots)
+        .iter()
+        .flat_map(|(_, entry)| entry.references.iter())
+        .filter(|reference| !view.contains(&PathHash::from_store_path(reference)))
         .map(|reference| format!("{}/{reference}", state.store_dir))
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -1206,6 +1093,12 @@ async fn closure_external_references(
 mod tests {
     use super::*;
     use crate::manifest::{ChunkList, FileTree, Regular};
+
+    fn unused_backend() -> Backend {
+        let http = reqwest::Client::new();
+        let twirp = crate::gha::twirp::TwirpClient::new(http.clone(), "http://unused", "token");
+        Backend::new(twirp, Err("GITHUB_TOKEN"), http)
+    }
 
     fn test_path_hash(seed: u8) -> PathHash {
         PathHash(crate::manifest::StorePathHash::new([seed; 20]))
@@ -1225,45 +1118,19 @@ mod tests {
                 executable: false,
                 contents: ChunkList::default(),
             })),
-            last_reachable: 0,
-            last_pushed: 0,
         }
     }
 
-    #[test]
-    fn manifest_store_indexes_nar_hashes() {
-        let store = ManifestStore::new();
-        assert_eq!(store.path_count(), 0);
-
-        let mut manifest = Manifest::new();
-        manifest.paths.insert(test_path_hash(1), test_entry(1));
-        manifest.paths.insert(test_path_hash(2), test_entry(2));
-        store.set(manifest);
-
-        assert_eq!(store.path_count(), 2);
-        let view = store.view();
-        assert_eq!(
-            view.by_nar_hash.get(&Hash32::digest([1])),
-            Some(&test_path_hash(1))
-        );
-        assert_eq!(view.by_nar_hash.get(&Hash32::digest([99])), None);
-    }
-
     #[tokio::test(start_paused = true)]
-    async fn narinfo_waits_for_the_startup_manifest_load() {
-        let mut manifest = Manifest::new();
-        manifest.paths.insert(test_path_hash(1), test_entry(1));
+    async fn narinfo_waits_for_the_startup_load() {
         let store = ManifestStore::new();
-        store.set(manifest);
-
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
         let state = Arc::new(
             Substituter::new(
                 StoreDir::default(),
                 store,
                 AccessLog::new(),
-                TwirpClient::new(reqwest::Client::new(), "http://unused", "token"),
-                reqwest::Client::new(),
+                unused_backend(),
             )
             .with_manifest_ready(ready_rx),
         );
@@ -1273,17 +1140,16 @@ mod tests {
             Path(format!("{}.narinfo", test_path_hash(1))),
         ));
         // The gate is closed: the request must still be pending.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert!(!request.is_finished(), "narinfo answered before the load");
 
         ready_tx.send(true).unwrap();
         let response = request.await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
     fn export_windows_split_by_nar_bytes() {
-        let mut manifest = Manifest::default();
         let sizes = [
             CLOSURE_EXPORT_WINDOW_BYTES / 2,
             CLOSURE_EXPORT_WINDOW_BYTES / 2, // fills the first window
@@ -1291,18 +1157,17 @@ mod tests {
             1,
             1,
         ];
-        let order: Vec<PathHash> = sizes
+        let entries: Vec<(PathHash, PathEntry)> = sizes
             .iter()
             .enumerate()
             .map(|(seed, &nar_size)| {
-                let hash = test_path_hash(seed as u8);
                 let mut entry = test_entry(seed as u8);
                 entry.nar_size = nar_size;
-                manifest.paths.insert(hash, entry);
-                hash
+                (test_path_hash(seed as u8), entry)
             })
             .collect();
-        let windows = export_windows(&manifest, &order);
+        let order: Vec<PathHash> = entries.iter().map(|(h, _)| *h).collect();
+        let windows = export_windows(&entries);
         assert_eq!(
             windows,
             vec![
@@ -1339,14 +1204,14 @@ mod tests {
 
     #[test]
     fn chunks_in_range_selects_only_fully_contained_chunks() {
-        let index = PackChunkIndex {
-            end: 1000,
-            chunks: vec![
-                (0, 100, ChunkHash::digest([0])),
-                (100, 100, ChunkHash::digest([1])),
-                (300, 100, ChunkHash::digest([2])),
-                (350, 100, ChunkHash::digest([3])), // straddles range end
-            ],
+        let e = |offset, seed: u8| crate::segment::PackIndexEntry {
+            hash: ChunkHash::digest([seed]),
+            offset,
+            compressed_size: 100,
+            uncompressed_size: 0,
+        };
+        let index = PackIndex {
+            entries: vec![e(0, 0), e(100, 1), e(300, 2), e(350, 3)], // last straddles range end
         };
         let selected: Vec<ChunkHash> = chunks_in_range(&index, &(100..400))
             .map(|(.., hash)| hash)
@@ -1359,10 +1224,7 @@ mod tests {
 
     #[test]
     fn unused_path_locks_are_pruned() {
-        let fetcher = ChunkFetcher::new(
-            TwirpClient::new(reqwest::Client::new(), "http://unused", "token"),
-            reqwest::Client::new(),
-        );
+        let fetcher = ChunkFetcher::new(unused_backend());
         let held = fetcher.path_lock(test_path_hash(1));
         drop(fetcher.path_lock(test_path_hash(2)));
         // The next call prunes everything no request holds.

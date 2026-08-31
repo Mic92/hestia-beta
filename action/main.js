@@ -349,13 +349,24 @@ function warnIfHookCannotFire() {
   }
 }
 
+/** `repository.default_branch` from the event payload, else `main`. */
+function defaultBranch() {
+  try {
+    const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+    return event.repository?.default_branch || 'main';
+  } catch {
+    return 'main';
+  }
+}
+
 /**
  * Extra `hestia serve` flags from optional inputs. Only emitted when set,
  * so older release binaries (which lack these flags) keep working with the
  * default inputs.
  */
 function serveFlags() {
-  const flags = [];
+  // Serve the default branch's root next to this job's, whatever it is called.
+  const flags = ['--serve-branch', defaultBranch()];
   if (getInput('upstream-cache-filter') === 'true') {
     flags.push('--upstream-cache-filter');
   }
@@ -371,9 +382,14 @@ function serveFlags() {
   if (readOnly()) {
     flags.push('--read-only');
   }
-  const waitManifestVersion = getInput('wait-manifest-version');
-  if (waitManifestVersion && waitManifestVersion !== '0') {
-    flags.push('--wait-manifest-version', waitManifestVersion);
+  let waitHead = getInput('wait-head');
+  const legacyWait = getInput('wait-manifest-version');
+  if (!waitHead && legacyWait) {
+    console.log('::warning::hestia: wait-manifest-version is deprecated, use wait-head');
+    waitHead = legacyWait;
+  }
+  if (waitHead) {
+    flags.push('--wait-head', waitHead);
   }
   return flags;
 }
@@ -382,9 +398,8 @@ function serveFlags() {
 function startDaemon(hestiaBin, listen, socket, logFile) {
   const log = fs.openSync(logFile, 'a');
   const args = ['serve', '--listen', listen, '--socket', socket, ...serveFlags()];
-  // GITHUB_TOKEN enables the daemon's upfront pack verification (needs
-  // actions:read; without it the REST listing 403s and the daemon falls
-  // back to lazy eviction detection). Spawn-env only: not exported to
+  // GITHUB_TOKEN lets the daemon list heads and verify packs (needs
+  // actions:read, without it the daemon substitutes nothing). Spawn-env only: not exported to
   // later job steps.
   const env = { ...process.env }; // carries ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL
   const githubToken = getInput('github-token');

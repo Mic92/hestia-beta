@@ -17,7 +17,7 @@ job builds, and an HTTP listener serving the Nix binary cache protocol.
 
 The action puts the daemon first in `extra-substituters`, so Nix asks
 it before cache.nixos.org. A narinfo hit answers straight from the
-manifest. A NAR request is more involved: the daemon fetches the path's
+segments loaded at startup. A NAR request is more involved: the daemon fetches the path's
 chunks from pack blobs with HTTP Range reads, reassembles the NAR, and
 verifies its hash before the first byte leaves the process. Any failure
 along the way (evicted pack, missing chunk, hash mismatch) becomes a
@@ -32,37 +32,51 @@ Nix runs `hestia hook` after every successful build; the hook forwards
 the built paths over the unix socket and the daemon buffers them in
 memory. Uploads happen on drain: the action's post step, the idle
 timeout, or SIGTERM. A drain takes the buffered paths plus everything
-the substituter served, chunks the new ones, uploads packs, and commits
-a new manifest version.
+the substituter served, chunks the new ones, uploads packs, and
+publishes a segment plus a head naming it.
 
 ## Storage view
 
-![manifest and pack layout](architecture.svg)
+![segments, heads and packs](segments.svg)
 
-hestia creates only two kinds of cache entry: the manifest, and pack
-blobs.
+hestia creates three kinds of cache entry, all write-once: pack blobs
+(`pack-<sha256>-<nonce>`, chunk frames followed by their index), segments
+(`seg-<sha256>-<nonce>` for the `.meta` part, which names its
+`tree-<sha256>-<nonce>`), and heads (`g-*`, `h-*`). Everything but a
+head carries the SHA-256 of its bytes in its name and is verified
+against it on every read; the nonce makes every upload a distinct key,
+so a writer never inherits another writer's (possibly half-finished)
+entry and a key always identifies exactly one claim. On OCI the blob
+itself is stored by digest and the nonce lives in the manifest.
 
-### Manifest
+### Segments and heads
 
-The manifest is a single zstd-compressed CBOR document describing
-everything hestia has stored: four maps over paths, chunks, packs, and
-GC roots. The wire form is columnar (hash tables plus parallel arrays)
-to keep repeated 32-byte hashes from bloating the encoding; the
-in-memory form is plain B-tree maps optimized for merging.
+A segment is what one writer published for one root: `.meta` holds a
+sorted path index, per-path narinfo fields and a pack table with a
+live-chunk bitset per pack; `.tree` holds the file trees, where a
+file's contents is a list of `(pack row, index in pack)` references
+plus reference rewrites (see below). Nothing in a segment is ever
+modified, so there is no merge conflict to resolve: concurrent drains
+simply publish one segment each. Lengths, table indices
+and nesting depth read from a segment are bounds-checked before use:
+storage is untrusted input.
 
-The cache is write-once, but the manifest must change. SaveMutable (a
-pattern borrowed from go-actions-cache) fakes mutability with a key
-sequence `m#1`, `m#2`, …: the highest index is the current version, and
-a writer claims the next index by reserving it. When two drains race,
-one loses the reservation, reloads the winner's version, merges its own
-changes on top, and tries again. All manifest merges are commutative
-and idempotent, so the outcome does not depend on who wins.
-
-A `PathEntry` holds what narinfo needs (store path, NAR hash and size,
-references) plus the path's file tree, where each file's contents is a
-list of chunk hashes (plus a table of reference rewrites -- see below).
-Chunk hashes resolve through the `chunks` map to a location: which
-pack, at what offset, how many bytes.
+Which segments make up a root is decided by heads, small CBOR records:
+`h-<epoch>-<root>-<time>-<sha256>` (a drain's claim: root name, the GC
+epoch it read, the segment it added) and `g-<epoch>-<time>-<sha256>`
+(GC's record: one base segment per root). The name is derived from the
+body, so a body is valid under exactly one name. A reader lists the
+heads, takes the newest GC record as the base and adds the segments of
+drain heads of the roots it serves that are based on this epoch or the
+one before. A drain therefore re-lists when it starts rather than
+claiming against the view `serve` loaded hours earlier, and keeps
+serving what it published itself for that window even if the listing
+lags. Writers only ever append; nothing but GC merges or replaces
+segments, so the view rule is a plain union and a busy root simply has
+more segments to fetch in parallel until the next GC.
+`docs/spec/segments.qnt` is the model of these rules (R1–R5 in its
+header), `docs/spec/trust.qnt` the model of what a malicious writer can
+do under each trust policy.
 
 ### Packs
 
@@ -70,10 +84,9 @@ Store paths are not cached one entry each. NARs are split into
 content-defined chunks (FastCDC, 16–256 KiB, 64 KiB average), each
 chunk is zstd-compressed individually, and compressed chunks are
 concatenated into pack blobs of about 64 MiB. The pack key is the
-BLAKE3 of the blob, so identical packs dedup naturally and a finalized
-pack can be trusted to match its name. Chunk and pack hashes use BLAKE3
-(~3x faster than SHA-256 and unconstrained by any Nix format); NAR
-hashes stay SHA-256, since Nix records and verifies those.
+SHA-256 of the blob, so identical packs dedup naturally and a finalized
+pack can be trusted to match its name. Chunk hashes use BLAKE3 (the hot
+path, ~3x faster and unconstrained by any format).
 
 This layout buys three things. Chunking dedups across paths and
 versions: a rebuilt package shares most of its chunks with the previous
@@ -115,18 +128,35 @@ serving. Any disagreement is a 404, and Nix falls through.
 ### Roots and GC
 
 What stays alive is decided by roots, one per branch and system (e.g.
-`main-x86_64-linux`). Every drain rewrites its root to the paths the
-job pushed or accessed. Roots from the same workflow run merge by
-union, so matrix legs accumulate into one closure no matter how far
-apart they finish; a later run replaces the root, which is what lets
-old closures die. The full GC story (mark, sweep, repack, eviction
-touching) lives at the top of `src/gc.rs`.
+`main-x86_64-linux`). Every drain publishes a segment naming what the
+job pushed, found stored, or substituted. GC compacts each root to the
+union of what drains named since its previous run, so matrix legs and
+re-runs accumulate while closures no job uses any more die. GC is the
+only deleter and the only rewriter: it repacks mostly-dead packs,
+publishes the new GC head and only then deletes, from its own listing,
+what is reachable from neither the new view nor the one it loaded and
+is older than a drain could take. The previous `g-*` therefore survives
+one epoch, and everything the new view reaches (heads, `.meta`, `.tree`,
+packs) gets its LRU clock reset. A root whose claims cannot all be read
+or merged is carried over unmerged (`RootRow.unmerged`) and retried next
+run: a read error costs an epoch of compaction, never a path. A `g-*`
+that is listed but cannot be fetched, or a verifier that cannot run,
+aborts the run instead (`src/gc.rs`).
+
+On the Actions cache GC lists, reads and deletes only the default
+branch's scope: PR scopes are neither readable from there nor GC's to
+manage, GitHub drops them with the branch. A drain re-lists `g-*` right
+before publishing its head and reloads if GC ran twice since it started,
+so a head is never published under a base readers already ignore.
 
 ### Crash safety
 
 Order of operations does the heavy lifting. Packs are uploaded before
-the manifest version that references them, so a manifest never points
-at a blob that was never finalized. A crash between the two leaves an
-orphaned pack, which GC's orphan scan deletes later. The reverse
-hazard, GitHub evicting a pack the manifest still references, is
-handled at read time (404 → next substituter) and reconciled by GC.
+the segment that references them, the segment before its head, so a
+head never points at a blob that was never finalized. A crash in
+between leaves orphans (on the Actions cache possibly a reserved key
+that will never hold data), which GC deletes once they are older than a
+drain could take; thanks to the nonce no later writer ever lands on
+such a key. The reverse hazard, GitHub evicting a pack a segment
+still references, is handled at read time (404 → next substituter) and
+by GC dropping the affected entries so the next job pushes them again.

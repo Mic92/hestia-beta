@@ -299,8 +299,14 @@ async fn list_retries_transient_server_errors() {
             )
             .with_state(state.clone());
         let url = start_server(router).await;
-        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
-            .with_pacing(Duration::ZERO, Duration::from_millis(100));
+        let rest = RestClient::new(
+            reqwest::Client::new(),
+            &url,
+            "fake/repo",
+            "refs/heads/main",
+            "fake-token",
+        )
+        .with_pacing(Duration::ZERO, Duration::from_millis(100));
 
         // A single transient 502 during pagination must not abort the whole
         // GC run; the data plane (blob.rs) already retries 5xx with backoff
@@ -327,8 +333,14 @@ async fn persistent_server_errors_still_fail() {
             )
             .with_state(state.clone());
         let url = start_server(router).await;
-        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
-            .with_pacing(Duration::ZERO, Duration::from_millis(10));
+        let rest = RestClient::new(
+            reqwest::Client::new(),
+            &url,
+            "fake/repo",
+            "refs/heads/main",
+            "fake-token",
+        )
+        .with_pacing(Duration::ZERO, Duration::from_millis(10));
 
         let err = rest.list_caches("pack-").await.unwrap_err();
         assert!(
@@ -344,8 +356,14 @@ async fn persistent_server_errors_still_fail() {
 async fn delete_retries_after_secondary_rate_limit() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (url, state) = start_rate_limited_server(1).await;
-        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
-            .with_pacing(Duration::ZERO, Duration::from_millis(100));
+        let rest = RestClient::new(
+            reqwest::Client::new(),
+            &url,
+            "fake/repo",
+            "refs/heads/main",
+            "fake-token",
+        )
+        .with_pacing(Duration::ZERO, Duration::from_millis(100));
 
         // GitHub answered the first DELETE with a secondary rate limit
         // error; the client must wait and retry instead of failing GC.
@@ -361,8 +379,14 @@ async fn delete_retries_after_secondary_rate_limit() {
 async fn list_retries_after_secondary_rate_limit() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (url, state) = start_rate_limited_server(1).await;
-        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
-            .with_pacing(Duration::ZERO, Duration::from_millis(100));
+        let rest = RestClient::new(
+            reqwest::Client::new(),
+            &url,
+            "fake/repo",
+            "refs/heads/main",
+            "fake-token",
+        )
+        .with_pacing(Duration::ZERO, Duration::from_millis(100));
 
         // Reads hit the same secondary rate limit as writes when GC pages
         // through a large cache; they must retry too.
@@ -378,8 +402,14 @@ async fn list_retries_after_secondary_rate_limit() {
 async fn rate_limiting_that_never_lifts_is_an_error_not_a_hang() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (url, _state) = start_rate_limited_server(usize::MAX).await;
-        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
-            .with_pacing(Duration::ZERO, Duration::from_millis(10));
+        let rest = RestClient::new(
+            reqwest::Client::new(),
+            &url,
+            "fake/repo",
+            "refs/heads/main",
+            "fake-token",
+        )
+        .with_pacing(Duration::ZERO, Duration::from_millis(10));
 
         let err = rest.delete_by_key("pack-never").await.unwrap_err();
         assert!(
@@ -396,8 +426,14 @@ async fn mutating_requests_are_paced() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (url, state) = start_rate_limited_server(0).await;
         let interval = Duration::from_millis(300);
-        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
-            .with_pacing(interval, Duration::from_secs(1));
+        let rest = RestClient::new(
+            reqwest::Client::new(),
+            &url,
+            "fake/repo",
+            "refs/heads/main",
+            "fake-token",
+        )
+        .with_pacing(interval, Duration::from_secs(1));
 
         for i in 0..3 {
             rest.delete_by_key(&format!("pack-{i}")).await.unwrap();
@@ -435,7 +471,13 @@ async fn pagination_returns_every_entry_despite_concurrent_lru_reordering() {
         let expected: BTreeSet<String> = entries.iter().map(|e| e.key.clone()).collect();
 
         let url = start_github_like(entries, true).await;
-        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token");
+        let rest = RestClient::new(
+            reqwest::Client::new(),
+            &url,
+            "fake/repo",
+            "refs/heads/main",
+            "fake-token",
+        );
 
         let listed = rest.list_caches("pack-").await.unwrap();
         let unique: BTreeSet<String> = listed.iter().map(|e| e.key.clone()).collect();
@@ -467,7 +509,13 @@ async fn pagination_does_not_trust_an_understated_total_count() {
             get(understated_total_count_handler),
         );
         let url = start_server(router).await;
-        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token");
+        let rest = RestClient::new(
+            reqwest::Client::new(),
+            &url,
+            "fake/repo",
+            "refs/heads/main",
+            "fake-token",
+        );
 
         // GC treats packs missing from this listing as evicted and drops
         // the paths referencing them, so ending the listing early on a
@@ -491,7 +539,13 @@ async fn pagination_terminates_when_server_returns_empty_pages() {
             get(empty_pages_handler),
         );
         let url = start_server(router).await;
-        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token");
+        let rest = RestClient::new(
+            reqwest::Client::new(),
+            &url,
+            "fake/repo",
+            "refs/heads/main",
+            "fake-token",
+        );
 
         // The inner timeout is the actual assertion: a server that reports
         // total_count > 0 but returns no entries must not be able to make

@@ -1,0 +1,179 @@
+//! Blob storage by string key over the GitHub Actions cache. Reads go
+//! through signed URLs (cached until they expire). Listing and deletes
+//! use the REST API and need `GITHUB_TOKEN`.
+
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+
+pub use crate::gha::Error;
+use crate::gha::blob;
+use crate::gha::rest::{CacheEntry, ENV_GITHUB_REPOSITORY, RestClient};
+use crate::gha::twirp::{DownloadUrl, Reservation, TwirpClient};
+
+const URL_TTL: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub key: String,
+    pub created: Option<u64>,
+    pub last_accessed: Option<u64>,
+}
+
+#[derive(Clone)]
+pub struct Backend {
+    twirp: TwirpClient,
+    /// The variable that was missing when there is no REST access.
+    rest: Result<RestClient, &'static str>,
+    http: reqwest::Client,
+    urls: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+}
+
+impl Backend {
+    pub fn new(
+        twirp: TwirpClient,
+        rest: Result<RestClient, &'static str>,
+        http: reqwest::Client,
+    ) -> Self {
+        Backend {
+            twirp,
+            rest,
+            http,
+            urls: Default::default(),
+        }
+    }
+
+    pub fn from_env(http: reqwest::Client) -> Result<Self, Error> {
+        let twirp = TwirpClient::from_env(http.clone())?;
+        let rest = RestClient::from_env(http.clone()).map_err(|e| match e {
+            Error::MissingEnv(v) => v,
+            _ => ENV_GITHUB_REPOSITORY,
+        });
+        Ok(Self::new(twirp, rest, http))
+    }
+
+    pub fn twirp(&self) -> &TwirpClient {
+        &self.twirp
+    }
+
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    fn rest(&self) -> Result<&RestClient, Error> {
+        self.rest.as_ref().map_err(|v| Error::MissingEnv(v))
+    }
+
+    /// Create `key`. [`Error::Exists`] if it is taken.
+    pub async fn put(&self, key: &str, data: Bytes) -> Result<(), Error> {
+        match self.twirp.create_cache_entry(key).await? {
+            Reservation::AlreadyExists => Err(Error::Exists(key.to_owned())),
+            Reservation::Created { upload_url } => {
+                self.twirp
+                    .upload_and_finalize(&self.http, key, upload_url, data)
+                    .await
+            }
+        }
+    }
+
+    async fn url(&self, key: &str, force: bool) -> Result<Option<String>, Error> {
+        if !force
+            && let Some((url, issued)) = self.urls.lock().unwrap().get(key)
+            && issued.elapsed() < URL_TTL
+        {
+            return Ok(Some(url.clone()));
+        }
+        let found = self.twirp.get_download_url(key, &[]).await?;
+        let mut urls = self.urls.lock().unwrap();
+        urls.retain(|_, (_, issued)| issued.elapsed() < URL_TTL);
+        match found {
+            DownloadUrl::Hit { url, .. } => {
+                urls.insert(key.to_owned(), (url.clone(), Instant::now()));
+                Ok(Some(url))
+            }
+            DownloadUrl::Miss => {
+                urls.remove(key);
+                Ok(None)
+            }
+        }
+    }
+
+    /// `None` if the key does not exist.
+    pub async fn get(&self, key: &str, range: Option<Range<u64>>) -> Result<Option<Bytes>, Error> {
+        let gone = || Error::Status {
+            status: 404,
+            url: key.to_owned(),
+            body: String::new(),
+        };
+        // A cached URL outlives its entry when the key was deleted and put
+        // again, so a 404 on it is retried with a fresh lookup.
+        for force in [false, true] {
+            let Some(url) = self.url(key, force).await? else {
+                return Ok(None);
+            };
+            let refresh = async || self.url(key, true).await?.ok_or_else(gone);
+            match blob::get_with_refresh(&self.http, &url, range.clone(), refresh).await {
+                Ok(bytes) => return Ok(Some(bytes)),
+                Err(Error::Status { status: 404, .. }) => {
+                    self.urls.lock().unwrap().remove(key);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(None)
+    }
+
+    /// 1-byte read to reset the LRU clock. `false` if the key is gone.
+    pub async fn touch(&self, key: &str) -> Result<bool, Error> {
+        Ok(self.get(key, Some(0..1)).await?.is_some())
+    }
+
+    /// The listing spans all `version` namespaces. Only ours count.
+    fn listed(&self, entries: Vec<CacheEntry>) -> Vec<Listed> {
+        entries
+            .into_iter()
+            .filter(|e| e.version == self.twirp.version())
+            .map(|e| Listed {
+                created: e.created_unix(),
+                last_accessed: e.last_accessed_unix(),
+                key: e.key,
+            })
+            .collect()
+    }
+
+    /// Entries in every scope this job can read. `Ok(None)` if there are
+    /// more than `limit`: a partial listing proves presence but never absence.
+    pub async fn list(
+        &self,
+        prefix: &str,
+        limit: Option<u64>,
+    ) -> Result<Option<Vec<Listed>>, Error> {
+        let entries = self
+            .rest()?
+            .list_caches_bounded(prefix, limit.unwrap_or(u64::MAX))
+            .await?;
+        Ok(entries.map(|e| self.listed(e)))
+    }
+
+    /// GC only: the `pack-`/`seg-`/`tree-` objects [`Self::delete`] can
+    /// reach, which on the Actions cache is this ref's scope.
+    pub async fn list_objects(&self) -> Result<Option<Vec<Listed>>, Error> {
+        let mut out = Vec::new();
+        for prefix in ["pack-", "seg-", "tree-"] {
+            out.extend(self.listed(self.rest()?.list_own(prefix).await?));
+        }
+        Ok(Some(out))
+    }
+
+    pub async fn delete(&self, key: &str) -> Result<bool, Error> {
+        self.urls.lock().unwrap().remove(key);
+        Ok(!self.rest()?.delete_by_key(key).await?.is_empty())
+    }
+
+    pub async fn probe_writable(&self) -> Result<bool, Error> {
+        self.twirp.probe_writable().await
+    }
+}

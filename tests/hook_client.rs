@@ -108,7 +108,8 @@ async fn hook_sends_out_paths_from_environment() {
             paths: vec![
                 "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-foo".to_string(),
                 "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-bar".to_string(),
-            ]
+            ],
+            system: None
         }
     );
 
@@ -147,7 +148,8 @@ async fn hook_prefers_explicit_arguments_over_out_paths() {
     assert_eq!(
         request,
         Request::Add {
-            paths: vec!["/nix/store/cccccccccccccccccccccccccccccccc-explicit".to_string()]
+            paths: vec!["/nix/store/cccccccccccccccccccccccccccccccc-explicit".to_string()],
+            system: None
         }
     );
 }

@@ -12,7 +12,7 @@
 
 pub mod blob;
 pub mod rest;
-pub mod savemutable;
+pub mod retry;
 pub mod twirp;
 
 /// Errors shared by all GHA cache client modules.
@@ -51,8 +51,10 @@ pub enum Error {
     #[error("invalid response: {0}")]
     InvalidResponse(String),
 
-    #[error("gave up after {attempts} conflicting attempts to save {key}")]
-    Conflict { key: String, attempts: u32 },
+    /// Keys are written once: content keys carry a per-upload nonce and
+    /// head names hash their body, so this is a bug or a replayed request.
+    #[error("{0} already exists")]
+    Exists(String),
 
     #[error(
         "cache write denied ({reason}): the runtime token is read-only, so nothing can be \

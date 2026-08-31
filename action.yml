@@ -26,9 +26,9 @@ inputs:
     default: "latest"
   github-token:
     description: >
-      Token for the attestation API lookup that verifies downloaded release
-      binaries, and for the daemon's upfront check which cached packs were
-      evicted (needs `actions: read`; skipped without it).
+      Token for listing cache entries to find what earlier jobs cached
+      (needs `actions: read`, nothing is substituted without it) and for
+      the attestation API lookup that verifies downloaded release binaries.
     required: false
     default: ${{ github.token }}
   listen:
@@ -47,7 +47,7 @@ inputs:
   drain-timeout:
     description: >
       Maximum number of seconds the post-job step waits for the final upload
-      (chunking, pack upload, manifest commit).
+      (chunking, pack upload, publish).
     required: false
     default: "300"
   upstream-cache-filter:
@@ -83,14 +83,17 @@ inputs:
       stay on upstream caches).
     required: false
     default: "false"
-  wait-manifest-version:
+  wait-head:
     description: >
-      Wait up to 60s at daemon startup until the cache manifest has at least
-      this version. Matrix build jobs pass the eval job's `manifest-version`
-      output so the just-uploaded drv closures are visible despite GHA cache
-      lookup lag.
+      Wait up to 60s at daemon startup until this head is listed. Matrix
+      build jobs pass their row's `matrix.head` (the head the eval job
+      published for that row's system) so the just-uploaded drv closures
+      are visible despite GHA cache listing lag.
     required: false
-    default: "0"
+  wait-manifest-version:
+    description: Deprecated alias of `wait-head`.
+    required: false
+    default: ""
 
 # If both `binary` and `version` are explicitly empty, the action only
 # captures and exports the cache tokens (ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL).

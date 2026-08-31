@@ -18,7 +18,7 @@ use hestia::protocol::{self, DrainStats, Request};
 use hestia::serve::Daemon;
 use hestia::substituter::{ManifestStore, Substituter};
 
-use support::common::{TEST_ROOT_KEY, committed_manifest, path_hash_of, pipeline_context};
+use support::common::{load_snapshot, path_hash_of, pipeline_context};
 use support::fake_gha::FakeGha;
 use support::store::ScratchStore;
 
@@ -74,6 +74,7 @@ impl RunningDaemon {
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect(),
+            system: None,
         })
         .await
     }
@@ -109,8 +110,8 @@ async fn read_only_daemon_never_writes() {
 
     daemon.add(&[&fixture]).await;
     let stats = daemon.stop().await.expect("final drain");
-    assert_eq!(stats.manifest_version, 0);
-    assert!(committed_manifest(&fake, &http).await.is_none());
+    assert!(stats.head.is_none());
+    assert_eq!(load_snapshot(&fake, &http).await.path_count(), 0);
     assert!(fake.blob_requests().is_empty());
 }
 
@@ -152,21 +153,70 @@ async fn hook_drain_status_lifecycle() {
     assert_eq!(stats.paths_received, 2);
     assert_eq!(stats.pushed, 2);
     assert_eq!(stats.packs_uploaded, 1);
-    assert!(stats.manifest_version > 0);
+    assert!(stats.head.is_some());
 
     // Buffer is empty afterwards.
     let status = daemon.request(&Request::Status).await;
     assert_eq!(status.buffered, Some(0));
 
-    // The manifest contains both paths.
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-    assert!(manifest.paths.contains_key(&path_hash_of(&fixture_a)));
-    assert!(manifest.paths.contains_key(&path_hash_of(&fixture_b)));
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert!(snapshot.contains(&path_hash_of(&fixture_a)));
+    assert!(snapshot.contains(&path_hash_of(&fixture_b)));
 
     // Shutdown: final drain has nothing to do.
     let final_stats = daemon.stop().await.expect("final drain failed");
     assert_eq!(final_stats.pushed, 0);
     assert_eq!(final_stats.paths_received, 0);
+}
+
+/// `hestia matrix` registers each platform's drvs with that platform as
+/// `system`: they publish under `<branch>-<system>`, where that platform's
+/// build legs look, and not under the eval job's own root.
+#[tokio::test]
+async fn add_with_system_publishes_under_that_systems_root() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let own = store.add_fixture("sys-own", 41);
+    let other = store.add_fixture("sys-other", 43);
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let daemon = RunningDaemon::start(
+        store_socket_path(&store),
+        None,
+        pipeline_context(&fake, &http, store.database()),
+    )
+    .await;
+    daemon.add(&[&own]).await;
+    let response = daemon
+        .request(&Request::Add {
+            paths: vec![other.to_string_lossy().into_owned()],
+            system: Some("riscv64-linux".into()),
+        })
+        .await;
+    assert_eq!(response.buffered, Some(2));
+    let stats = daemon.request(&Request::Drain).await.stats.unwrap();
+    assert_eq!((stats.paths_received, stats.pushed), (2, 2));
+    assert!(stats.head.is_some());
+    assert_eq!(
+        stats.heads.keys().collect::<Vec<_>>(),
+        ["riscv64-linux"],
+        "{stats:?}"
+    );
+
+    let own_root = load_snapshot(&fake, &http).await;
+    assert!(own_root.contains(&path_hash_of(&own)));
+    assert!(!own_root.contains(&path_hash_of(&other)));
+    let other_root = hestia::store::Snapshot::load(
+        fake.backend(&http),
+        &["main-riscv64-linux".to_string()],
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(other_root.contains(&path_hash_of(&other)));
+    assert!(!other_root.contains(&path_hash_of(&own)));
+    daemon.stop().await.unwrap();
 }
 
 #[tokio::test]
@@ -197,9 +247,15 @@ async fn drain_under_concurrent_hook_sends_loses_no_paths() {
         let socket = socket.clone();
         let path = fixture.to_string_lossy().into_owned();
         tasks.push(tokio::spawn(async move {
-            protocol::roundtrip(&socket, &Request::Add { paths: vec![path] })
-                .await
-                .expect("add failed");
+            protocol::roundtrip(
+                &socket,
+                &Request::Add {
+                    paths: vec![path],
+                    system: None,
+                },
+            )
+            .await
+            .expect("add failed");
         }));
     }
     for _ in 0..2 {
@@ -219,16 +275,15 @@ async fn drain_under_concurrent_hook_sends_loses_no_paths() {
     // Shutdown drains whatever the racing drains did not catch.
     daemon.stop().await.expect("final drain failed");
 
-    // No path lost: all fixtures are in the manifest and pinned by the root.
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
+    // No path lost.
+    let snapshot = load_snapshot(&fake, &http).await;
     for fixture in &fixtures {
         let hash = path_hash_of(fixture);
         assert!(
-            manifest.paths.contains_key(&hash),
+            snapshot.contains(&hash),
             "path {} lost during concurrent hook/drain",
             fixture.display()
         );
-        assert!(manifest.roots[TEST_ROOT_KEY].paths.contains(&hash));
     }
 }
 
@@ -256,8 +311,8 @@ async fn shutdown_drains_buffered_paths() {
     assert_eq!(stats.pushed, 1);
     assert_eq!(stats.packs_uploaded, 1);
 
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-    assert!(manifest.paths.contains_key(&path_hash_of(&fixture)));
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert!(snapshot.contains(&path_hash_of(&fixture)));
 }
 
 #[tokio::test]
@@ -289,6 +344,7 @@ async fn idle_exit_drains_and_returns() {
         &socket,
         &Request::Add {
             paths: vec![fixture.to_string_lossy().into_owned()],
+            system: None,
         },
     )
     .await
@@ -302,8 +358,8 @@ async fn idle_exit_drains_and_returns() {
         .expect("final drain failed");
     assert_eq!(stats.pushed, 1);
 
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-    assert!(manifest.paths.contains_key(&path_hash_of(&fixture)));
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert!(snapshot.contains(&path_hash_of(&fixture)));
 }
 
 #[tokio::test]
@@ -372,6 +428,7 @@ async fn failed_drain_keeps_paths_buffered_for_retry() {
     daemon
         .request(&Request::Add {
             paths: vec!["/nix/store/00000000000000000000000000000000-some-path".to_string()],
+            system: None,
         })
         .await;
 
@@ -709,8 +766,7 @@ async fn substituter_serves_paths_pushed_by_daemon_drains() {
             store.database().store_dir().clone(),
             daemon.manifest_store.clone(),
             daemon.access_log.clone(),
-            fake.twirp(&http),
-            http.clone(),
+            fake.backend(&http),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -763,8 +819,7 @@ async fn substituter_serves_paths_pushed_by_daemon_drains() {
         // was pushed.
         daemon.stop().await.expect("final drain failed");
         server.abort();
-        let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-        assert!(manifest.roots[TEST_ROOT_KEY].paths.contains(&hash));
+        assert!(load_snapshot(&fake, &http).await.contains(&hash));
     };
     tokio::time::timeout(Duration::from_secs(120), test)
         .await

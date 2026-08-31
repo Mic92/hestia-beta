@@ -55,6 +55,16 @@ pub struct ServeArgs {
     #[arg(long)]
     pub system: Option<String>,
 
+    /// Also serve paths pushed under these branches' roots (same system).
+    #[arg(long = "serve-branch", value_name = "BRANCH", default_value = "main")]
+    pub serve_branches: Vec<String>,
+
+    /// Wait up to 60s at startup until this head is listed. Build jobs
+    /// pass the head an eval job published so its drv closures are
+    /// visible despite cache listing lag.
+    #[arg(long, value_name = "NAME", alias = "wait-manifest-version")]
+    pub wait_head: Option<String>,
+
     /// Skip paths signed by an upstream cache (see
     /// --upstream-cache-key-name) instead of caching them.
     #[arg(long)]
@@ -89,13 +99,6 @@ pub struct ServeArgs {
     /// Nix store database to read path metadata from.
     #[arg(long, default_value = crate::pathinfo::DEFAULT_DB_PATH)]
     pub db_path: PathBuf,
-
-    /// Wait up to 60s at startup until the loaded manifest's version is at
-    /// least this (0 = don't wait). Build jobs pass the version committed
-    /// by an eval job so its drv closures are visible despite GHA cache
-    /// lookup lag.
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    pub wait_manifest_version: u64,
 }
 
 #[derive(Args, Debug)]
@@ -170,15 +173,7 @@ pub struct GcArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Grace period in days before unreachable paths become garbage.
-    #[arg(long, value_name = "DAYS", default_value_t = 3)]
-    pub grace: u64,
-
-    /// Paths pushed within this many days are kept even when unreachable.
-    #[arg(long, value_name = "DAYS", default_value_t = 14)]
-    pub push_ttl: u64,
-
-    /// Roots not updated for this many days are dropped.
+    /// Roots without a drain for this many days are dropped.
     #[arg(long, value_name = "DAYS", default_value_t = 14)]
     pub root_ttl: u64,
 
@@ -336,8 +331,6 @@ mod tests {
             panic!("expected gc");
         };
         assert!(!args.dry_run);
-        assert_eq!(args.grace, 3);
-        assert_eq!(args.push_ttl, 14);
         assert_eq!(args.root_ttl, 14);
         assert_eq!(args.touch_age, 4);
 
@@ -345,10 +338,6 @@ mod tests {
             "hestia",
             "gc",
             "--dry-run",
-            "--grace",
-            "14",
-            "--push-ttl",
-            "30",
             "--root-ttl",
             "60",
             "--touch-age",
@@ -358,8 +347,6 @@ mod tests {
             panic!("expected gc");
         };
         assert!(args.dry_run);
-        assert_eq!(args.grace, 14);
-        assert_eq!(args.push_ttl, 30);
         assert_eq!(args.root_ttl, 60);
         assert_eq!(args.touch_age, 2);
     }

@@ -11,12 +11,14 @@ setups, or hacking on hestia).
 | `--socket <PATH>` | `/tmp/hestia/hook.sock` | Unix socket for the post-build-hook listener. |
 | `--listen <ADDR>` | `127.0.0.1:37515` | Substituter HTTP address. |
 | `--idle-exit <SECONDS>` | — | Drain and exit after this much inactivity (fallback for setups without post steps). |
-| `--branch <NAME>` | `$GITHUB_REF_NAME`, else `local` | Branch part of the manifest root key. |
+| `--branch <NAME>` | `$GITHUB_REF_NAME`, else `local` | Branch part of the root key. |
 | `--system <SYSTEM>` | detected | Nix system part of the root key (e.g. `x86_64-linux`). |
+| `--serve-branch <BRANCH>` | `main` | Also serve what these branches' roots hold (repeatable). |
+| `--wait-head <NAME>` | — | Wait up to 60s at startup until this head is listed (matrix build jobs pass their row's `matrix.head`). |
 | `--upstream-cache-filter` | off | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
 | `--upstream-cache-key-name <KEY_NAME>` | `cache.nixos.org-1` | Key names treated as upstream caches by the filter. Repeatable. |
 | `--filter-drv-closures` | off | Apply the upstream filter to registered derivation closures. Requires `--upstream-cache-filter`; use `hestia prefetch` to retain bulk closure fetching. |
-| `--read-only` | off | Serve the cache for substitution but never write to it (no uploads, no manifest commits). |
+| `--read-only` | off | Serve the cache for substitution but never write to it (no uploads, nothing published). |
 | `--no-closure` | off | Cache built paths only, without their runtime closure. |
 | `--db-path <PATH>` | `/nix/var/nix/db/db.sqlite` | Nix store database to read path metadata from. |
 
@@ -52,11 +54,9 @@ Always exits 0 (a failing post-build-hook would fail the build).
 
 | Flag | Default | Description |
 |---|---|---|
-| `--dry-run` | off | Plan only; delete nothing. |
-| `--grace <DAYS>` | `3` | Unreachable paths are kept this long. |
-| `--push-ttl <DAYS>` | `14` | Recently pushed paths are kept, reachable or not. |
-| `--root-ttl <DAYS>` | `14` | Roots (branch+system pins) expire after this. |
-| `--touch-age <DAYS>` | `4` | Idle packs get an LRU touch after this. |
+| `--dry-run` | off | Plan only; upload and delete nothing. |
+| `--root-ttl <DAYS>` | `14` | Roots without a drain for this long are dropped. |
+| `--touch-age <DAYS>` | `4` | Idle live packs get an LRU touch after this. |
 
 ## Environment variables
 
@@ -64,9 +64,10 @@ Always exits 0 (a failing post-build-hook would fail the build).
 |---|---|---|
 | `ACTIONS_RUNTIME_TOKEN` | serve, gc | GHA cache API token. Only visible to JS actions; the hestia action exports it. |
 | `ACTIONS_RESULTS_URL` | serve, gc | GHA cache API base URL. Exported by the action. |
-| `GITHUB_TOKEN` | gc | GitHub REST API token (`actions: write`) for listing/deleting cache entries. |
+| `GITHUB_TOKEN` | serve, gc | GitHub REST API token for listing cache entries (`actions: read`), gc also deletes (`actions: write`). |
 | `GITHUB_REPOSITORY` | gc | `owner/repo`, set automatically in workflows. |
 | `GITHUB_API_URL` | gc | REST API base URL (override for GHES). |
+| `GITHUB_REF`, `GITHUB_BASE_REF`, `GITHUB_EVENT_PATH` | serve, gc | The job's cache scope, and the two further scopes it can read (a pull request's base branch, the repository's default branch from the event payload). Listings cover exactly these; deletes only `GITHUB_REF`. Set automatically in workflows. |
 | `GITHUB_REF_NAME` | serve | Default for `--branch`. |
 | `GITHUB_RUN_ID` | serve | Roots written by the same workflow run merge by union (matrix legs); different runs replace each other's root. |
 | `HESTIA_LISTEN` | prefetch | Address exported by the action for the running Hestia server. |

@@ -30,7 +30,7 @@
 //! registrations self-correct (the path is rebuilt and re-registered next
 //! run).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::Path;
 use std::process::ExitCode;
@@ -46,11 +46,12 @@ use tokio::net::{UnixListener, UnixStream};
 /// 64 MiB pack target keeps real repositories well below this.
 const MAX_PACK_VERIFY_ENTRIES: u64 = 1000;
 
+use crate::backend::Backend;
 use crate::cli::ServeArgs;
-use crate::gha::twirp::TwirpClient;
 use crate::pathinfo::StoreDatabase;
-use crate::pipeline::{self, AccessLog, MANIFEST_PREFIX, PipelineContext, now_unix};
+use crate::pipeline::{self, AccessLog, PipelineContext};
 use crate::protocol::{DrainStats, Request, Response, encode_line};
+use crate::store::Snapshot;
 use crate::substituter::{ManifestStore, Substituter, verify_packs};
 use crate::upstream::UpstreamFilter;
 
@@ -68,8 +69,9 @@ const MAX_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Shared state of a running daemon.
 struct DaemonState {
-    /// Store paths registered by hooks, waiting for the next drain.
-    buffered: Mutex<BTreeSet<String>>,
+    /// Store paths registered by hooks, waiting for the next drain, by
+    /// target system (`None`: this daemon's own).
+    buffered: Mutex<BTreeMap<Option<String>, BTreeSet<String>>>,
     /// Paths served by the substituter (narinfo hits).
     access_log: AccessLog,
     /// The write pipeline.
@@ -138,7 +140,12 @@ impl DaemonState {
     }
 
     fn buffered_count(&self) -> usize {
-        self.buffered.lock().expect("buffer lock poisoned").len()
+        self.buffered
+            .lock()
+            .expect("buffer lock poisoned")
+            .values()
+            .map(BTreeSet::len)
+            .sum()
     }
 
     /// Run the pipeline over everything buffered + accessed.
@@ -149,11 +156,29 @@ impl DaemonState {
         let _work = self.begin_work();
         let _guard = self.drain_lock.lock().await;
 
-        let paths = std::mem::take(&mut *self.buffered.lock().expect("buffer lock poisoned"));
+        let mut pending = std::mem::take(&mut *self.buffered.lock().expect("buffer lock poisoned"));
         let accessed = self.access_log.snapshot();
 
         let started = Instant::now();
-        match self.pipeline.run(paths.clone(), accessed, now_unix()).await {
+        let result = async {
+            let own = pending.get(&None).cloned().unwrap_or_default();
+            let mut stats = self.pipeline.run(own, accessed).await?;
+            pending.remove(&None);
+            while let Some((system, paths)) = pending.first_key_value() {
+                let system = system.clone().expect("own paths taken first");
+                let root = pipeline::root_key(&self.pipeline.branch, &system);
+                let other = self
+                    .pipeline
+                    .run_root(&root, paths.clone(), BTreeSet::new())
+                    .await?;
+                pending.pop_first();
+                stats.absorb(&other);
+                stats.heads.extend(other.head.map(|h| (system, h)));
+            }
+            Ok(stats)
+        }
+        .await;
+        match result {
             Ok(mut stats) => {
                 stats.elapsed_ms = started.elapsed().as_millis() as u64;
                 if stats.pushed > 0 {
@@ -163,18 +188,15 @@ impl DaemonState {
                     );
                 }
                 self.touch();
-                // The pipeline publishes the committed manifest into the
-                // shared ManifestStore itself; reloading from the cache here
-                // could return a stale version (lookups are eventually
-                // consistent).
                 Ok(stats)
             }
             Err(err) => {
-                // Paths added during the drain are kept too (extend, not replace).
-                self.buffered
-                    .lock()
-                    .expect("buffer lock poisoned")
-                    .extend(paths);
+                // Roots not yet drained go back; paths added during the
+                // drain are kept too (extend, not replace).
+                let mut buffered = self.buffered.lock().expect("buffer lock poisoned");
+                for (system, paths) in pending {
+                    buffered.entry(system).or_default().extend(paths);
+                }
                 Err(err)
             }
         }
@@ -183,18 +205,20 @@ impl DaemonState {
     async fn handle_request(&self, request: Request) -> Response {
         self.touch();
         match request {
-            Request::Add { paths } => {
+            Request::Add { paths, system } => {
                 if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
                     return Response::error(
                         "daemon is shutting down; path not registered".to_string(),
                     );
                 }
-                let count = {
-                    let mut buffered = self.buffered.lock().expect("buffer lock poisoned");
-                    buffered.extend(paths);
-                    buffered.len()
-                };
-                Response::ok().with_buffered(count)
+                let system = system.filter(|s| *s != self.pipeline.system);
+                self.buffered
+                    .lock()
+                    .expect("buffer lock poisoned")
+                    .entry(system)
+                    .or_default()
+                    .extend(paths);
+                Response::ok().with_buffered(self.buffered_count())
             }
             Request::Status => Response::ok().with_buffered(self.buffered_count()),
             Request::Drain => match self.drain().await {
@@ -271,7 +295,7 @@ impl Daemon {
 
         Ok(Self {
             state: Arc::new(DaemonState {
-                buffered: Mutex::new(BTreeSet::new()),
+                buffered: Mutex::new(BTreeMap::new()),
                 access_log,
                 pipeline,
                 drain_lock: tokio::sync::Mutex::new(()),
@@ -397,8 +421,8 @@ impl Daemon {
             stats.new_chunks += more.new_chunks;
             stats.packs_uploaded += more.packs_uploaded;
             stats.bytes_uploaded += more.bytes_uploaded;
-            if more.manifest_version > 0 {
-                stats.manifest_version = more.manifest_version;
+            if more.head.is_some() {
+                stats.head = more.head;
             }
         }
 
@@ -418,61 +442,49 @@ impl Daemon {
     }
 }
 
-/// Load the newest committed manifest and publish it into the served
-/// store if it is newer than the current view. A drain may have published
-/// a newer manifest while the load was in flight (or the load may return a
-/// stale version: lookups are eventually consistent); that version must
-/// win. Recording the version makes drains start their reservations above
-/// it even when cache lookups lag.
-async fn load_published_manifest(
-    twirp: &TwirpClient,
-    http: &reqwest::Client,
-    manifest_store: &ManifestStore,
-) {
-    let save = crate::gha::savemutable::SaveMutable::new(twirp, http, MANIFEST_PREFIX);
-    match save.load().await {
-        Ok(Some(entry)) => manifest_store
-            .set_version_if_newer(pipeline::decode_manifest_or_empty(&entry.data), entry.index),
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("hestia serve: cannot load the manifest, substituting nothing: {err}");
-        }
+/// Load what the heads of `roots` publish into the served store.
+async fn load_published(backend: &Backend, manifest_store: &ManifestStore, roots: &[String]) {
+    let previous = manifest_store.snapshot();
+    match Snapshot::load(backend.clone(), roots, previous.as_deref()).await {
+        Ok(snapshot) => manifest_store.set_snapshot(Arc::new(snapshot)),
+        Err(err) => eprintln!(
+            "hestia serve: cannot list heads, substituting nothing (grant `actions: read`): {err}"
+        ),
     }
 }
 
-/// How long `--wait-manifest-version` retries the startup manifest load
-/// before giving up, and how long it pauses between attempts.
-const MANIFEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
-const MANIFEST_WAIT_POLL: Duration = Duration::from_secs(2);
+/// How long `--wait-head` retries the startup load before giving up, and
+/// the pause between attempts.
+const HEAD_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const HEAD_WAIT_POLL: Duration = Duration::from_secs(2);
 
-/// Retry `reload` until the served manifest's version reaches
-/// `min_version` or the timeout expires (GHA cache lookups are eventually
-/// consistent: a manifest committed by the eval job moments ago may not be
-/// visible yet when a build job's daemon starts). On timeout the daemon
-/// serves whatever it found; missing paths then surface as cache misses.
-async fn wait_for_manifest_version<Fut: Future<Output = ()>>(
+/// Retry `reload` until the served view includes `head` or the timeout
+/// expires: cache listings lag, so a head an eval job published moments
+/// ago may not be visible yet when a build job's daemon starts. On timeout
+/// the daemon serves what it found and missing paths surface as misses.
+async fn wait_for_head<Fut: Future<Output = ()>>(
     manifest_store: &ManifestStore,
-    min_version: u64,
+    head: Option<&str>,
     reload: impl Fn() -> Fut,
 ) {
-    // tokio's clock, not std::time::Instant: respects paused time in tests.
-    let deadline = tokio::time::Instant::now() + MANIFEST_WAIT_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + HEAD_WAIT_TIMEOUT;
     loop {
         reload().await;
-        if manifest_store.version() >= min_version {
+        let Some(head) = head else { return };
+        if manifest_store
+            .snapshot()
+            .is_some_and(|s| s.view.has_head(head))
+        {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
             eprintln!(
-                "hestia serve: manifest version {} not visible after {}s (have {}); \
-                 serving what was found",
-                min_version,
-                MANIFEST_WAIT_TIMEOUT.as_secs(),
-                manifest_store.version(),
+                "hestia serve: head {head} not visible after {}s; serving what was found",
+                HEAD_WAIT_TIMEOUT.as_secs(),
             );
             return;
         }
-        tokio::time::sleep(MANIFEST_WAIT_POLL).await;
+        tokio::time::sleep(HEAD_WAIT_POLL).await;
     }
 }
 
@@ -552,8 +564,8 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         .connect_timeout(Duration::from_secs(10))
         .build()
         .expect("building the HTTP client failed");
-    let twirp = match TwirpClient::from_env(http.clone()) {
-        Ok(twirp) => twirp,
+    let backend = match Backend::from_env(http.clone()) {
+        Ok(backend) => backend,
         Err(err) => {
             eprintln!(
                 "hestia serve: {err}\n\
@@ -594,22 +606,26 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
 
     let store_dir = store.store_dir().clone();
     let root_key = pipeline::root_key(&branch, &system);
+    let mut serve_roots = vec![root_key.clone()];
+    serve_roots.extend(
+        args.serve_branches
+            .iter()
+            .map(|b| pipeline::root_key(b, &system)),
+    );
+    serve_roots.dedup();
     let pipeline = PipelineContext {
-        twirp: twirp.clone(),
-        http: http.clone(),
+        backend: backend.clone(),
         store,
         upstream,
         expand_closure: !args.no_closure,
         filter_drv_closures: args.filter_drv_closures,
-        root_key: root_key.clone(),
-        run_id: std::env::var("GITHUB_RUN_ID")
-            .ok()
-            .filter(|id| !id.is_empty()),
-        manifest_prefix: MANIFEST_PREFIX.to_string(),
+        branch: branch.clone(),
+        system: system.clone(),
         pack_target_size: pipeline::PACK_TARGET_SIZE,
         read_only: read_only.clone(),
         // Replaced by Daemon::bind with the daemon's shared ManifestStore.
         publish: None,
+        clock: crate::pipeline::system_clock(),
     };
 
     let manifest_store = ManifestStore::new();
@@ -646,9 +662,8 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         }
     };
 
-    // Narinfo requests block until the startup manifest load (and the
-    // optional --wait-manifest-version wait) finished; otherwise an early
-    // nix build races the load and sees spurious misses.
+    // Narinfo requests block until the startup load finished. Otherwise an
+    // early nix build races the load and sees spurious misses.
     let (manifest_ready_tx, manifest_ready_rx) = tokio::sync::watch::channel(false);
 
     // The substituter HTTP server shares the manifest and access log with
@@ -657,22 +672,19 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         store_dir,
         manifest_store.clone(),
         daemon.access_log(),
-        twirp.clone(),
-        http.clone(),
+        backend.clone(),
     )
     .with_activity_hook(daemon.activity_hook())
     .with_manifest_ready(manifest_ready_rx)
     .with_manifest_reload({
-        let twirp = twirp.clone();
-        let http = http.clone();
+        let backend = backend.clone();
         let manifest_store = manifest_store.clone();
+        let serve_roots = serve_roots.clone();
         Arc::new(move || {
-            let twirp = twirp.clone();
-            let http = http.clone();
+            let backend = backend.clone();
             let manifest_store = manifest_store.clone();
-            Box::pin(async move {
-                load_published_manifest(&twirp, &http, &manifest_store).await;
-            })
+            let serve_roots = serve_roots.clone();
+            Box::pin(async move { load_published(&backend, &manifest_store, &serve_roots).await })
         })
     });
     let substituter_task = tokio::spawn(async move {
@@ -681,48 +693,36 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         }
     });
 
-    // Load the manifest committed by previous runs so the substituter can
-    // serve those paths. Loaded concurrently: the listeners are already
-    // bound, so a slow or stalled cache API cannot delay the action's
-    // readiness probe (which gives up after 30s and fails the job). No
-    // manifest yet (first run) or a load failure both mean "serve nothing
-    // until the first drain".
+    // Load what previous runs published so the substituter can serve it.
+    // Loaded concurrently: the listeners are already bound, so a slow or
+    // stalled cache API cannot delay the action's readiness probe (which
+    // gives up after 30s and fails the job). Nothing yet (first run) or a
+    // load failure both mean "serve nothing until the first drain".
     let load_task = {
-        let twirp = twirp.clone();
-        let http = http.clone();
+        let backend = backend.clone();
         let manifest_store = manifest_store.clone();
-        let min_version = args.wait_manifest_version;
+        let wait_head = args.wait_head.clone();
         tokio::spawn(async move {
-            let reload = || {
-                let twirp = twirp.clone();
-                let http = http.clone();
-                let manifest_store = manifest_store.clone();
-                async move { load_published_manifest(&twirp, &http, &manifest_store).await }
-            };
-            wait_for_manifest_version(&manifest_store, min_version, reload).await;
+            let reload = || load_published(&backend, &manifest_store, &serve_roots);
+            wait_for_head(&manifest_store, wait_head.as_deref(), reload).await;
             let _ = manifest_ready_tx.send(true);
-            // Only with a GITHUB_TOKEN (optional: build jobs need no
-            // permissions); without one the NAR handler's lazy negative
-            // cache still catches evictions, one failed request later.
-            if let Ok(rest) = crate::gha::rest::RestClient::from_env(http.clone()) {
-                verify_packs(&rest, &manifest_store, MAX_PACK_VERIFY_ENTRIES).await;
-            }
+            verify_packs(&backend, &manifest_store, MAX_PACK_VERIFY_ENTRIES).await;
         })
     };
 
     // Detect a read-only token (check_run, fork pull_request) upfront so a
     // job never chunks a whole closure only to fail at the first
-    // reservation. Spawned like the manifest load so a stalled cache API
+    // reservation. Spawned like the startup load so a stalled cache API
     // cannot delay readiness; it resolves long before the post-step drain.
     // An unreachable cache is inconclusive: stay writable and let the real
     // drain surface any genuine failure.
     if args.read_only {
         eprintln!("hestia serve: read-only mode; nothing will be written to the cache");
     } else {
-        let twirp = twirp.clone();
+        let backend = backend.clone();
         let read_only = read_only.clone();
         tokio::spawn(async move {
-            match twirp.probe_writable().await {
+            match backend.probe_writable().await {
                 Ok(false) => {
                     read_only.store(true, Ordering::Relaxed);
                     eprintln!(
@@ -793,48 +793,32 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::Manifest;
 
     #[tokio::test(start_paused = true)]
-    async fn manifest_wait_retries_until_the_version_appears() {
-        let store = ManifestStore::new();
-        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let reload_store = store.clone();
-        let reload_attempts = attempts.clone();
-        wait_for_manifest_version(&store, 3, || {
-            let store = reload_store.clone();
-            let attempts = reload_attempts.clone();
-            async move {
-                // The version becomes visible on the third attempt.
-                if attempts.fetch_add(1, Ordering::SeqCst) + 1 >= 3 {
-                    store.set_version_if_newer(Manifest::new(), 3);
-                }
-            }
-        })
-        .await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
-        assert_eq!(store.version(), 3);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn manifest_wait_gives_up_after_the_timeout() {
+    async fn head_wait_gives_up_after_the_timeout() {
         let store = ManifestStore::new();
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let reload_attempts = attempts.clone();
-        wait_for_manifest_version(&store, 5, || {
+        wait_for_head(&store, Some("h-x"), || {
             let attempts = reload_attempts.clone();
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
             }
         })
         .await;
-        assert_eq!(store.version(), 0, "nothing was published");
-        let expected = 1 + MANIFEST_WAIT_TIMEOUT.as_secs() / MANIFEST_WAIT_POLL.as_secs();
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            expected,
-            "initial load + one per poll"
-        );
+        let expected = 1 + HEAD_WAIT_TIMEOUT.as_secs() / HEAD_WAIT_POLL.as_secs();
+        assert_eq!(attempts.load(Ordering::SeqCst), expected);
+
+        attempts.store(0, Ordering::SeqCst);
+        let reload_attempts = attempts.clone();
+        wait_for_head(&store, None, || {
+            let attempts = reload_attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "no head: load once");
     }
 
     #[test]

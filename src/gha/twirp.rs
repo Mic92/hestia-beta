@@ -19,6 +19,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::gha::retry::{self, Backoff};
 use crate::gha::{Error, blob};
 
 /// Cache `version` namespace: sha256 of "hestia-2".
@@ -203,13 +204,20 @@ impl TwirpClient {
         Resp: DeserializeOwned,
     {
         let url = rpc_url(&self.base_url, method);
-        let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.token)
-            .json(request)
-            .send()
-            .await?;
+        let mut backoff = Backoff::default();
+        let response = loop {
+            let result = self
+                .http
+                .post(&url)
+                .bearer_auth(&self.token)
+                .json(request)
+                .send()
+                .await
+                .map_err(Error::Http);
+            if !backoff.retry(retry::transient(&result)).await {
+                break result?;
+            }
+        };
 
         let status = response.status();
         if status.is_success() {

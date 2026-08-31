@@ -48,7 +48,10 @@ pub fn collect_paths(arg_paths: &[PathBuf], out_paths_env: Option<&str>) -> Vec<
 /// Send paths to the daemon. Returns the number of paths the daemon has
 /// buffered after the add.
 pub async fn send_paths(args: &HookArgs, paths: Vec<String>) -> Result<usize, protocol::Error> {
-    let request = Request::Add { paths };
+    let request = Request::Add {
+        paths,
+        system: None,
+    };
     let response = protocol::roundtrip(&args.socket, &request).await?;
     Ok(response.buffered.unwrap_or(0))
 }

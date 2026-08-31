@@ -44,6 +44,7 @@ use axum::routing::{get, post, put};
 use serde::Deserialize;
 use serde_json::json;
 
+use hestia::backend::Backend;
 use hestia::gha::rest::{RestClient, format_timestamp};
 use hestia::gha::twirp::{
     CreateCacheEntryRequest, FinalizeCacheEntryUploadRequest, GetCacheEntryDownloadUrlRequest,
@@ -52,9 +53,19 @@ use hestia::gha::twirp::{
 
 const TWIRP_PATH: &str = "/twirp/github.actions.results.api.v1.CacheService";
 
+/// The default branch's cache scope: every job reads it, only jobs on
+/// that branch write it.
+pub const DEFAULT_REF: &str = "refs/heads/main";
+
+/// The fake's runtime token names the scope it writes to after this prefix.
+const TOKEN_PREFIX: &str = "fake-runtime-token;";
+
 #[derive(Debug, Clone)]
 struct Entry {
     id: u64,
+    /// The ref whose job created the entry. Reads see their own ref and
+    /// [`DEFAULT_REF`]; REST list/delete see all unless `ref=` narrows them.
+    scope: String,
     key: String,
     version: String,
     finalized: bool,
@@ -127,15 +138,17 @@ impl Inner {
         self.dir.join(format!("blob-{id}"))
     }
 
-    fn find(&self, key: &str, version: &str) -> Option<&Entry> {
+    fn find(&self, scope: &str, key: &str, version: &str) -> Option<&Entry> {
         self.entries
             .iter()
-            .find(|e| e.key == key && e.version == version)
+            .find(|e| e.scope == scope && e.key == key && e.version == version)
     }
 
-    fn remove_by_key(&mut self, key: &str) -> Vec<Entry> {
-        let (removed, kept): (Vec<Entry>, Vec<Entry>) =
-            self.entries.drain(..).partition(|e| e.key == key);
+    fn remove_by_key(&mut self, key: &str, scope: Option<&str>) -> Vec<Entry> {
+        let (removed, kept): (Vec<Entry>, Vec<Entry>) = self
+            .entries
+            .drain(..)
+            .partition(|e| e.key == key && scope.is_none_or(|s| s == e.scope));
         self.entries = kept;
         for entry in &removed {
             let _ = std::fs::remove_file(self.blob_path(entry.id));
@@ -158,7 +171,18 @@ fn twirp_error(status: StatusCode, code: &str, msg: &str) -> Response {
 // Twirp handlers
 // ---------------------------------------------------------------------------
 
-async fn twirp_create(State(state): State<AppState>, body: Bytes) -> Response {
+/// The scope a Twirp request writes to, from its bearer token.
+fn token_scope(headers: &HeaderMap) -> String {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(|t| t.strip_prefix(TOKEN_PREFIX))
+        .unwrap_or(DEFAULT_REF)
+        .to_owned()
+}
+
+async fn twirp_create(State(state): State<AppState>, scope: String, body: Bytes) -> Response {
     let Ok(request) = serde_json::from_slice::<CreateCacheEntryRequest>(&body) else {
         return twirp_error(StatusCode::BAD_REQUEST, "malformed", "bad json");
     };
@@ -182,7 +206,7 @@ async fn twirp_create(State(state): State<AppState>, body: Bytes) -> Response {
         }
         *remaining -= 1;
     }
-    if inner.find(&request.key, &request.version).is_some() {
+    if inner.find(&scope, &request.key, &request.version).is_some() {
         return twirp_error(
             StatusCode::CONFLICT,
             "already_exists",
@@ -194,6 +218,7 @@ async fn twirp_create(State(state): State<AppState>, body: Bytes) -> Response {
     let created_at = inner.tick();
     inner.entries.push(Entry {
         id,
+        scope,
         key: request.key,
         version: request.version,
         finalized: false,
@@ -241,7 +266,7 @@ async fn twirp_finalize(State(state): State<AppState>, body: Bytes) -> Response 
     Json(json!({ "ok": true, "entry_id": id.to_string() })).into_response()
 }
 
-async fn twirp_download_url(State(state): State<AppState>, body: Bytes) -> Response {
+async fn twirp_download_url(State(state): State<AppState>, scope: String, body: Bytes) -> Response {
     let Ok(request) = serde_json::from_slice::<GetCacheEntryDownloadUrlRequest>(&body) else {
         return twirp_error(StatusCode::BAD_REQUEST, "malformed", "bad json");
     };
@@ -257,6 +282,7 @@ async fn twirp_download_url(State(state): State<AppState>, body: Bytes) -> Respo
         let mut matching: Vec<&Entry> = inner
             .entries
             .iter()
+            .filter(|e| e.scope == scope || e.scope == DEFAULT_REF)
             .filter(|e| e.finalized && e.version == request.version && e.key.starts_with(prefix))
             .collect();
         matching.sort_by_key(|e| std::cmp::Reverse(e.created_at));
@@ -289,8 +315,10 @@ async fn twirp_download_url(State(state): State<AppState>, body: Bytes) -> Respo
 async fn twirp_dispatch(
     State(state): State<AppState>,
     Path(method): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let scope = token_scope(&headers);
     // Token-expiry injection: the real service rejects every Twirp call with
     // HTTP 401 once the runtime JWT has expired (~6h lifetime).
     {
@@ -307,9 +335,9 @@ async fn twirp_dispatch(
         }
     }
     match method.as_str() {
-        "CreateCacheEntry" => twirp_create(State(state), body).await,
+        "CreateCacheEntry" => twirp_create(State(state), scope, body).await,
         "FinalizeCacheEntryUpload" => twirp_finalize(State(state), body).await,
-        "GetCacheEntryDownloadURL" => twirp_download_url(State(state), body).await,
+        "GetCacheEntryDownloadURL" => twirp_download_url(State(state), scope, body).await,
         _ => twirp_error(StatusCode::NOT_FOUND, "bad_route", "unknown rpc"),
     }
 }
@@ -446,6 +474,8 @@ async fn blob_get(
 struct ListQuery {
     #[serde(default)]
     key: String,
+    #[serde(default, rename = "ref")]
+    scope: Option<String>,
     #[serde(default)]
     page: Option<u64>,
     #[serde(default)]
@@ -459,7 +489,7 @@ struct ListQuery {
 fn rest_entry_json(entry: &Entry) -> serde_json::Value {
     json!({
         "id": entry.id,
-        "ref": "refs/heads/main",
+        "ref": entry.scope,
         "key": entry.key,
         "version": entry.version,
         // The real REST API reports RFC 3339 UTC timestamps.
@@ -474,6 +504,7 @@ async fn rest_list(State(state): State<AppState>, Query(query): Query<ListQuery>
     let mut matching: Vec<&Entry> = inner
         .entries
         .iter()
+        .filter(|e| query.scope.as_ref().is_none_or(|s| *s == e.scope))
         .filter(|e| e.finalized && e.key.starts_with(&query.key))
         .collect();
     // The production client relies on the immutable created_at order for
@@ -506,7 +537,7 @@ async fn rest_list(State(state): State<AppState>, Query(query): Query<ListQuery>
 
 async fn rest_delete(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
     let mut inner = state.inner.lock().unwrap();
-    let removed = inner.remove_by_key(&query.key);
+    let removed = inner.remove_by_key(&query.key, query.scope.as_deref());
     if removed.is_empty() {
         return (
             StatusCode::NOT_FOUND,
@@ -528,7 +559,7 @@ async fn rest_delete(State(state): State<AppState>, Query(query): Query<ListQuer
 
 async fn test_evict(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
     let mut inner = state.inner.lock().unwrap();
-    let removed = inner.remove_by_key(&query.key);
+    let removed = inner.remove_by_key(&query.key, None);
     Json(json!({ "evicted": removed.len() })).into_response()
 }
 
@@ -689,27 +720,74 @@ impl FakeGha {
         self.inner.lock().unwrap().clock = unix_seconds;
     }
 
+    /// Reads the clock without advancing it.
+    pub fn clock(&self) -> hestia::pipeline::Clock {
+        let inner = self.inner.clone();
+        Arc::new(move || inner.lock().unwrap().clock)
+    }
+
     /// Refuse every reservation with a write-denied response, modelling a
     /// read-only runtime token (check_run, fork pull_request).
     pub fn deny_writes(&self) {
         self.inner.lock().unwrap().deny_writes = true;
     }
 
-    /// Twirp client pointed at this fake.
+    /// Twirp client for a job on the default branch.
     pub fn twirp(&self, http: &reqwest::Client) -> TwirpClient {
-        TwirpClient::new(http.clone(), &self.base_url, "fake-runtime-token")
+        self.twirp_on(http, DEFAULT_REF)
     }
 
-    /// REST client pointed at this fake. The fake never rate-limits, so
-    /// request pacing is disabled to keep tests fast.
+    /// Twirp client for a job running on `git_ref`.
+    pub fn twirp_on(&self, http: &reqwest::Client, git_ref: &str) -> TwirpClient {
+        TwirpClient::new(
+            http.clone(),
+            &self.base_url,
+            format!("{TOKEN_PREFIX}{git_ref}"),
+        )
+    }
+
+    /// Backend for a job on the default branch, with REST access.
+    pub fn backend(&self, http: &reqwest::Client) -> Backend {
+        self.backend_on(http, DEFAULT_REF)
+    }
+
+    /// Backend for a job running on `git_ref`, with REST access.
+    pub fn backend_on(&self, http: &reqwest::Client, git_ref: &str) -> Backend {
+        Backend::new(
+            self.twirp_on(http, git_ref),
+            Ok(self.rest_on(http, git_ref)),
+            http.clone(),
+        )
+    }
+
+    /// REST client scoped to the default branch. The fake never
+    /// rate-limits, so request pacing is disabled to keep tests fast.
     pub fn rest(&self, http: &reqwest::Client) -> RestClient {
+        self.rest_on(http, DEFAULT_REF)
+    }
+
+    pub fn rest_on(&self, http: &reqwest::Client, git_ref: &str) -> RestClient {
         RestClient::new(
             http.clone(),
             &self.base_url,
             &self.repo,
+            git_ref,
             "fake-github-token",
         )
+        .with_read_refs([DEFAULT_REF.to_owned()])
         .with_pacing(Duration::ZERO, Duration::from_millis(50))
+    }
+
+    /// Finalized keys in `scope`.
+    pub fn keys_in(&self, scope: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|e| e.finalized && e.scope == scope)
+            .map(|e| e.key.clone())
+            .collect()
     }
 
     /// Simulate LRU eviction of `key` (entry and blob disappear).

@@ -36,13 +36,40 @@ pub enum Error {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    /// Register store paths for upload at the next drain.
-    Add { paths: Vec<String> },
+    /// Register store paths for upload at the next drain. `system` files
+    /// them under `<branch>-<system>` instead of the daemon's own root, for
+    /// `.drv`s of other platforms coming out of one evaluation.
+    Add {
+        paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system: Option<String>,
+    },
     /// Upload all buffered paths, commit the manifest, and report stats.
     /// The response is sent only after the pipeline finishes.
     Drain,
     /// Liveness check: reports how many paths are currently buffered.
     Status,
+}
+
+impl DrainStats {
+    /// Fold another root's drain into this one's counters.
+    pub fn absorb(&mut self, o: &DrainStats) {
+        self.paths_received += o.paths_received;
+        self.skipped_upstream += o.skipped_upstream;
+        self.skipped_existing += o.skipped_existing;
+        self.skipped_invalid += o.skipped_invalid;
+        self.failed_verification += o.failed_verification;
+        self.failed_chunking += o.failed_chunking;
+        self.pushed += o.pushed;
+        self.new_chunks += o.new_chunks;
+        self.packs_uploaded += o.packs_uploaded;
+        self.bytes_uploaded += o.bytes_uploaded;
+        self.load_ms += o.load_ms;
+        self.chunk_ms += o.chunk_ms;
+        self.pack_ms += o.pack_ms;
+        self.upload_ms += o.upload_ms;
+        self.commit_ms += o.commit_ms;
+    }
 }
 
 /// What one drain accomplished.
@@ -80,14 +107,16 @@ pub struct DrainStats {
     /// Pack blobs uploaded.
     #[serde(default)]
     pub packs_uploaded: usize,
-    /// Compressed bytes uploaded (packs only, not the manifest).
+    /// Compressed pack bytes uploaded.
     #[serde(default)]
     pub bytes_uploaded: u64,
-    /// Manifest version this drain committed (`m#N`), 0 if nothing
-    /// needed committing.
+    /// Head this drain published under the daemon's own root, if any.
     #[serde(default)]
-    pub manifest_version: u64,
-    /// Time spent loading the manifest and querying the local store
+    pub head: Option<String>,
+    /// Heads published under other systems' roots (`Add { system }`), by system.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub heads: std::collections::BTreeMap<String, String>,
+    /// Time spent loading heads and querying the local store
     /// (everything before chunking starts), in milliseconds.
     #[serde(default)]
     pub load_ms: u64,
@@ -205,6 +234,7 @@ mod tests {
         // stay stable. These assertions pin it.
         let request = Request::Add {
             paths: vec!["/nix/store/aaa-foo".into(), "/nix/store/bbb-bar".into()],
+            system: None,
         };
         assert_eq!(
             serde_json::to_string(&request).unwrap(),
@@ -226,8 +256,12 @@ mod tests {
         for request in [
             Request::Add {
                 paths: vec!["/nix/store/aaa-foo".into()],
+                system: None,
             },
-            Request::Add { paths: vec![] },
+            Request::Add {
+                paths: vec![],
+                system: None,
+            },
             Request::Drain,
             Request::Status,
         ] {
@@ -250,7 +284,7 @@ mod tests {
             skipped_upstream: 3,
             packs_uploaded: 1,
             bytes_uploaded: 12345,
-            manifest_version: 7,
+            head: Some("h-x".into()),
             ..DrainStats::default()
         };
         let response = Response::ok().with_stats(stats.clone());
@@ -277,7 +311,8 @@ mod tests {
         assert_eq!(
             request,
             Request::Add {
-                paths: vec!["/nix/store/x".into()]
+                paths: vec!["/nix/store/x".into()],
+                system: None,
             }
         );
 

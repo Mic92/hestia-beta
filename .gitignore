@@ -2,3 +2,4 @@
 /result*
 .workmux/
 perf.data*
+_apalache-out/

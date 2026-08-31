@@ -18,6 +18,7 @@ use serde::Deserialize;
 use tokio::time::Instant;
 
 use crate::gha::Error;
+use crate::gha::retry::{self, Backoff};
 
 /// Default GitHub API endpoint; `GITHUB_API_URL` overrides it (GHES).
 const DEFAULT_API_URL: &str = "https://api.github.com";
@@ -25,6 +26,9 @@ const DEFAULT_API_URL: &str = "https://api.github.com";
 pub const ENV_GITHUB_TOKEN: &str = "GITHUB_TOKEN";
 pub const ENV_GITHUB_REPOSITORY: &str = "GITHUB_REPOSITORY";
 pub const ENV_GITHUB_API_URL: &str = "GITHUB_API_URL";
+pub const ENV_GITHUB_REF: &str = "GITHUB_REF";
+pub const ENV_GITHUB_BASE_REF: &str = "GITHUB_BASE_REF";
+pub const ENV_GITHUB_EVENT_PATH: &str = "GITHUB_EVENT_PATH";
 
 const PER_PAGE: u32 = 100;
 
@@ -43,13 +47,6 @@ const RATE_LIMIT_MAX_ATTEMPTS: u32 = 5;
 /// header is server-controlled data and must not be able to stall a GC run
 /// indefinitely.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
-
-/// Retries for transient failures (5xx, dropped connections), mirroring the
-/// data plane's policy in [`crate::gha::blob`].
-const TRANSIENT_RETRIES: u32 = 3;
-
-/// First transient-retry delay; doubles per attempt.
-const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Build the caches collection URL for a repository.
 fn caches_url(api_url: &str, repo: &str) -> String {
@@ -224,6 +221,12 @@ pub struct RestClient {
     http: reqwest::Client,
     api_url: String,
     repo: String,
+    /// The cache scope this job writes to; deletes are confined to it.
+    git_ref: String,
+    /// The scopes this job's runtime token can read: its own, a pull
+    /// request's base branch, the default branch. Listings cover these
+    /// and nothing else, so what is listed can be fetched.
+    read_refs: Vec<String>,
     token: String,
     mutation_interval: Duration,
     rate_limit_fallback_wait: Duration,
@@ -237,17 +240,31 @@ impl RestClient {
         http: reqwest::Client,
         api_url: impl Into<String>,
         repo: impl Into<String>,
+        git_ref: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
+        let git_ref = git_ref.into();
         Self {
             http,
             api_url: api_url.into(),
             repo: repo.into(),
+            read_refs: vec![git_ref.clone()],
+            git_ref,
             token: token.into(),
             mutation_interval: MUTATION_INTERVAL,
             rate_limit_fallback_wait: RATE_LIMIT_FALLBACK_WAIT,
             last_mutation: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    /// Further refs whose caches this job can read.
+    pub fn with_read_refs(mut self, refs: impl IntoIterator<Item = String>) -> Self {
+        for r in refs {
+            if !self.read_refs.contains(&r) {
+                self.read_refs.push(r);
+            }
+        }
+        self
     }
 
     /// Override the request pacing (tests use short intervals).
@@ -261,13 +278,15 @@ impl RestClient {
         self
     }
 
-    /// Build a client from `GITHUB_TOKEN` / `GITHUB_REPOSITORY`
+    /// Build a client from `GITHUB_TOKEN` / `GITHUB_REPOSITORY` / `GITHUB_REF`
     /// (and `GITHUB_API_URL` if set, for GHES).
     pub fn from_env(http: reqwest::Client) -> Result<Self, Error> {
         let token =
             std::env::var(ENV_GITHUB_TOKEN).map_err(|_| Error::MissingEnv(ENV_GITHUB_TOKEN))?;
         let repo = std::env::var(ENV_GITHUB_REPOSITORY)
             .map_err(|_| Error::MissingEnv(ENV_GITHUB_REPOSITORY))?;
+        let git_ref =
+            std::env::var(ENV_GITHUB_REF).map_err(|_| Error::MissingEnv(ENV_GITHUB_REF))?;
         let api_url =
             std::env::var(ENV_GITHUB_API_URL).unwrap_or_else(|_| DEFAULT_API_URL.to_string());
         if token.is_empty() {
@@ -279,7 +298,19 @@ impl RestClient {
                 reason: format!("expected owner/repo, got {repo:?}"),
             });
         }
-        Ok(Self::new(http, api_url, repo, token))
+        let base = std::env::var(ENV_GITHUB_BASE_REF)
+            .ok()
+            .filter(|b| !b.is_empty());
+        let default = std::env::var(ENV_GITHUB_EVENT_PATH)
+            .ok()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|e| Some(e["repository"]["default_branch"].as_str()?.to_owned()));
+        let readable = base
+            .into_iter()
+            .chain(default)
+            .map(|branch| format!("refs/heads/{branch}"));
+        Ok(Self::new(http, api_url, repo, git_ref, token).with_read_refs(readable))
     }
 
     fn caches_url(&self) -> String {
@@ -320,8 +351,7 @@ impl RestClient {
         mutating: bool,
     ) -> Result<T, Error> {
         let mut attempts = 0;
-        let mut transient_left = TRANSIENT_RETRIES;
-        let mut transient_delay = TRANSIENT_RETRY_DELAY;
+        let mut backoff = Backoff::default();
         loop {
             if mutating {
                 self.pace_mutation().await;
@@ -330,30 +360,20 @@ impl RestClient {
                 .try_clone()
                 .expect("cache API requests have no streaming body")
                 .send()
-                .await;
-            let response = match result {
-                Ok(response) => response,
-                Err(err) => {
-                    let error = Error::Http(err);
-                    if crate::gha::blob::is_transient(&error) && transient_left > 0 {
-                        transient_left -= 1;
-                        tokio::time::sleep(transient_delay).await;
-                        transient_delay *= 2;
-                        continue;
-                    }
-                    return Err(error);
-                }
+                .await
+                .map_err(Error::Http);
+            // 429 is handled below: it carries a Retry-After worth honouring.
+            let transient = match &result {
+                Ok(r) => r.status().is_server_error(),
+                Err(e) => retry::is_transient(e),
             };
+            if backoff.retry(transient).await {
+                continue;
+            }
+            let response = result?;
             let status = response.status();
             if status.is_success() {
                 return Ok(response.json().await?);
-            }
-
-            if status.is_server_error() && transient_left > 0 {
-                transient_left -= 1;
-                tokio::time::sleep(transient_delay).await;
-                transient_delay *= 2;
-                continue;
             }
 
             let retry_after = response
@@ -383,26 +403,47 @@ impl RestClient {
         }
     }
 
-    /// List all cache entries whose key starts with `key_prefix`
-    /// (empty prefix lists everything). Follows pagination.
-    ///
+    /// Cache entries in the readable scopes whose key starts with
+    /// `key_prefix` (empty prefix lists everything). Follows pagination.
+    pub async fn list_caches(&self, key_prefix: &str) -> Result<Vec<CacheEntry>, Error> {
+        let listing = self.list_caches_bounded(key_prefix, u64::MAX).await?;
+        Ok(listing.expect("an unbounded listing never bails out"))
+    }
+
+    /// Like [`Self::list_caches`], but returns `Ok(None)` when a scope's
+    /// server-reported `total_count` exceeds `max_total`. The counter is
+    /// only a bail-out heuristic. Termination still uses the short-page
+    /// rule below.
+    pub async fn list_caches_bounded(
+        &self,
+        key_prefix: &str,
+        max_total: u64,
+    ) -> Result<Option<Vec<CacheEntry>>, Error> {
+        let mut entries = Vec::new();
+        for r in &self.read_refs {
+            match self.list_ref(r, key_prefix, max_total).await? {
+                Some(e) => entries.extend(e),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(entries))
+    }
+
+    /// This job's own scope only: what GC may delete.
+    pub async fn list_own(&self, key_prefix: &str) -> Result<Vec<CacheEntry>, Error> {
+        let listing = self.list_ref(&self.git_ref, key_prefix, u64::MAX).await?;
+        Ok(listing.expect("an unbounded listing never bails out"))
+    }
+
     /// Pages are requested sorted by `created_at` ascending: GitHub's
     /// default order (`last_accessed_at` descending) is mutable — every
     /// cache download by any concurrent CI job bumps an entry's
     /// `last_accessed_at` and reorders the listing between page fetches,
     /// which makes page-numbered pagination skip and duplicate entries.
     /// `created_at` never changes, so the page boundaries stay stable.
-    pub async fn list_caches(&self, key_prefix: &str) -> Result<Vec<CacheEntry>, Error> {
-        let listing = self.list_caches_bounded(key_prefix, u64::MAX).await?;
-        Ok(listing.expect("an unbounded listing never bails out"))
-    }
-
-    /// Like [`Self::list_caches`], but returns `Ok(None)` when the
-    /// server-reported `total_count` exceeds `max_total`. The counter is
-    /// only a bail-out heuristic. Termination still uses the short-page
-    /// rule below.
-    pub async fn list_caches_bounded(
+    async fn list_ref(
         &self,
+        git_ref: &str,
         key_prefix: &str,
         max_total: u64,
     ) -> Result<Option<Vec<CacheEntry>>, Error> {
@@ -415,6 +456,7 @@ impl RestClient {
                 ("page", page.to_string()),
                 ("sort", "created_at".to_string()),
                 ("direction", "asc".to_string()),
+                ("ref", git_ref.to_owned()),
             ]);
             if !key_prefix.is_empty() {
                 request = request.query(&[("key", key_prefix)]);
@@ -438,14 +480,14 @@ impl RestClient {
         }
     }
 
-    /// Delete all cache entries with exactly this key (across versions/refs).
+    /// Delete this ref's cache entries with exactly this key (any version).
     /// Returns the deleted entries. Deleting a non-existent key is not an
     /// error and returns an empty list (GC idempotence).
     pub async fn delete_by_key(&self, key: &str) -> Result<Vec<CacheEntry>, Error> {
         let url = self.caches_url();
         let request = self
             .request(reqwest::Method::DELETE, &url)
-            .query(&[("key", key)]);
+            .query(&[("key", key), ("ref", &self.git_ref)]);
         match self.send(&url, request, true).await {
             Ok(CacheList { actions_caches, .. }) => Ok(actions_caches),
             // GitHub returns 404 when nothing matched the key.

@@ -8,6 +8,7 @@ use bytes::Bytes;
 pub use crate::gha::Error;
 
 pub mod gha;
+pub mod ghcr;
 pub mod oci;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +79,7 @@ impl Backend {
     pub async fn list_objects(&self) -> Result<Option<Vec<Listed>>, Error> {
         match self {
             Backend::Gha(b) => b.list_objects().await,
-            Backend::Oci(_) => Ok(None),
+            Backend::Oci(b) => b.list_objects().await,
         }
     }
 
@@ -93,6 +94,14 @@ impl Backend {
         match self {
             Backend::Gha(b) => b.probe_writable().await,
             Backend::Oci(b) => b.probe_writable().await,
+        }
+    }
+
+    /// Persist backend bookkeeping (the GHCR ledger) at the end of a GC run.
+    pub async fn flush(&self) -> Result<(), Error> {
+        match self {
+            Backend::Gha(_) => Ok(()),
+            Backend::Oci(b) => b.flush().await,
         }
     }
 }

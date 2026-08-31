@@ -448,6 +448,7 @@ impl Gc {
                     }
                 }
             }
+            self.backend.flush().await?;
         }
         Ok(stats)
     }

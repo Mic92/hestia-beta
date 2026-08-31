@@ -222,6 +222,77 @@ jobs:
       - name: Build by drv path
         run: nix build -L ${{ matrix.installables }}
 
+  # The OCI store on ghcr.io with head provenance: this job signs its
+  # heads keyless, and a strict reader must see them while `gh` does the
+  # verifying. Two legs so the second substitutes what the first pushed.
+  oci-trust:
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        leg: [push, pull]
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      actions: read
+    env:
+      OCI_REPO: ghcr.io/${{ github.repository }}/cache
+    steps:
+      - uses: actions/checkout@v7
+      - uses: NixOS/nix-installer-action@main
+      - name: Start hestia cache (dogfood)
+        if: vars.HESTIA_DOGFOOD == 'true'
+        uses: ./
+      - name: Build hestia
+        run: nix build .# -o hestia-bin
+      - uses: ./
+        with:
+          binary: ./hestia-bin/bin/hestia
+          listen: 127.0.0.1:37518
+          socket: /tmp/hestia-oci/hook.sock
+          oci: ${{ env.OCI_REPO }}
+          trust: strict
+      - name: Build a commit-unique derivation
+        run: |
+          set -euo pipefail
+          cat > /tmp/oci-test.nix <<'NIXEOF'
+          derivation {
+            name = "hestia-oci-test";
+            system = builtins.currentSystem;
+            builder = "/bin/sh";
+            rev = "${{ github.sha }}";
+            args = [ "-c" "echo $rev > $out" ];
+          }
+          NIXEOF
+          if [ "${{ matrix.leg }}" = pull ]; then
+            # Same commit as the push leg: must come out of the registry,
+            # through heads the strict policy accepted.
+            path=$(nix eval --impure --raw --file /tmp/oci-test.nix outPath)
+            nix path-info --store "http://$HESTIA_LISTEN" "$path"
+          fi
+          nix build -L --impure --file /tmp/oci-test.nix -o ./oci-test-result
+      - name: Drain and read back
+        if: matrix.leg == 'push'
+        run: |
+          set -euo pipefail
+          "$HESTIA_BIN" drain --socket "$HESTIA_SOCKET" --timeout 300 2>&1 | tee /dev/stderr | grep -E 'head (h|c)-'
+          path=$(readlink -f ./oci-test-result)
+          fresh_store="$RUNNER_TEMP/fresh-store"
+          nix copy --no-check-sigs --from "http://$HESTIA_LISTEN" --to "$fresh_store" "$path"
+          test -e "$fresh_store$path"
+      - name: GC dry run over the registry
+        if: matrix.leg == 'pull'
+        run: ./hestia-bin/bin/hestia gc --dry-run
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HESTIA_OCI: ${{ env.OCI_REPO }}
+      - name: Daemon log
+        if: always()
+        run: cat "$HESTIA_SERVE_LOG" || true
+
   # End-to-end test of the hestia-cache action on a real runner: install
   # (locally built binary), nix.conf wiring, daemon readiness, post-build-hook
   # capture, manifest commit, and substitution back out of the cache.

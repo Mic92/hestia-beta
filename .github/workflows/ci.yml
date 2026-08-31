@@ -9,6 +9,17 @@ on:
 permissions:
   contents: read
 
+env:
+  # Unique per commit, so oci-pull can only get it from oci-push.
+  OCI_TEST_DRV: >
+    derivation {
+      name = "hestia-oci-test";
+      system = builtins.currentSystem;
+      builder = "/bin/sh";
+      rev = "${{ github.sha }}";
+      args = [ "-c" "echo $rev > $out" ];
+    }
+
 jobs:
   # Formatting, clippy, tests, and the package build, all as flake checks.
   #
@@ -36,10 +47,24 @@ jobs:
         uses: ./
       - name: Run flake checks
         run: nix flake check --print-build-logs
-      # No-op after the flake checks; asserts the closures the dependent
-      # jobs substitute are complete and pushed.
-      - name: Assert package closures are complete
-        run: nix build .# .#gha-real-tests --no-link
+      # No-op builds after the flake checks. Dependent jobs import this
+      # closure instead of building or substituting it again.
+      - name: Export binaries
+        run: |
+          set -euo pipefail
+          nix build .# -o hestia-bin
+          targets=(./hestia-bin)
+          if [ "$RUNNER_OS" = Linux ]; then
+            nix build .#gha-real-tests -o gha-real-tests
+            targets+=(./gha-real-tests)
+          fi
+          for t in "${targets[@]}"; do echo "$t $(readlink -f "$t")"; done > hestia-closure.paths
+          nix-store -qR "${targets[@]}" | xargs nix-store --export > hestia-closure.nar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hestia-${{ runner.os }}
+          path: hestia-closure.*
+          retention-days: 1
 
   # Proves the action wrapper makes the GHA cache tokens visible to shell
   # steps and that the results endpoint is reachable. The real-API
@@ -48,7 +73,6 @@ jobs:
   # the REST API.
   token-probe:
     runs-on: ubuntu-latest
-    # The build job pushes the gha-real-tests closure to the cache.
     needs: build
     permissions:
       # actions:write is needed by the REST delete test
@@ -57,11 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: NixOS/nix-installer-action@main
-      # Dogfood substituter, so the nix build below substitutes instead of
-      # compiling. Must run before the token-only invocation below.
-      - name: Start hestia cache (dogfood)
-        if: vars.HESTIA_DOGFOOD == 'true'
-        uses: ./
+      - uses: ./.github/actions/built-hestia
       # Explicitly empty binary/version: token-capture-only mode (must
       # stay tested). version defaults to "latest" when omitted.
       - uses: ./
@@ -98,7 +118,6 @@ jobs:
         if: github.event.pull_request.head.repo.fork != true
         run: |
           set -euo pipefail
-          nix build .#gha-real-tests -o gha-real-tests
           ./gha-real-tests/bin/gha-real-tests --ignored --nocapture
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -108,7 +127,6 @@ jobs:
   # bugs would only show up after a release.
   gc-dry-run:
     runs-on: ubuntu-latest
-    # The build job pushes the package closure to the cache.
     needs: build
     permissions:
       # REST cache listing; a dry run never deletes.
@@ -117,20 +135,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: NixOS/nix-installer-action@main
-      # Substituter for the nix build below; also exports the cache tokens
-      # GC needs to read manifests.
-      - name: Start hestia cache (dogfood)
-        if: vars.HESTIA_DOGFOOD == 'true'
-        uses: ./
-      # Token-capture-only mode when dogfooding is off (forks). Explicitly
-      # empty version: it defaults to "latest" when omitted, which would
-      # start an unwanted daemon.
+      # Token capture only: GC needs the cache tokens, not a daemon.
       - uses: ./
-        if: vars.HESTIA_DOGFOOD != 'true'
         with:
           version: ""
-      - name: Build hestia
-        run: nix build .# -o hestia-bin
+      - uses: ./.github/actions/built-hestia
       - name: Run GC (dry run)
         run: ./hestia-bin/bin/hestia gc --dry-run
         env:
@@ -141,7 +150,6 @@ jobs:
   # matrix to build jobs that build by drv path without re-evaluating.
   matrix-eval:
     runs-on: ubuntu-latest
-    # The build job pushes the package closure to the cache.
     needs: build
     permissions:
       actions: write
@@ -153,20 +161,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: NixOS/nix-installer-action@main
-      # Dogfood substituter, so the nix build below substitutes instead of
-      # compiling (forks without the variables build from source).
-      - name: Start hestia cache (dogfood)
-        if: vars.HESTIA_DOGFOOD == 'true'
-        uses: ./
-      - name: Build hestia
-        run: nix build .# -o hestia-bin
-      # Instance under test on its own port/socket, started last: the
-      # HESTIA_* variables and the post-build-hook then point at it.
+      - uses: ./.github/actions/built-hestia
       - uses: ./
         with:
           binary: ./hestia-bin/bin/hestia
-          listen: 127.0.0.1:37517
-          socket: /tmp/hestia-matrix/hook.sock
       - name: Make the fixture derivations unique to this run
         run: |
           set -euo pipefail
@@ -202,25 +200,86 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: NixOS/nix-installer-action@main
-      # Dogfood substituter, so the nix build below substitutes instead of
-      # compiling (forks without the variables build from source).
-      - name: Start hestia cache (dogfood)
-        if: vars.HESTIA_DOGFOOD == 'true'
-        uses: ./
-      - name: Build hestia
-        run: nix build .# -o hestia-bin
+      - uses: ./.github/actions/built-hestia
       # Instance under test: it must serve the drv closures registered by
       # the eval job, hence wait-manifest-version.
       - uses: ./
         with:
           binary: ./hestia-bin/bin/hestia
-          listen: 127.0.0.1:37517
-          socket: /tmp/hestia-matrix/hook.sock
           wait-manifest-version: ${{ needs.matrix-eval.outputs.manifest-version }}
       # No checkout of the fixture flake and no evaluation: the drv closure
       # comes out of the cache.
       - name: Build by drv path
         run: nix build -L ${{ matrix.installables }}
+
+  # The OCI store on ghcr.io with head provenance: oci-push signs its
+  # head keyless, oci-pull must substitute through it under the strict
+  # policy with `gh` doing the verifying.
+  oci-push:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      head: ${{ steps.drain.outputs.head }}
+    env:
+      OCI_REPO: ghcr.io/${{ github.repository }}/cache
+    steps:
+      - uses: actions/checkout@v7
+      - uses: NixOS/nix-installer-action@main
+      - uses: ./.github/actions/built-hestia
+      - uses: ./
+        with:
+          binary: ./hestia-bin/bin/hestia
+          oci: ${{ env.OCI_REPO }}
+          trust: strict
+      - name: Build a commit-unique derivation
+        run: nix build -L --impure --expr "$OCI_TEST_DRV" -o ./oci-test-result
+      - id: drain
+        name: Drain
+        run: |
+          set -euo pipefail
+          "$HESTIA_BIN" drain --socket "$HESTIA_SOCKET" --timeout 300 2>&1 | tee drain.log
+          echo "head=$(grep -oE '(h|c)-[0-9a-f-]+' drain.log)" >> "$GITHUB_OUTPUT"
+      - name: Daemon log
+        if: always()
+        run: cat "$HESTIA_SERVE_LOG" || true
+
+  oci-pull:
+    runs-on: ubuntu-latest
+    needs: oci-push
+    permissions:
+      contents: read
+      packages: read
+    env:
+      OCI_REPO: ghcr.io/${{ github.repository }}/cache
+    steps:
+      - uses: actions/checkout@v7
+      - uses: NixOS/nix-installer-action@main
+      - uses: ./.github/actions/built-hestia
+      - uses: ./
+        with:
+          binary: ./hestia-bin/bin/hestia
+          oci: ${{ env.OCI_REPO }}
+          trust: strict
+          read-only: true
+          wait-head: ${{ needs.oci-push.outputs.head }}
+      - name: Substitute what oci-push built
+        run: |
+          set -euo pipefail
+          path=$(nix eval --impure --raw --expr "($OCI_TEST_DRV).outPath")
+          nix path-info --store "http://$HESTIA_LISTEN" "$path"
+          nix build -L --impure --expr "$OCI_TEST_DRV" -o ./oci-test-result
+      - name: GC dry run over the registry
+        run: ./hestia-bin/bin/hestia gc --dry-run
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HESTIA_OCI: ${{ env.OCI_REPO }}
+      - name: Daemon log
+        if: always()
+        run: cat "$HESTIA_SERVE_LOG" || true
 
   # End-to-end test of the hestia-cache action on a real runner: install
   # (locally built binary), nix.conf wiring, daemon readiness, post-build-hook
@@ -231,7 +290,6 @@ jobs:
       matrix:
         runner: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.runner }}
-    # The build job pushes the package closure to the cache.
     needs: build
     permissions:
       actions: write
@@ -239,20 +297,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: NixOS/nix-installer-action@main
-      # Dogfood substituter, so the nix build below substitutes instead of
-      # compiling (forks without the variables build from source).
-      - name: Start hestia cache (dogfood)
-        if: vars.HESTIA_DOGFOOD == 'true'
-        uses: ./
-      - name: Build hestia
-        run: nix build .# -o hestia-bin
-      # Instance under test on its own port/socket, started last: the
-      # HESTIA_* variables and the post-build-hook then point at it.
+      - uses: ./.github/actions/built-hestia
       - uses: ./
         with:
           binary: ./hestia-bin/bin/hestia
-          listen: 127.0.0.1:37516
-          socket: /tmp/hestia-test/hook.sock
       - name: Build a run-unique derivation through the post-build-hook
         run: |
           set -euo pipefail

@@ -9,17 +9,20 @@
   header h1 { font-size: 16px; margin: 0; }
   button { font: inherit; padding: 4px 12px; cursor: pointer; }
   #stepno { color: var(--muted); min-width: 6em; }
-  main { display: grid; grid-template-columns: 1fr 280px; gap: 0; height: calc(100vh - 54px); }
-  #canvas { overflow: auto; }
+  main { display:block; }
+  #info { padding: 8px 20px; max-width: 900px; }
+  #info h2 { display:inline; margin-right:8px; font-size:15px; }
+  #desc { display:inline; } #desc p { display:inline; margin:0 6px 0 0; }
+  #canvas { overflow:auto; padding-left:10px; }
   svg { display:block; }
-  aside { border-left: 1px solid #ddd; padding: 14px 18px; overflow:auto; }
+  aside { padding: 4px 20px; }
   aside h2 { font-size: 15px; margin: 0 0 6px; }
   aside p { margin: 6px 0; }
   code { background:#eee; padding:0 3px; border-radius:3px; }
-  .legend { display:flex; gap:10px; flex-wrap:wrap; font-size:12px; margin-top:14px; }
+  .legend { display:flex; gap:10px; flex-wrap:wrap; font-size:12px; }
   .legend span { display:inline-flex; align-items:center; gap:4px; }
   .legend i { width:14px; height:10px; display:inline-block; border:1px solid #999; }
-  ol#log { padding-left: 20px; color: var(--muted); font-size: 12px; }
+  ol#log { padding-left: 20px; color: var(--muted); font-size: 12px; columns: 3; }
   ol#log li.cur { color: var(--fg); font-weight: 600; }
   text { font: 11px ui-monospace, monospace; }
   .lane-label { font: 12px system-ui; fill: var(--muted); }
@@ -46,6 +49,7 @@
   <label><input type="checkbox" id="showview" checked> show reader view</label>
 </header>
 <main>
+  <div id="info"><h2 id="title"></h2><div id="desc"></div></div>
   <div id="canvas"><svg id="svg" width="1100" height="520">
     <defs>
       <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker>
@@ -54,10 +58,7 @@
     </defs>
     <g id="root"></g>
   </svg></div>
-  <aside>
-    <h2 id="title"></h2>
-    <div id="desc"></div>
-    <div class="legend">
+  <aside><div class="legend">
       <span><i style="background:var(--pack)"></i>pack (chunks)</span>
       <span><i style="background:var(--seg)"></i>segment</span>
       <span><i style="background:var(--h)"></i>h‑head (drain)</span>
@@ -67,8 +68,7 @@
       <span><i style="border:2.5px solid #d33"></i>written / deleted this step</span>
       <span><i style="border:2px dashed #26a"></i>reader view</span>
     </div>
-    <ol id="log"></ol>
-  </aside>
+    <ol id="log"></ol></aside>
 </main>
 <script>
 "use strict";

@@ -1,13 +1,13 @@
 //! The GitHub Actions cache. Reads go through signed URLs (cached until
 //! they expire). Listing and deletes use the REST API and need `GITHUB_TOKEN`.
 
-use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 
+use super::urls::UrlCache;
 use super::{Error, Listed};
 use crate::gha::blob;
 use crate::gha::rest::{CacheEntry, ENV_GITHUB_REPOSITORY, RestClient};
@@ -21,7 +21,7 @@ pub struct Gha {
     /// The variable that was missing when there is no REST access.
     rest: Result<RestClient, &'static str>,
     http: reqwest::Client,
-    urls: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+    urls: Arc<UrlCache>,
 }
 
 impl Gha {
@@ -34,7 +34,7 @@ impl Gha {
             twirp,
             rest,
             http,
-            urls: Default::default(),
+            urls: Arc::new(UrlCache::new(URL_TTL)),
         }
     }
 
@@ -64,25 +64,14 @@ impl Gha {
     }
 
     async fn url(&self, key: &str, force: bool) -> Result<Option<String>, Error> {
-        if !force
-            && let Some((url, issued)) = self.urls.lock().unwrap().get(key)
-            && issued.elapsed() < URL_TTL
-        {
-            return Ok(Some(url.clone()));
-        }
-        let found = self.twirp.get_download_url(key, &[]).await?;
-        let mut urls = self.urls.lock().unwrap();
-        urls.retain(|_, (_, issued)| issued.elapsed() < URL_TTL);
-        match found {
-            DownloadUrl::Hit { url, .. } => {
-                urls.insert(key.to_owned(), (url.clone(), Instant::now()));
-                Ok(Some(url))
-            }
-            DownloadUrl::Miss => {
-                urls.remove(key);
-                Ok(None)
-            }
-        }
+        self.urls
+            .get(key, force, async {
+                Ok(match self.twirp.get_download_url(key, &[]).await? {
+                    DownloadUrl::Hit { url, .. } => Some(url),
+                    DownloadUrl::Miss => None,
+                })
+            })
+            .await
     }
 
     /// `None` if the key does not exist.
@@ -101,9 +90,7 @@ impl Gha {
             let refresh = async || self.url(key, true).await?.ok_or_else(gone);
             match blob::get_with_refresh(&self.http, &url, range.clone(), refresh).await {
                 Ok(bytes) => return Ok(Some(bytes)),
-                Err(Error::Status { status: 404, .. }) => {
-                    self.urls.lock().unwrap().remove(key);
-                }
+                Err(Error::Status { status: 404, .. }) => self.urls.evict(key),
                 Err(err) => return Err(err),
             }
         }
@@ -153,7 +140,7 @@ impl Gha {
     }
 
     pub async fn delete(&self, key: &str) -> Result<bool, Error> {
-        self.urls.lock().unwrap().remove(key);
+        self.urls.evict(key);
         Ok(!self.rest()?.delete_by_key(key).await?.is_empty())
     }
 

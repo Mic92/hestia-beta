@@ -11,6 +11,7 @@ pub mod gha;
 pub mod ghcr;
 pub mod oci;
 pub mod s3;
+mod urls;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
@@ -82,6 +83,16 @@ impl Backend {
             Backend::Oci(b) => b.list(prefix, limit).await,
             Backend::S3(b) => b.list(prefix, limit).await,
         }
+    }
+
+    /// Every `g-`/`h-` key. One request where the backend can.
+    pub async fn list_heads(&self) -> Result<Vec<Listed>, Error> {
+        if let Backend::Gha(b) = self {
+            let (g, h) =
+                futures_util::future::try_join(b.list("g-", None), b.list("h-", None)).await?;
+            return Ok([g, h].into_iter().flatten().flatten().collect());
+        }
+        Ok(self.list("", None).await?.expect("unbounded"))
     }
 
     /// GC only: the `pack-`/`seg-`/`tree-` objects [`Self::delete`] can

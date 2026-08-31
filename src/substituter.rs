@@ -1097,7 +1097,11 @@ mod tests {
     fn unused_backend() -> Backend {
         let http = reqwest::Client::new();
         let twirp = crate::gha::twirp::TwirpClient::new(http.clone(), "http://unused", "token");
-        Backend::new(twirp, Err("GITHUB_TOKEN"), http)
+        Backend::Gha(crate::backend::gha::Gha::new(
+            twirp,
+            Err("GITHUB_TOKEN"),
+            http,
+        ))
     }
 
     fn test_path_hash(seed: u8) -> PathHash {

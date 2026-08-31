@@ -70,5 +70,6 @@ Always exits 0 (a failing post-build-hook would fail the build).
 | `GITHUB_REF`, `GITHUB_BASE_REF`, `GITHUB_EVENT_PATH` | serve, gc | The job's cache scope, and the two further scopes it can read (a pull request's base branch, the repository's default branch from the event payload). Listings cover exactly these; deletes only `GITHUB_REF`. Set automatically in workflows. |
 | `GITHUB_REF_NAME` | serve | Default for `--branch`. |
 | `GITHUB_RUN_ID` | serve | Roots written by the same workflow run merge by union (matrix legs); different runs replace each other's root. |
+| `HESTIA_OCI` | serve, gc | `<registry>/<repository>` (e.g. `ghcr.io/owner/repo/hestia`): store in that OCI registry instead of the Actions cache. Credentials from `HESTIA_OCI_USER`/`HESTIA_OCI_PASSWORD`, else `GITHUB_TOKEN` on ghcr.io, else anonymous (read-only). gc cannot delete there yet. |
 | `HESTIA_LISTEN` | prefetch | Address exported by the action for the running Hestia server. |
 | `OUT_PATHS` | hook | Set by Nix when invoking the post-build-hook. |

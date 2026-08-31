@@ -1,6 +1,5 @@
-//! Blob storage by string key over the GitHub Actions cache. Reads go
-//! through signed URLs (cached until they expire). Listing and deletes
-//! use the REST API and need `GITHUB_TOKEN`.
+//! The GitHub Actions cache. Reads go through signed URLs (cached until
+//! they expire). Listing and deletes use the REST API and need `GITHUB_TOKEN`.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -9,22 +8,15 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-pub use crate::gha::Error;
+use super::{Error, Listed};
 use crate::gha::blob;
 use crate::gha::rest::{CacheEntry, ENV_GITHUB_REPOSITORY, RestClient};
 use crate::gha::twirp::{DownloadUrl, Reservation, TwirpClient};
 
 const URL_TTL: Duration = Duration::from_secs(10 * 60);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Listed {
-    pub key: String,
-    pub created: Option<u64>,
-    pub last_accessed: Option<u64>,
-}
-
 #[derive(Clone)]
-pub struct Backend {
+pub struct Gha {
     twirp: TwirpClient,
     /// The variable that was missing when there is no REST access.
     rest: Result<RestClient, &'static str>,
@@ -32,13 +24,13 @@ pub struct Backend {
     urls: Arc<Mutex<HashMap<String, (String, Instant)>>>,
 }
 
-impl Backend {
+impl Gha {
     pub fn new(
         twirp: TwirpClient,
         rest: Result<RestClient, &'static str>,
         http: reqwest::Client,
     ) -> Self {
-        Backend {
+        Gha {
             twirp,
             rest,
             http,
@@ -53,14 +45,6 @@ impl Backend {
             _ => ENV_GITHUB_REPOSITORY,
         });
         Ok(Self::new(twirp, rest, http))
-    }
-
-    pub fn twirp(&self) -> &TwirpClient {
-        &self.twirp
-    }
-
-    pub fn http(&self) -> &reqwest::Client {
-        &self.http
     }
 
     fn rest(&self) -> Result<&RestClient, Error> {

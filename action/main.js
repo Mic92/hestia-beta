@@ -406,6 +406,15 @@ function startDaemon(hestiaBin, listen, socket, logFile) {
   if (githubToken && !env.GITHUB_TOKEN) {
     env.GITHUB_TOKEN = githubToken;
   }
+  // Backend selection is exported too, so later steps (`prefetch`, `gc`,
+  // `import`) talk to the same store as the daemon.
+  for (const [input, name] of [['oci', 'HESTIA_OCI']]) {
+    const value = getInput(input);
+    if (value) {
+      env[name] = value;
+      exportVariable(name, value);
+    }
+  }
   const daemon = spawn(hestiaBin, args, {
     detached: true,
     stdio: ['ignore', log, log],

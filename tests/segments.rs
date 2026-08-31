@@ -246,8 +246,11 @@ async fn drain_with_listing_down_claims_against_the_served_view() {
         publish.set_snapshot(support::common::load_snapshot(&fake, &http).await);
 
         let mut ctx = pipeline_context(&fake, &http, store.database());
-        ctx.backend =
-            hestia::backend::Backend::new(fake.twirp(&http), Err("GITHUB_TOKEN"), http.clone());
+        ctx.backend = hestia::backend::Backend::Gha(hestia::backend::gha::Gha::new(
+            fake.twirp(&http),
+            Err("GITHUB_TOKEN"),
+            http.clone(),
+        ));
         ctx.publish = Some(publish.clone());
         let stats = ctx
             .run(to_path_set(&[&a, &b]), BTreeSet::new())

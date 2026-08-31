@@ -34,7 +34,7 @@ fn url_expired(status: u16) -> bool {
     status == 403 || status == 401
 }
 
-async fn status_error(url: &str, response: reqwest::Response) -> Error {
+pub async fn status_error(url: &str, response: reqwest::Response) -> Error {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
     Error::Status {

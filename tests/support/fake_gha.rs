@@ -45,6 +45,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use hestia::backend::Backend;
+use hestia::backend::gha::Gha;
 use hestia::gha::rest::{RestClient, format_timestamp};
 use hestia::gha::twirp::{
     CreateCacheEntryRequest, FinalizeCacheEntryUploadRequest, GetCacheEntryDownloadUrlRequest,
@@ -753,11 +754,11 @@ impl FakeGha {
 
     /// Backend for a job running on `git_ref`, with REST access.
     pub fn backend_on(&self, http: &reqwest::Client, git_ref: &str) -> Backend {
-        Backend::new(
+        Backend::Gha(Gha::new(
             self.twirp_on(http, git_ref),
             Ok(self.rest_on(http, git_ref)),
             http.clone(),
-        )
+        ))
     }
 
     /// REST client scoped to the default branch. The fake never

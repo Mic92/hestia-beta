@@ -49,6 +49,12 @@ so a writer never inherits another writer's (possibly half-finished)
 entry and a key always identifies exactly one claim. On OCI the blob
 itself is stored by digest and the nonce lives in the manifest.
 
+The same objects go into one of three stores: the Actions cache (the
+default, evicts by LRU), an OCI registry (blobs plus one manifest each,
+heads as tags) or an S3-compatible bucket (`pack/<xx>/`, `seg/`,
+`heads/` under a prefix). The rest of this document is store-agnostic:
+a store only needs put, ranged get, list by prefix and delete.
+
 ### Segments and heads
 
 A segment is what one writer published for one root: `.meta` holds a

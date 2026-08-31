@@ -408,7 +408,11 @@ function startDaemon(hestiaBin, listen, socket, logFile) {
   }
   // Backend selection is exported too, so later steps (`prefetch`, `gc`,
   // `import`) talk to the same store as the daemon.
-  for (const [input, name] of [['oci', 'HESTIA_OCI']]) {
+  for (const [input, name] of [
+    ['oci', 'HESTIA_OCI'],
+    ['s3', 'HESTIA_S3'],
+    ['s3-endpoint', 'HESTIA_S3_ENDPOINT'],
+  ]) {
     const value = getInput(input);
     if (value) {
       env[name] = value;

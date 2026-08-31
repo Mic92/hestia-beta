@@ -9,11 +9,12 @@ use std::process::ExitCode;
 use crate::backend::{self, Backend, Listed};
 use crate::chunker::{PackBuilder, coalesce_adjacent, extract_chunk, pack_cache_key};
 use crate::cli::GcArgs;
-use crate::heads::{GcRecord, RootRow, Signed};
+use crate::heads::{GcRecord, RootRow};
 use crate::manifest::{ChunkHash, PackKey, SegKey};
 use crate::pipeline::{now_unix, upload_pack};
 use crate::segment::{self, Meta, PackRow, Relocated, Tree};
 use crate::store::{self, Heads, fetch_pack_index, meta_key, tree_key};
+use crate::trust::Trust;
 
 pub const SECS_PER_HOUR: u64 = 3_600;
 pub const SECS_PER_DAY: u64 = 86_400;
@@ -24,6 +25,8 @@ pub enum Error {
     Backend(#[from] backend::Error),
     #[error(transparent)]
     Store(#[from] store::Error),
+    #[error(transparent)]
+    Trust(#[from] crate::trust::Error),
     #[error(transparent)]
     Segment(#[from] segment::Error),
     #[error(transparent)]
@@ -83,6 +86,7 @@ pub struct GcStats {
 
 pub struct Gc {
     pub backend: Backend,
+    pub trust: Trust,
     pub policy: GcPolicy,
     pub dry_run: bool,
 }
@@ -226,7 +230,7 @@ impl Gc {
 
     pub async fn run(&self, now: u64) -> Result<GcStats, Error> {
         let mut stats = GcStats::default();
-        let heads = Heads::load(&self.backend).await?;
+        let heads = Heads::load(&self.backend, &self.trust).await?;
         if let Some(name) = heads.gc_missing.first() {
             return Err(Error::HeadUnreadable(name.clone()));
         }
@@ -397,7 +401,7 @@ impl Gc {
                 .collect(),
             time: now,
         };
-        let body = Signed::unsigned(record.encode());
+        let body = store::signed(&self.trust, record.encode()).await?;
         let name = record.head_name(&body).to_string();
         self.put(&name, body).await?;
 
@@ -559,8 +563,16 @@ pub async fn run(args: &GcArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let trust = match Trust::from_env() {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("hestia gc: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let gc = Gc {
         backend,
+        trust,
         policy: GcPolicy {
             root_ttl: args.root_ttl * SECS_PER_DAY,
             touch_age: args.touch_age * SECS_PER_DAY,

@@ -42,9 +42,14 @@ async fn serve(
     store: &ScratchStore,
 ) -> (String, AccessLog, tokio::task::JoinHandle<()>) {
     let backend = fake.backend(http);
-    let snapshot = Snapshot::load(backend.clone(), &[TEST_ROOT_KEY.to_string()], None)
-        .await
-        .unwrap();
+    let snapshot = Snapshot::load(
+        backend.clone(),
+        hestia::trust::Trust::open(),
+        &[TEST_ROOT_KEY.to_string()],
+        None,
+    )
+    .await
+    .unwrap();
     let manifest_store = ManifestStore::new();
     manifest_store.set_snapshot(Arc::new(snapshot));
     let access_log = AccessLog::new();
@@ -144,13 +149,23 @@ async fn unserved_root_is_invisible() {
         let http = reqwest::Client::new();
         push(&fake, &http, &store, &[&fixture]).await;
 
-        let snapshot = Snapshot::load(fake.backend(&http), &["other-root".to_string()], None)
-            .await
-            .unwrap();
+        let snapshot = Snapshot::load(
+            fake.backend(&http),
+            hestia::trust::Trust::open(),
+            &["other-root".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(snapshot.path_count(), 0);
-        let snapshot = Snapshot::load(fake.backend(&http), &[TEST_ROOT_KEY.to_string()], None)
-            .await
-            .unwrap();
+        let snapshot = Snapshot::load(
+            fake.backend(&http),
+            hestia::trust::Trust::open(),
+            &[TEST_ROOT_KEY.to_string()],
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(snapshot.path_count(), 1);
         assert!(snapshot.view.roots.contains_key(TEST_ROOT_KEY));
     })
@@ -174,9 +189,14 @@ async fn drain_dedups_against_segments() {
 
         let mut ctx = pipeline_context(&fake, &http, store.database());
         let publish = ManifestStore::new();
-        let snapshot = Snapshot::load(fake.backend(&http), &[TEST_ROOT_KEY.to_string()], None)
-            .await
-            .unwrap();
+        let snapshot = Snapshot::load(
+            fake.backend(&http),
+            hestia::trust::Trust::open(),
+            &[TEST_ROOT_KEY.to_string()],
+            None,
+        )
+        .await
+        .unwrap();
         publish.set_snapshot(Arc::new(snapshot));
         ctx.publish = Some(publish.clone());
         let second = ctx
@@ -209,7 +229,9 @@ async fn stored_path_with_evicted_tree_is_pushed_again() {
         let fake = FakeGha::start().await;
         let http = reqwest::Client::new();
         assert_eq!(push(&fake, &http, &store, &[&a]).await.pushed, 1);
-        let heads = Heads::load(&fake.backend(&http)).await.unwrap();
+        let heads = Heads::load(&fake.backend(&http), &hestia::trust::Trust::open())
+            .await
+            .unwrap();
         let meta = hestia::store::fetch_meta(&fake.backend(&http), &heads.view.heads[0].1.seg)
             .await
             .unwrap();
@@ -289,6 +311,7 @@ async fn drain_after_two_gc_runs_is_not_stale() {
         publish.set_snapshot(support::common::load_snapshot(&fake, &http).await);
         let gc = Gc {
             backend: fake.backend(&http),
+            trust: hestia::trust::Trust::open(),
             policy: GcPolicy::default(),
             dry_run: false,
         };

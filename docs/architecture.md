@@ -84,6 +84,14 @@ more segments to fetch in parallel until the next GC.
 header), `docs/spec/trust.qnt` the model of what a malicious writer can
 do under each trust policy.
 
+Where the store has no write scopes (registries, buckets) a head's body
+carries a cosign bundle: over the name for `h-*`, over the record with
+the proof field cleared for `c-*` and `g-*`. Readers verify pending heads
+in parallel against a per-root policy before computing the view and take
+the newest `g-*` that verifies, so a head from an unlisted signer is as
+if never published. Content objects need no signature: they are only
+reachable through a head and verified against their names.
+
 ### Packs
 
 Store paths are not cached one entry each. NARs are split into

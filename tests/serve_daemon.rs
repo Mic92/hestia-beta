@@ -209,6 +209,7 @@ async fn add_with_system_publishes_under_that_systems_root() {
     assert!(!own_root.contains(&path_hash_of(&other)));
     let other_root = hestia::store::Snapshot::load(
         fake.backend(&http),
+        hestia::trust::Trust::open(),
         &["main-riscv64-linux".to_string()],
         None,
     )

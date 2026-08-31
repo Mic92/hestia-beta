@@ -17,6 +17,7 @@ use crate::manifest::{
 use crate::segment::{
     self, ChunkRef, Chunks, Meta, Node, PackIndex, PackRow, Sealed, SegmentWriter, Tree,
 };
+use crate::trust::{GC_ROW, Trust};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -24,6 +25,8 @@ pub enum Error {
     Backend(#[from] crate::backend::Error),
     #[error(transparent)]
     Segment(#[from] segment::Error),
+    #[error(transparent)]
+    Trust(#[from] crate::trust::Error),
     #[error("{0} missing from the store")]
     Missing(String),
     #[error("{0} does not hash to its name")]
@@ -77,6 +80,7 @@ pub struct Resolved {
 /// a new one that shares loaded segments and pack indexes.
 pub struct Snapshot {
     backend: Backend,
+    trust: Trust,
     roots: Vec<String>,
     pub view: View,
     /// In lookup priority: served roots in order, newest segment first.
@@ -133,27 +137,36 @@ async fn signed_record(backend: &Backend, name: &str) -> Result<Option<(Signed, 
 enum GcHead {
     /// Listed but not fetchable (listing lag, eviction, a delete in flight).
     Missing,
-    /// Garbled or misnamed: as if never published.
+    /// Garbled, misnamed or its proof rejected: as if never published.
     Invalid,
     Valid(GcRecord),
 }
 
-async fn gc_record(backend: &Backend, name: &str) -> Result<GcHead, Error> {
+async fn gc_record(backend: &Backend, trust: &Trust, name: &str) -> Result<GcHead, Error> {
     let Some(body) = backend.get(name, None).await? else {
         return Ok(GcHead::Missing);
     };
-    match Signed::decode(&body)
+    let Some((s, r)) = Signed::decode(&body)
         .ok()
-        .and_then(|s| GcRecord::decode(&s.record).ok())
-        .filter(|r| Some(r.head_name(&body)) == HeadName::parse(name))
-    {
-        Some(r) => Ok(GcHead::Valid(r)),
-        None => Ok(GcHead::Invalid),
-    }
+        .and_then(|s| Some((GcRecord::decode(&s.record).ok()?, s)))
+        .map(|(r, s)| (s, r))
+        .filter(|(_, r)| Some(r.head_name(&body)) == HeadName::parse(name))
+    else {
+        return Ok(GcHead::Invalid);
+    };
+    Ok(match trust.verify(GC_ROW, &s.record, &s.proof).await? {
+        true => GcHead::Valid(r),
+        false => GcHead::Invalid,
+    })
 }
 
-/// A drain head whose body decodes and hashes back to its name.
-async fn head_record(backend: &Backend, name: &str) -> Result<Option<HeadRecord>, Error> {
+/// A drain head whose body matches its name and whose proof `trust`
+/// accepts for the root it claims.
+async fn head_record(
+    backend: &Backend,
+    trust: &Trust,
+    name: &str,
+) -> Result<Option<HeadRecord>, Error> {
     let Some((s, body)) = signed_record(backend, name).await? else {
         return Ok(None);
     };
@@ -163,7 +176,10 @@ async fn head_record(backend: &Backend, name: &str) -> Result<Option<HeadRecord>
     else {
         return Ok(None);
     };
-    Ok(Some(r))
+    Ok(trust
+        .verify(&r.root, &s.record, &s.proof)
+        .await?
+        .then_some(r))
 }
 
 /// The head listing and what it resolves to.
@@ -179,7 +195,8 @@ pub struct Heads {
 }
 
 impl Heads {
-    pub async fn load(backend: &Backend) -> Result<Heads, Error> {
+    /// Heads whose proof `trust` rejects count as not listed.
+    pub async fn load(backend: &Backend, trust: &Trust) -> Result<Heads, Error> {
         let mut listed = Vec::new();
         for prefix in ["g-", "h-"] {
             listed.extend(backend.list(prefix, None).await?.expect("unbounded"));
@@ -188,7 +205,7 @@ impl Heads {
         let mut gc = None;
         let mut gc_missing = Vec::new();
         for name in heads::newest_gc(names()) {
-            match gc_record(backend, name).await? {
+            match gc_record(backend, trust, name).await? {
                 GcHead::Valid(record) => {
                     gc = Some((name.to_owned(), record));
                     break;
@@ -202,7 +219,7 @@ impl Heads {
             heads::pending_heads(names(), gc_ref)
                 .into_iter()
                 .map(|n| async move {
-                    head_record(backend, n)
+                    head_record(backend, trust, n)
                         .await
                         .map(|r| r.map(|r| (n.to_owned(), r)))
                 }),
@@ -224,10 +241,11 @@ impl Heads {
 impl Snapshot {
     pub async fn load(
         backend: Backend,
+        trust: Trust,
         roots: &[String],
         previous: Option<&Snapshot>,
     ) -> Result<Snapshot, Error> {
-        let Heads { view, .. } = Heads::load(&backend).await?;
+        let Heads { view, .. } = Heads::load(&backend, &trust).await?;
         let loaded: HashMap<SegKey, Arc<Segment>> = previous
             .into_iter()
             .flat_map(|p| p.segments.iter().map(|s| (s.digest, s.clone())))
@@ -266,6 +284,7 @@ impl Snapshot {
             .unwrap_or_default();
         Ok(Snapshot {
             backend,
+            trust,
             roots: roots.to_vec(),
             view,
             segments,
@@ -278,12 +297,19 @@ impl Snapshot {
     /// store as last seen: a drain then claims against a base at most one
     /// drain old instead of keeping its paths hostage to the listing.
     pub async fn reload(&self) -> Result<Snapshot, Error> {
-        let fresh = Snapshot::load(self.backend.clone(), &self.roots, Some(self)).await;
+        let fresh = Snapshot::load(
+            self.backend.clone(),
+            self.trust.clone(),
+            &self.roots,
+            Some(self),
+        )
+        .await;
         match fresh {
             Err(Error::Backend(e)) => {
                 eprintln!("hestia: cannot refresh the view, using the last one: {e}");
                 Ok(Snapshot {
                     backend: self.backend.clone(),
+                    trust: self.trust.clone(),
                     roots: self.roots.clone(),
                     view: self.view.clone(),
                     segments: self.segments.clone(),
@@ -648,9 +674,15 @@ async fn put_segment(backend: &Backend, sealed: &Sealed) -> Result<SegKey, Error
     Ok(sealed.key)
 }
 
+pub async fn signed(trust: &Trust, record: Vec<u8>) -> Result<Vec<u8>, crate::trust::Error> {
+    let proof = trust.sign(&record).await?;
+    Ok(Signed { record, proof }.encode())
+}
+
 /// Upload a sealed segment and a signed `h-*` claiming it for `root`.
 pub async fn publish(
     backend: &Backend,
+    trust: &Trust,
     view: &View,
     root: &str,
     sealed: &Sealed,
@@ -662,7 +694,7 @@ pub async fn publish(
         seg: put_segment(backend, sealed).await?,
         time: now,
     };
-    let body = Signed::unsigned(record.encode());
+    let body = signed(trust, record.encode()).await?;
     let name = record.head_name(&body).to_string();
     backend.put(&name, body.into()).await?;
     Ok(name)

@@ -28,6 +28,7 @@ use crate::refnorm::RefTable;
 use crate::segment::SegmentWriter;
 use crate::store::{self, Snapshot};
 use crate::substituter::ManifestStore;
+use crate::trust::Trust;
 use crate::upstream::UpstreamFilter;
 use futures_util::{StreamExt as _, TryStreamExt as _};
 
@@ -143,6 +144,7 @@ pub async fn upload_pack(backend: &Backend, pack: &chunker::Pack) -> Result<(), 
 /// Everything the pipeline needs to talk to the world.
 pub struct PipelineContext {
     pub backend: Backend,
+    pub trust: Trust,
     pub store: StoreDatabase,
     pub upstream: UpstreamFilter,
     /// Expand hooked paths to their runtime closure before pushing.
@@ -247,7 +249,15 @@ impl PipelineContext {
             .and_then(ManifestStore::snapshot);
         let snapshot = Arc::new(match served {
             Some(served) => served.reload().await?,
-            None => Snapshot::load(self.backend.clone(), &[root.to_owned()], None).await?,
+            None => {
+                Snapshot::load(
+                    self.backend.clone(),
+                    self.trust.clone(),
+                    &[root.to_owned()],
+                    None,
+                )
+                .await?
+            }
         });
         // Blocking sqlite I/O happens off the async runtime.
         let store = self.store.clone();
@@ -573,7 +583,17 @@ impl PipelineContext {
         let commit_started = std::time::Instant::now();
         let sealed = writer.seal().map_err(store::Error::from)?;
         let now = (self.clock)();
-        stats.head = Some(store::publish(&self.backend, &snapshot.view, root, &sealed, now).await?);
+        stats.head = Some(
+            store::publish(
+                &self.backend,
+                &self.trust,
+                &snapshot.view,
+                root,
+                &sealed,
+                now,
+            )
+            .await?,
+        );
         stats.commit_ms = commit_started.elapsed().as_millis() as u64;
         let next = match snapshot.refresh_with(&sealed).await {
             Ok(next) => next,

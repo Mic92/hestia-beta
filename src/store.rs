@@ -12,7 +12,7 @@ use crate::chunker::pack_cache_key;
 use crate::heads::{self, GcRecord, HeadName, HeadRecord, Signed, View};
 use crate::manifest::{
     ChunkHash, ChunkList, ChunkLocation, Directory, FileSystemObject, FileTree, Hash32, PackKey,
-    PathEntry, PathHash, Regular, SegKey, Symlink,
+    PathEntry, PathHash, Regular, SegKey, StorePath, Symlink,
 };
 use crate::segment::{
     self, ChunkRef, Chunks, Meta, Node, PackIndex, PackRow, Sealed, SegmentWriter, Tree,
@@ -334,11 +334,13 @@ impl Snapshot {
         Ok(next)
     }
 
-    /// Copy a stored entry into `writer`. `false` if no served segment has
-    /// it or it is unservable as stored.
+    /// Copy a stored entry into `writer`, adding `realises` (CA build-trace
+    /// rows the local store gained since the entry was written). `false` if
+    /// no served segment has it.
     pub async fn copy_entry(
         &self,
         hash: &PathHash,
+        realises: &[String],
         writer: &mut SegmentWriter,
     ) -> Result<bool, Error> {
         let Some((seg, i)) = self.find(hash) else {
@@ -358,7 +360,13 @@ impl Snapshot {
                 ..c
             }
         });
-        writer.push(seg.meta.entry(i, node));
+        let mut entry = seg.meta.entry(i, node);
+        for id in realises {
+            if !entry.realises.contains(id) {
+                entry.realises.push(id.clone());
+            }
+        }
+        writer.push(entry);
         Ok(true)
     }
 
@@ -475,6 +483,13 @@ impl Snapshot {
         self.find(hash).is_some()
     }
 
+    /// The path realising CA output `id` (`drv^output`).
+    pub fn realisation(&self, id: &str) -> Option<StorePath> {
+        self.segments
+            .iter()
+            .find_map(|s| s.meta.realisation(id).map(|i| s.meta.store_path(i)))
+    }
+
     /// Without the file tree: enough for narinfo.
     pub fn lookup(&self, hash: &PathHash) -> Option<PathEntry> {
         let (seg, i) = self.find(hash)?;
@@ -553,6 +568,7 @@ fn path_entry(e: segment::Entry, tree: FileTree<ChunkList>) -> PathEntry {
         references: e.references,
         ca: e.ca,
         deriver: e.deriver,
+        realises: e.realises,
         tree,
     }
 }
@@ -656,6 +672,7 @@ pub fn push_entry(
         references: entry.references.clone(),
         deriver: entry.deriver.clone(),
         ca: entry.ca.clone(),
+        realises: entry.realises.clone(),
         tree,
     });
     Some(())

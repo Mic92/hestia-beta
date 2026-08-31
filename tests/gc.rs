@@ -286,11 +286,12 @@ async fn drain_racing_gc_is_kept() {
             references: vec![],
             ca: None,
             deriver: None,
+            realises: Vec::new(),
             tree,
         };
         hestia::store::push_entry(&mut writer, &entry, &known).unwrap();
         stale_view
-            .copy_entry(&a.path_hash(), &mut writer)
+            .copy_entry(&a.path_hash(), &[], &mut writer)
             .await
             .unwrap();
         let sealed = writer.seal().unwrap();

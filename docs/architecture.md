@@ -17,10 +17,13 @@ job builds, and an HTTP listener serving the Nix binary cache protocol.
 
 The action puts the daemon first in `extra-substituters`, so Nix asks
 it before cache.nixos.org. A narinfo hit answers straight from the
-segments loaded at startup. A NAR request is more involved: the daemon fetches the path's
-chunks from pack blobs with HTTP Range reads, reassembles the NAR, and
-verifies its hash before the first byte leaves the process. Any failure
-along the way (evicted pack, missing chunk, hash mismatch) becomes a
+segments loaded at startup, and so does `<hash>.ls` (file listing with NAR offsets,
+computed from the stored tree and pack indexes). A NAR request is more involved: the daemon fetches the path's
+chunks from pack blobs with HTTP Range reads and serves them as
+`.nar.zst` without recompressing: the stored zstd frames are spliced
+verbatim between small raw frames carrying the NAR framing, and Nix
+checks `NarHash` after decoding. Any failure
+along the way (evicted pack, missing chunk) becomes a
 404 and Nix quietly falls through to the next substituter; the daemon
 would rather serve nothing than something corrupt.
 
@@ -63,9 +66,19 @@ live-chunk bitset per pack; `.tree` holds the file trees, where a
 file's contents is a list of `(pack row, index in pack)` references
 plus reference rewrites (see below). Nothing in a segment is ever
 modified, so there is no merge conflict to resolve: concurrent drains
-simply publish one segment each. Lengths, table indices
+simply publish one segment each. The `.meta` header and bodies are CBOR,
+so fields can be added without breaking older readers; a `features`
+word in the header marks changes a rewrite (GC) must understand, and a
+build that does not leaves such segments alone. Lengths, table indices
 and nesting depth read from a segment are bounds-checked before use:
 storage is untrusted input.
+
+With `ca-derivations`, Nix asks a cache which path an output of a
+content-addressed derivation resolved to
+(`build-trace-v2/<drv>/<output>.doi`) before it can ask for the
+narinfo. A drain copies those rows from the builder's `BuildTraceV3`
+table into the body of the output path, and the daemon answers from
+them.
 
 Which segments make up a root is decided by heads, small CBOR records:
 `h-<epoch>-<root>-<time>-<sha256>` (a drain's claim: root name, the GC
@@ -85,12 +98,13 @@ header), `docs/spec/trust.qnt` the model of what a malicious writer can
 do under each trust policy.
 
 Where the store has no write scopes (registries, buckets) a head's body
-carries a cosign bundle: over the name for `h-*`, over the record with
-the proof field cleared for `c-*` and `g-*`. Readers verify pending heads
+carries a cosign bundle over the record. Readers verify pending heads
 in parallel against a per-root policy before computing the view and take
 the newest `g-*` that verifies, so a head from an unlisted signer is as
-if never published. Content objects need no signature: they are only
-reachable through a head and verified against their names.
+if never published; a verifier *error* (as opposed to a rejection)
+aborts GC rather than computing a view without that head. Content
+objects need no signature: they are only reachable through a head and
+verified against their names.
 
 ### Packs
 
@@ -120,8 +134,8 @@ even though nothing else in the file changed.
 hestia rewrites those occurrences to zeros before chunking, so the
 stored chunk stays identical across rebuilds. Each occurrence is
 recorded in a per-file position table (`ChunkList::rewrites`: file
-offset + reference index); on NAR reassembly the daemon copies the real
-hash back into each span. The hashes are not stored twice -- they come
+offset + reference index); when serving, the daemon re-encodes just the
+chunks an occurrence touches with the real hash copied back. The hashes are not stored twice -- they come
 from the path's `references` in the `PathEntry`, and a reference's index
 is its position in the sorted, deduplicated reference set, so write and
 read derive identical indices.

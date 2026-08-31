@@ -50,6 +50,8 @@ pub struct PathInfo {
     /// path is content-addressed.
     pub ca: Option<String>,
     pub signatures: Vec<Signature>,
+    /// `drv^output` ids from the CA build trace naming this path.
+    pub realises: Vec<String>,
 }
 
 impl PathInfo {
@@ -84,6 +86,7 @@ fn convert(path: StorePath, info: UnkeyedValidPathInfo) -> PathInfo {
         ca: info.ca.map(|ca| ca.to_string()),
         signatures: info.signatures.into_iter().collect(),
         store_path: path,
+        realises: Vec::new(),
     }
 }
 
@@ -215,10 +218,34 @@ impl StoreDatabase {
             }
         };
         match db.query_path_info(&self.store_dir, &parsed)? {
-            Some(record) => Ok(Lookup::Found(Box::new(convert(record.path, record.info)))),
+            Some(record) => {
+                let mut info = convert(record.path, record.info);
+                info.realises = realises(db, store_path)?;
+                Ok(Lookup::Found(Box::new(info)))
+            }
             None => Ok(Lookup::Unknown),
         }
     }
+}
+
+/// `drv^output` ids naming `out_path` in the CA build trace, none when
+/// the store never had `ca-derivations` on (no such table).
+fn realises(db: &StoreDb, out_path: &str) -> Result<Vec<String>, Error> {
+    let conn = db.connection();
+    let Ok(mut stmt) =
+        conn.prepare_cached("SELECT drvPath, outputName FROM BuildTraceV3 WHERE outputPath = ?1")
+    else {
+        return Ok(Vec::new());
+    };
+    stmt.query_map([out_path], |row| {
+        Ok(format!(
+            "{}^{}",
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?
+        ))
+    })
+    .and_then(Iterator::collect)
+    .map_err(|e| harmonia_store_db::Error::from(e).into())
 }
 
 #[cfg(test)]

@@ -95,6 +95,46 @@ impl ScratchStore {
         }
     }
 
+    /// `nix nar ls --json -R` of the path, the body of a `.ls` file.
+    pub fn nar_ls_json(&self, store_path: &Path) -> Option<serde_json::Value> {
+        let dump = self
+            .nix_store_cmd()
+            .arg("--dump")
+            .arg(store_path)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        let nar = tempfile::NamedTempFile::new().ok()?;
+        std::fs::write(nar.path(), &dump.stdout).ok()?;
+        let ls = Command::new("nix")
+            .args([
+                "--extra-experimental-features",
+                "nix-command",
+                "nar",
+                "ls",
+                "--json",
+                "-R",
+            ])
+            .arg(nar.path())
+            .arg("/")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        // nix < 2.35 omits `"executable": false`; normalise to the current format.
+        let mut v: serde_json::Value = serde_json::from_slice(&ls.stdout).ok()?;
+        fn fill(v: &mut serde_json::Value) {
+            let Some(o) = v.as_object_mut() else { return };
+            if o.get("type").and_then(|t| t.as_str()) == Some("regular") {
+                o.entry("executable").or_insert(false.into());
+            }
+            if let Some(entries) = o.get_mut("entries").and_then(|e| e.as_object_mut()) {
+                entries.values_mut().for_each(fill);
+            }
+        }
+        fill(&mut v);
+        Some(v)
+    }
+
     fn nix_store_cmd(&self) -> Command {
         let mut cmd = Command::new("nix-store");
         cmd.arg("--store").arg(self.store_uri());

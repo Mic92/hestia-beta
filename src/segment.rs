@@ -119,12 +119,19 @@ impl PackRow {
     }
 }
 
+/// Format bits a reader must understand to rewrite this segment;
+/// [`merge`] refuses inputs with bits outside this set.
+const KNOWN_FEATURES: u32 = 0;
+
 #[derive(Encode, Decode)]
 struct Header {
     #[n(0)]
     packs: Vec<PackRow>,
     #[n(1)]
     tree: SegKey,
+    /// `None` is 0, kept optional so older segments decode.
+    #[n(2)]
+    features: Option<u32>,
 }
 
 /// A chunk by location: row in the segment's pack table, entry in that pack's index.
@@ -289,6 +296,8 @@ pub struct Entry {
     pub references: Vec<StorePath>,
     pub deriver: Option<StorePath>,
     pub ca: Option<String>,
+    /// `drv^output` ids of CA derivation outputs this path realises.
+    pub realises: Vec<String>,
     pub tree: Node,
 }
 
@@ -315,9 +324,19 @@ pub struct MetaBody<'a> {
     pub deriver: Option<&'a str>,
     #[b(5)]
     pub ca: Option<&'a str>,
+    /// Space-joined `drv^output` ids, see [`Entry::realises`].
+    #[b(6)]
+    realises: Option<&'a str>,
 }
 
 impl MetaBody<'_> {
+    pub fn realises(&self) -> impl Iterator<Item = &str> {
+        self.realises
+            .unwrap_or("")
+            .split(' ')
+            .filter(|s| !s.is_empty())
+    }
+
     pub fn local_refs(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
         self.local_refs
             .chunks_exact(4)
@@ -407,8 +426,11 @@ pub struct Meta {
     pub packs: Vec<PackRow>,
     /// Digest of the `.tree` that goes with it.
     pub tree: SegKey,
+    pub features: u32,
     index: Index,
     bodies: Vec<u8>,
+    /// `drv^output` -> row.
+    traces: HashMap<String, usize>,
 }
 
 impl Meta {
@@ -443,20 +465,23 @@ impl Meta {
             return Err(bad(".meta body length mismatch"));
         }
         raw.drain(..index_len);
-        let meta = Meta {
+        let mut meta = Meta {
             packs: header.packs,
             tree: header.tree,
+            features: header.features.unwrap_or(0),
             index,
             bodies: raw,
+            traces: HashMap::new(),
         };
         for i in 0..meta.len() {
-            meta.validate(i)?;
+            let ids: Vec<String> = meta.validate(i)?.realises().map(str::to_owned).collect();
+            meta.traces.extend(ids.into_iter().map(|id| (id, i)));
         }
         Ok(meta)
     }
 
     /// Checked once at open so accessors need no error paths.
-    fn validate(&self, i: usize) -> Result<(), Error> {
+    fn validate(&self, i: usize) -> Result<MetaBody<'_>, Error> {
         let b = &self.bodies[self.index.body(i)];
         let name_len = *b.first().ok_or_else(|| bad("empty body"))? as usize;
         let name = b
@@ -470,7 +495,12 @@ impl Meta {
         for p in body.foreign_refs().chain(body.deriver) {
             StorePath::from_base_path(p).map_err(|e| bad(e.to_string()))?;
         }
-        Ok(())
+        Ok(body)
+    }
+
+    /// Row of the path realising CA output `id` (`drv^output`).
+    pub fn realisation(&self, id: &str) -> Option<usize> {
+        self.traces.get(id).copied()
     }
 
     pub fn len(&self) -> usize {
@@ -520,6 +550,7 @@ impl Meta {
                 .deriver
                 .map(|d| StorePath::from_base_path(d).expect("validated")),
             ca: body.ca.map(str::to_owned),
+            realises: body.realises().map(str::to_owned).collect(),
             tree,
         }
     }
@@ -772,6 +803,7 @@ impl SegmentWriter {
                 }
             }
             let deriver = e.deriver.as_ref().map(StorePath::to_base_path);
+            let realises = e.realises.join(" ");
             let body = MetaBody {
                 nar_hash: e.nar_hash,
                 nar_size: e.nar_size,
@@ -779,6 +811,7 @@ impl SegmentWriter {
                 foreign_refs: &foreign.join(" "),
                 deriver: deriver.as_deref(),
                 ca: e.ca.as_deref(),
+                realises: (!realises.is_empty()).then_some(&realises),
             };
             minicbor::encode(&body, &mut bodies).expect("Vec write");
             lens.push(bodies.len() - start);
@@ -821,6 +854,7 @@ impl SegmentWriter {
         let header = Header {
             packs: self.packs,
             tree: tree_key,
+            features: None,
         };
         let header = minicbor::to_vec(header).expect("Vec write");
         let mut meta = Vec::new();
@@ -851,6 +885,12 @@ pub fn merge(
     let mut writer = SegmentWriter::default();
     let mut dropped = BTreeSet::new();
     for (meta, tree) in inputs {
+        if meta.features & !KNOWN_FEATURES != 0 {
+            return Err(bad(format!(
+                "segment uses format features {:#x} this build cannot rewrite",
+                meta.features & !KNOWN_FEATURES
+            )));
+        }
         if meta.len() != tree.len() {
             return Err(bad(".meta and .tree disagree on entry count"));
         }
@@ -1036,6 +1076,7 @@ mod tests {
             ca: seed
                 .is_multiple_of(3)
                 .then(|| "fixed:r:sha256:abc".to_string()),
+            realises: Vec::new(),
             tree,
         }
     }
@@ -1159,6 +1200,30 @@ mod tests {
         assert_eq!(m.body(m.find(&e3.key()).unwrap()).foreign_refs().count(), 0);
         // only e3's chunk 3 is left in pack [1]
         assert_eq!(m.packs[1].live_count, 1);
+    }
+
+    #[test]
+    fn merge_refuses_unknown_features() {
+        let (mut meta, tree, _) = roundtrip(vec![entry(1, &[], &[c(0, 0)])], packs(1));
+        meta.features = 1 << 31;
+        assert!(matches!(
+            merge(&[(&meta, &tree)], in_place),
+            Err(Error::Format(_))
+        ));
+    }
+
+    #[test]
+    fn realisations_round_trip_and_survive_merge() {
+        let mut e = entry(1, &[], &[c(0, 0)]);
+        e.realises = vec!["a.drv^out".into(), "b.drv^lib".into()];
+        let (meta, tree, _) = roundtrip(vec![entry(2, &[], &[c(0, 1)]), e.clone()], packs(1));
+        let i = meta.find(&e.key()).unwrap();
+        assert_eq!(meta.realisation("b.drv^lib"), Some(i));
+        assert_eq!(meta.realisation("b.drv^out"), None);
+        assert_eq!(meta.entry(i, e.tree.clone()).realises, e.realises);
+        let (sealed, _) = merge(&[(&meta, &tree)], in_place).unwrap();
+        let merged = Meta::open(&sealed.meta).unwrap();
+        assert_eq!(merged.realisation("a.drv^out"), merged.find(&e.key()));
     }
 
     #[test]

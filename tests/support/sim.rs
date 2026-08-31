@@ -188,6 +188,7 @@ impl SimCache {
                 references: vec![],
                 ca: None,
                 deriver: None,
+                realises: Vec::new(),
                 tree,
             });
         }
@@ -206,7 +207,7 @@ impl SimCache {
             let hash = path.path_hash();
             if !writer.contains(&hash) {
                 snapshot
-                    .copy_entry(&hash, &mut writer)
+                    .copy_entry(&hash, &[], &mut writer)
                     .await
                     .expect("copy entry");
             }
@@ -300,7 +301,7 @@ impl SimCache {
                 .await
                 .expect("nar request");
             assert_eq!(response.status(), 200, "NAR for {}", path.name);
-            let nar = response.bytes().await.expect("nar body");
+            let nar = super::common::nar_body(response).await;
             assert_eq!(
                 nar.len() as u64,
                 entry.nar_size,

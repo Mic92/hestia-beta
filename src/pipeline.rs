@@ -13,7 +13,7 @@
 //! 5. Publish everything this job pushed, found stored or substituted as
 //!    one segment plus head under this root.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -289,6 +289,9 @@ impl PipelineContext {
         .expect("store database query task panicked")?;
 
         let mut root_paths: BTreeSet<PathHash> = accessed;
+        // CA build-trace rows of already stored paths; the local store may
+        // have gained some since the entry was written.
+        let mut realises: BTreeMap<PathHash, Vec<String>> = BTreeMap::new();
         // Paths that need chunking + upload.
         let mut to_push: Vec<(String, PathInfo)> = Vec::new();
         // Valid local paths the view already has.
@@ -334,6 +337,9 @@ impl PipelineContext {
                 continue;
             }
             root_paths.insert(hash);
+            if !info.realises.is_empty() {
+                realises.insert(hash, info.realises);
+            }
             stats.skipped_existing += 1;
         }
         // A rebuild mostly repeats the chunks of the previous build under
@@ -472,6 +478,7 @@ impl PipelineContext {
                     nar_size,
                     ca: info.ca,
                     deriver: info.deriver,
+                    realises: info.realises,
                     tree: chunked.tree,
                 });
 
@@ -574,7 +581,8 @@ impl PipelineContext {
         stats.pushed = prepared.len();
         for hash in &root_paths {
             if !writer.contains(hash) {
-                snapshot.copy_entry(hash, &mut writer).await?;
+                let extra = realises.get(hash).map_or(&[][..], Vec::as_slice);
+                snapshot.copy_entry(hash, extra, &mut writer).await?;
             }
         }
         if writer.is_empty() {

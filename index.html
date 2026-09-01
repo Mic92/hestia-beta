@@ -3,43 +3,45 @@
 <meta charset="utf-8">
 <title>hestia: heads, segments and GC epochs</title>
 <style>
-  :root { --bg:#fafafa; --fg:#222; --muted:#888; --pack:#c9dcf3; --seg:#cfe9c9; --h:#ffe3a8; --c:#f5c6e0; --g:#f3b0a8; --dead:#e0e0e0; }
-  body { font: 14px/1.4 system-ui, sans-serif; margin: 0; background: var(--bg); color: var(--fg); }
-  header { padding: 12px 20px; border-bottom: 1px solid #ddd; display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+  :root {
+    --bg: #fafafa; --fg: #222; --muted: #888;
+    --pack: #c9dcf3; --seg: #cfe9c9; --h: #ffe3a8; --g: #f3b0a8; --dead: #e0e0e0;
+  }
+  body   { font: 14px/1.4 system-ui, sans-serif; margin: 0; background: var(--bg); color: var(--fg); }
+  header { padding: 12px 20px; border-bottom: 1px solid #ddd; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
   header h1 { font-size: 16px; margin: 0; }
   button { font: inherit; padding: 4px 12px; cursor: pointer; }
   #stepno { color: var(--muted); min-width: 6em; }
-  main { display:block; }
-  #info { padding: 8px 20px; max-width: 900px; }
-  #info h2 { display:inline; margin-right:8px; font-size:15px; }
-  #desc { display:inline; } #desc p { display:inline; margin:0 6px 0 0; }
-  #canvas { overflow:auto; padding-left:10px; }
-  svg { display:block; }
+  #info { padding: 8px 20px; max-width: 900px; min-height: 4.5em; }
+  #info h2 { margin: 0 0 4px; font-size: 15px; }
+  #desc p { margin: 0 0 4px; }
+  #canvas { overflow: auto; padding-left: 10px; }
+  svg { display: block; }
   aside { padding: 4px 20px; }
-  aside h2 { font-size: 15px; margin: 0 0 6px; }
-  aside p { margin: 6px 0; }
-  code { background:#eee; padding:0 3px; border-radius:3px; }
-  .legend { display:flex; gap:10px; flex-wrap:wrap; font-size:12px; }
-  .legend span { display:inline-flex; align-items:center; gap:4px; }
-  .legend i { width:14px; height:10px; display:inline-block; border:1px solid #999; }
+  code { background: #eee; padding: 0 3px; border-radius: 3px; }
+  .legend { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 4px; }
+  .legend i { width: 14px; height: 10px; display: inline-block; border: 1px solid #999; }
   ol#log { padding-left: 20px; color: var(--muted); font-size: 12px; columns: 3; }
+  ol#log li { cursor: pointer; }
   ol#log li.cur { color: var(--fg); font-weight: 600; }
   text { font: 11px ui-monospace, monospace; }
   .lane-label { font: 12px system-ui; fill: var(--muted); }
-  .obj rect { stroke:#666; stroke-width:1; rx:3; }
-  .obj.new rect { stroke:#d33; stroke-width:2.5; }
+  .obj rect { stroke: #666; stroke-width: 1; rx: 3; }
+  .obj.new rect { stroke: #d33; stroke-width: 2.5; }
   .obj.dead rect { fill: var(--dead) !important; stroke-dasharray: 3 2; }
-  .obj.dead text { fill:#999; text-decoration: line-through; }
-  .obj.retired rect { stroke:#b55; stroke-dasharray: 4 2; }
+  .obj.dead text { fill: #999; text-decoration: line-through; }
+  .obj.unreadable rect { stroke: #b55; stroke-dasharray: 4 2; }
   .obj.gone { opacity: .15; }
-  .arrow { fill:none; stroke:#555; stroke-width:1.3; marker-end:url(#ah); }
-  .arrow.dim { stroke:#ccc; }
-  .arrow.new { stroke:#d33; stroke-width:2; marker-end:url(#ahn); }
-  .arrow.view { stroke:#26a; stroke-width:2; stroke-dasharray:5 3; marker-end:url(#ahv); }
-  .actor rect { fill:#fff; stroke:#333; rx:6; }
-  .actor.gc rect { fill:#fde; }
-  .actor text.t { font: 12px system-ui; font-weight:600; }
+  .arrow { fill: none; stroke: #555; stroke-width: 1.3; marker-end: url(#ah); }
+  .arrow.dim { stroke: #ccc; }
+  .arrow.new { stroke: #d33; stroke-width: 2; marker-end: url(#ahn); }
+  .arrow.view { stroke: #26a; stroke-width: 2; stroke-dasharray: 5 3; marker-end: url(#ahv); }
+  .actor rect { fill: #fff; stroke: #333; rx: 6; }
+  .actor.gc rect { fill: #fde; }
+  .actor text.t { font: 12px system-ui; font-weight: 600; }
 </style>
+
 <header>
   <h1>hestia store: uploads, heads and GC epochs</h1>
   <button id="prev">◀ back</button>
@@ -48,207 +50,452 @@
   <span id="stepno"></span>
   <label><input type="checkbox" id="showview" checked> show reader view</label>
 </header>
+
 <main>
   <div id="info"><h2 id="title"></h2><div id="desc"></div></div>
-  <div id="canvas"><svg id="svg" width="1100" height="520">
-    <defs>
-      <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker>
-      <marker id="ahn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#d33"/></marker>
-      <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#26a"/></marker>
-    </defs>
-    <g id="root"></g>
-  </svg></div>
-  <aside><div class="legend">
-      <span><i style="background:var(--pack)"></i>pack (chunks)</span>
-      <span><i style="background:var(--seg)"></i>segment</span>
-      <span><i style="background:var(--h)"></i>h‑head (drain)</span>
-      <span><i style="background:var(--c)"></i>c‑head (compaction)</span>
-      <span><i style="background:var(--g)"></i>g‑head (GC record)</span>
-      <span><i style="background:var(--dead);border-style:dashed"></i>unreferenced</span>
-      <span><i style="border:2.5px solid #d33"></i>written / deleted this step</span>
+  <div id="canvas">
+    <svg id="svg" width="1100" height="520">
+      <defs>
+        <marker id="ah"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker>
+        <marker id="ahn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#d33"/></marker>
+        <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#26a"/></marker>
+      </defs>
+      <g id="root"></g>
+    </svg>
+  </div>
+  <aside>
+    <div class="legend">
+      <span><i style="background:var(--pack)"></i>pack (compressed chunks)</span>
+      <span><i style="background:var(--seg)"></i>segment (path index + trees)</span>
+      <span><i style="background:var(--h)"></i>h‑head (one per drain)</span>
+      <span><i style="background:var(--g)"></i>g‑head (one per GC run)</span>
+      <span><i style="background:var(--dead);border-style:dashed"></i>not in the current view</span>
+      <span><i style="border:2px dashed #b55"></i>unreadable (evicted)</span>
+      <span><i style="border:2.5px solid #d33"></i>written / deleted in this step</span>
       <span><i style="border:2px dashed #26a"></i>reader view</span>
     </div>
-    <ol id="log"></ol></aside>
+    <ol id="log"></ol>
+  </aside>
 </main>
+
 <script>
 "use strict";
-// ---- model -------------------------------------------------------------
-// The store is a flat bag of write-once objects. Heads carry claims in their
-// names; readers derive the view: newest g-N as base + pending h/c heads with
-// base_epoch in {N-1, N} that g-N did not fold.
+
+// ===========================================================================
+// Model
+//
+// The store is a flat bag of write-once objects, each under a unique key:
+//
+//   pack-…   compressed file chunks
+//   seg-…    a segment: which store paths exist and which packs hold them
+//   h-…      a drain head: "root R also contains segment S" (one per drain)
+//   g-N      a GC head: "epoch N starts; here is every root's segment list,
+//            and here are the h-heads I folded into it"
+//
+// Nobody coordinates. Readers derive the *view* from the key listing alone:
+//   base   = the newest g-N
+//   plus   = every h-head whose base epoch is N or N-1 and that g-N did not fold
+// ===========================================================================
+
 function emptyState() {
-  return { epoch: 0, packs: [], segs: [], heads: [], actors: [], fresh: new Set(), note: [] };
+  return { epoch: 0, packs: [], segs: [], heads: [], actors: [], fresh: new Set(), loaded: new Set() };
 }
-const clone = s => ({
-  epoch: s.epoch,
-  packs: s.packs.map(o => ({...o})),
-  segs: s.segs.map(o => ({...o, packs:[...o.packs]})),
-  heads: s.heads.map(o => ({...o, replaces: o.replaces && [...o.replaces], roots: o.roots && {...o.roots}, retired: o.retired && [...o.retired], folded: o.folded && [...o.folded]})),
-  actors: s.actors.map(a => ({...a})),
-  fresh: new Set(), note: [],
-});
-function gcHead(s) { return [...s.heads].filter(h => h.kind === 'g' && !h.gone).sort((a,b)=>b.epoch-a.epoch)[0]; }
-function pending(s) {
-  const g = gcHead(s); const N = g ? g.epoch : 0; const folded = new Set(g ? g.folded : []);
-  return s.heads.filter(h => !h.gone && h.kind !== 'g' && !folded.has(h.id) && h.base <= N && h.base + 1 >= N);
+
+function cloneState(s) {
+  return {
+    epoch: s.epoch,
+    packs: s.packs.map(o => ({ ...o })),
+    segs: s.segs.map(o => ({ ...o, packs: [...o.packs] })),
+    heads: s.heads.map(o => ({
+      ...o,
+      roots: o.roots && Object.fromEntries(Object.entries(o.roots).map(([r, segs]) => [r, [...segs]])),
+      folded: o.folded && [...o.folded],
+    })),
+    actors: s.actors.map(a => ({ ...a })),
+    loaded: new Set(s.loaded),
+    fresh: new Set(),   // what this step wrote or deleted (drawn in red)
+  };
 }
-// view: root -> set of live segment ids
+
+/** The newest GC head still in the store, if any. */
+function newestGcHead(s) {
+  const gs = s.heads.filter(h => h.kind === 'g' && !h.gone);
+  gs.sort((a, b) => b.epoch - a.epoch);
+  return gs[0];
+}
+
+/** Drain heads a reader honours: based on this epoch or the one before, not yet folded. */
+function pendingHeads(s) {
+  const g = newestGcHead(s);
+  const epoch = g ? g.epoch : 0;
+  const folded = new Set(g ? g.folded : []);
+  return s.heads.filter(h =>
+    h.kind === 'h' && !h.gone && !folded.has(h.id) &&
+    h.base <= epoch && h.base + 1 >= epoch);
+}
+
+/** The reader view: root name -> Set of segment ids. */
 function view(s) {
-  const g = gcHead(s); const roots = {};
-  if (g) for (const [r, seg] of Object.entries(g.roots)) roots[r] = new Set([seg]);
-  const pend = pending(s).sort((a,b)=>a.time-b.time);
-  for (const h of pend) {
-    roots[h.root] ??= new Set();
-    if (h.kind === 'h') roots[h.root].add(h.seg);
-    if (h.kind === 'c') { for (const r of h.replaces) roots[h.root].delete(r); roots[h.root].add(h.seg); }
+  const roots = {};
+  const g = newestGcHead(s);
+  if (g) {
+    for (const [root, segs] of Object.entries(g.roots)) roots[root] = new Set(segs);
+  }
+  for (const h of pendingHeads(s)) {
+    (roots[h.root] ??= new Set()).add(h.seg);
   }
   return roots;
 }
-function liveSegs(s) { const v = view(s); return new Set(Object.values(v).flatMap(x => [...x])); }
-function livePacks(s) { const ls = liveSegs(s); return new Set(s.segs.filter(x => ls.has(x.id)).flatMap(x => x.packs)); }
 
-let T = 0;
-const put = (s, list, obj) => { list.push(obj); s.fresh.add(obj.id); return obj; };
-function addPack(s, id) { return put(s, s.packs, { id, kind:'pack' }); }
-function addSeg(s, id, root, packs) { return put(s, s.segs, { id, kind:'seg', root, packs }); }
-function addH(s, root, seg, base) { return put(s, s.heads, { id:`h-${base}-${root}-${seg}`, kind:'h', root, seg, base, time: ++T }); }
-function addC(s, root, seg, replaces, base) { return put(s, s.heads, { id:`c-${base}-${root}-${seg}`, kind:'c', root, seg, replaces, base, time: ++T }); }
-function actor(s, id, label, cls, base) { s.actors.push({ id, label, cls, base }); }
-function dropActor(s, id) { s.actors = s.actors.filter(a => a.id !== id); }
+function liveSegments(s) {
+  return new Set(Object.values(view(s)).flatMap(set => [...set]));
+}
 
-// ---- scenario ----------------------------------------------------------
+function livePacks(s) {
+  const segs = liveSegments(s);
+  return new Set(s.segs.filter(x => segs.has(x.id)).flatMap(x => x.packs));
+}
+
+/** Every key a reader holding the current view may still fetch. */
+function reachable(s) {
+  const g = newestGcHead(s);
+  const segs = liveSegments(s);
+  const packs = s.segs.filter(x => segs.has(x.id)).flatMap(x => x.packs);
+  return new Set([...(g ? [g.id] : []), ...pendingHeads(s).map(h => h.id), ...segs, ...packs]);
+}
+
+// ---- mutations used by the scenario ---------------------------------------
+
+let clock = 0;
+const nonce = () => Math.random().toString(36).slice(2, 6);
+
+let stepNo = 0;         // set while building history
+const MIN_AGE = 3;      // steps an unreferenced object is safe from GC (upload in flight)
+
+function put(s, list, obj) {
+  obj.born = stepNo;
+  list.push(obj);
+  s.fresh.add(obj.id);
+  return obj;
+}
+const addPack = (s, id) => put(s, s.packs, { id, kind: 'pack' });
+const addSegment = (s, id, packs) => put(s, s.segs, { id, kind: 'seg', packs });
+
+/** A drain head. Time + nonce in the name: two drains never write the same key. */
+function addDrainHead(s, root, seg, base) {
+  const time = ++clock;
+  return put(s, s.heads, { id: `h-${base}-${root}-${time}-${nonce()}`, kind: 'h', root, seg, base, time });
+}
+
+const actor = (s, id, label, cls = '') => s.actors.push({ id, label, cls });
+const dropActor = (s, id) => { s.actors = s.actors.filter(a => a.id !== id); };
+
+/**
+ * GC, part 1: remember what the view GC loaded reaches (readers may hold
+ * it too), then publish g-(N+1) with the new per-root segment lists and
+ * the drain heads folded into them.
+ */
+function gcPublish(s, roots) {
+  s.loaded = reachable(s);
+  const epoch = s.epoch + 1;
+  put(s, s.heads, {
+    id: `g-${epoch}`, kind: 'g', epoch, roots,
+    folded: pendingHeads(s).map(h => h.id),
+    time: ++clock,
+  });
+  s.epoch = epoch;
+}
+
+/**
+ * GC, part 2: delete every listed key that neither the new view nor the
+ * loaded view reaches. Same rule for heads, segments and packs. Young
+ * objects are spared: they may belong to a drain that has not published yet.
+ */
+function gcSweep(s) {
+  const keep = new Set([...reachable(s), ...s.loaded]);
+  for (const o of [...s.heads, ...s.segs, ...s.packs]) {
+    const young = stepNo - o.born < MIN_AGE;
+    if (!o.gone && !keep.has(o.id) && !young) {
+      o.gone = true;
+      s.fresh.add(o.id);
+    }
+  }
+}
+
+// ===========================================================================
+// Scenario
+// ===========================================================================
+
 const steps = [
-  { title: "Empty store", desc: `<p>Store API: put / get / list / delete. No locks. Epoch 0 = no GC yet.</p>`, run: s => {} },
-  { title: "Drain A: packs first", desc: `<p>Packs are uploaded first. Unreferenced until a segment names them.</p>`,
-    run: s => { actor(s,'A','drain A → main','',0); addPack(s,'pack-a1'); addPack(s,'pack-a2'); } },
-  { title: "Drain A: segment", desc: `<p>Segment = path index + pack table. Still invisible: no head.</p>`,
-    run: s => { addSeg(s,'seg-A','main',['pack-a1','pack-a2']); } },
-  { title: "Drain A: h‑head", desc: `<p><code>h-0-main-seg-A</code>: “at epoch 0, root main += seg‑A”. Order pack → seg → head = never a dangling head.</p>`,
-    run: s => { addH(s,'main','seg-A',0); } },
-  { title: "Drain B (concurrent)", desc: `<p>Reuses <code>pack-a1</code> (dedup). Concurrent drains never conflict: one segment + one head each.</p>`,
-    run: s => { dropActor(s,'A'); actor(s,'B','drain B → main','',0); addPack(s,'pack-b1'); addSeg(s,'seg-B','main',['pack-a1','pack-b1']); addH(s,'main','seg-B',0); } },
-  { title: "Drain C, other root", desc: `<p>Roots (branch×system) are independent.</p>`,
-    run: s => { dropActor(s,'B'); actor(s,'C','drain C → pr-7','',0); addPack(s,'pack-c1'); addSeg(s,'seg-C','pr-7',['pack-c1','pack-a2']); addH(s,'pr-7','seg-C',0); } },
-  { title: "Drain D compacts: c‑head", desc: `<p>D folds main's pending segments into <code>seg-M1</code> and says so with a c‑head. <b>Nothing is deleted</b> — old segments just drop out of the view.</p>`,
-    run: s => { dropActor(s,'C'); actor(s,'D','drain D → main (compacts)','',0); addPack(s,'pack-d1'); addSeg(s,'seg-D','main',['pack-d1']); addH(s,'main','seg-D',0);
-                addSeg(s,'seg-M1','main',['pack-a1','pack-a2','pack-b1','pack-d1']); addC(s,'main','seg-M1',['seg-A','seg-B','seg-D'],0); } },
-  { title: "Slow drain E starts (base 0)", desc: `<p>E reads epoch 0 now, will publish after GC.</p>`,
-    run: s => { dropActor(s,'D'); actor(s,'E','drain E → main, base epoch 0 (slow)','',0); addPack(s,'pack-e1'); } },
-  { title: "GC 1: publish g‑1", desc: `<p>One segment per root. <code>g-1</code> records roots, <b>folded</b> heads and <b>retired</b> segments (A, B, D).</p>`,
-    run: s => { actor(s,'GC','GC → epoch 1','gc');
-                const ls = liveSegs(s); const retired = s.segs.filter(x=>!ls.has(x.id)).map(x=>x.id);
-                put(s, s.heads, { id:'g-1', kind:'g', epoch:1, roots:{main:'seg-M1','pr-7':'seg-C'}, folded: s.heads.filter(h=>!h.gone).map(h=>h.id), retired, time: ++T }); s.epoch = 1; } },
-  { title: "GC 1: sweep", desc: `<p>Deletes folded heads + what the <b>previous</b> GC retired (nothing yet). Retired seg‑A/B/D <b>stay one more epoch</b>: a reader may still hold the pre‑g‑1 view.</p>`,
-    run: s => { const g = gcHead(s); for (const h of s.heads) if (g.folded.includes(h.id)) { h.gone = true; s.fresh.add(h.id); }
-                for (const x of s.segs) if (g.retired.includes(x.id)) x.retired = true; } },
-  { title: "E publishes h‑0 after g‑1", desc: `<p>base 0, current 1 → accepted (<code>base ∈ {N‑1,N}</code>). Racing one GC loses nothing.</p>`,
-    run: s => { dropActor(s,'GC'); addSeg(s,'seg-E','main',['pack-e1','pack-a1']); addH(s,'main','seg-E',0); } },
-  { title: "Drain F (base 1)", desc: `<p>Normal drain after GC 1.</p>`,
-    run: s => { dropActor(s,'E'); actor(s,'F','drain F → main','',1); addPack(s,'pack-f1'); addSeg(s,'seg-F','main',['pack-f1','pack-d1']); addH(s,'main','seg-F',1); } },
-  { title: "GC 2: publish g‑2", desc: `<p>main = M1+E+F → <code>seg-M2</code>. Retires M1, E, F.</p>`,
-    run: s => { dropActor(s,'F'); actor(s,'GC','GC → epoch 2','gc');
-                addSeg(s,'seg-M2','main',['pack-a1','pack-a2','pack-b1','pack-d1','pack-e1','pack-f1']);
-                const roots = {main:'seg-M2','pr-7':'seg-C'};
-                const keep = new Set(Object.values(roots));
-                const retired = s.segs.filter(x=>!keep.has(x.id) && !x.retired && !x.gone).map(x=>x.id);
-                put(s, s.heads, { id:'g-2', kind:'g', epoch:2, roots, folded: s.heads.filter(h=>!h.gone).map(h=>h.id), retired, time: ++T }); s.epoch = 2; } },
-  { title: "GC 2: sweep — epoch‑1 garbage dies", desc: `<p>Delete = g‑1.retired (seg‑A/B/D + their packs) − reachable from new view. All their packs are still used by seg‑M2 → only the segments go.</p><p>Rule: <b>anything in the previous view survives one more GC interval.</b> Older readers get 404 → next substituter.</p>`,
-    run: s => { const g = gcHead(s); const prev = s.heads.find(h=>h.id==='g-1');
-                const keepSegs = liveSegs(s); for (const r of g.retired) keepSegs.add(r);
-                const keepPacks = new Set(s.segs.filter(x=>keepSegs.has(x.id)).flatMap(x=>x.packs));
-                for (const x of s.segs) if (prev.retired.includes(x.id)) { x.gone = true; s.fresh.add(x.id); }
-                const sweptPacks = new Set(s.segs.filter(x=>prev.retired.includes(x.id)).flatMap(x=>x.packs));
-                for (const p of s.packs) if (sweptPacks.has(p.id) && !keepPacks.has(p.id)) { p.gone = true; s.fresh.add(p.id); }
-                for (const h of s.heads) if (g.folded.includes(h.id) && !h.gone) { h.gone = true; s.fresh.add(h.id); }
-                for (const x of s.segs) if (g.retired.includes(x.id)) x.retired = true; } },
-  { title: "The hole: drain spanning two GCs", desc: `<p>base 0 at epoch 2 → ignored; its segment is swept later as an orphan. Cost: cache miss, re‑pushed next job. Never corruption. That bounded loss buys zero coordination.</p>`,
-    run: s => { dropActor(s,'GC'); actor(s,'X','drain X, base 0 at epoch 2 → ignored','',0); addSeg(s,'seg-X','main',['pack-a2']); put(s, s.heads, { id:'h-0-main-seg-X', kind:'h', root:'main', seg:'seg-X', base:0, time: ++T }); } },
+  {
+    title: "Empty store",
+    desc: `<p>The store only knows put / get / list / delete. There are no locks;
+           every key is written exactly once. Epoch 0 means: GC never ran.</p>`,
+    run: s => {},
+  },
+  {
+    title: "Drain A uploads its packs",
+    desc: `<p>A CI job finished building and drains what it built. The file
+           contents go up first, as packs. Nothing references them yet.</p>`,
+    run: s => { actor(s, 'A', 'drain A → root main-x86_64-linux'); addPack(s, 'pack-a1'); addPack(s, 'pack-a2'); },
+  },
+  {
+    title: "Drain A writes its segment",
+    desc: `<p>The segment lists the store paths and, per file, which pack holds
+           its chunks. Still invisible to readers: no head points at it.</p>`,
+    run: s => { addSegment(s, 'seg-A', ['pack-a1', 'pack-a2']); },
+  },
+  {
+    title: "Drain A publishes its head",
+    desc: `<p><code>h-0-main-…</code> says: “as of epoch 0, root <b>main</b> also
+           contains seg‑A”. Because packs, then segment, then head are written in
+           that order, a listed head never dangles.</p>`,
+    run: s => { addDrainHead(s, 'main', 'seg-A', 0); },
+  },
+  {
+    title: "Drain B runs at the same time",
+    desc: `<p>B reuses <code>pack-a1</code> (its chunks were already there) and adds
+           its own segment and head. Concurrent drains cannot conflict: each
+           writes only new keys, and only GC ever merges or deletes.</p>`,
+    run: s => {
+      dropActor(s, 'A'); actor(s, 'B', 'drain B → main');
+      addPack(s, 'pack-b1'); addSegment(s, 'seg-B', ['pack-a1', 'pack-b1']); addDrainHead(s, 'main', 'seg-B', 0);
+    },
+  },
+  {
+    title: "Matrix eval job: one head per target system",
+    desc: `<p><code>hestia matrix</code> uploads the .drv closures of every build
+           leg, filed under <em>that leg's</em> system. The darwin leg will look
+           under <code>main-aarch64-darwin</code>, so that is where its drvs go —
+           not under the Linux runner that evaluated them.</p>`,
+    run: s => {
+      dropActor(s, 'B'); actor(s, 'C', 'matrix eval → main (linux) and darwin');
+      addPack(s, 'pack-c1');
+      addSegment(s, 'seg-C', ['pack-c1']);            addDrainHead(s, 'darwin', 'seg-C', 0);
+      addSegment(s, 'seg-D', ['pack-c1', 'pack-a2']); addDrainHead(s, 'main', 'seg-D', 0);
+    },
+  },
+  {
+    title: "A slow job E starts",
+    desc: `<p>E's daemon loaded the view at epoch 0. It lists again right before
+           it publishes, so normally its base is fresh — but here a GC run will
+           squeeze in between that listing and the publish.</p>`,
+    run: s => { dropActor(s, 'C'); actor(s, 'E', 'drain E → main, based on epoch 0 (slow)'); addPack(s, 'pack-e1'); },
+  },
+  {
+    title: "GC run 1: merge and publish g‑1",
+    desc: `<p>GC merges main's three segments into one (<code>seg-M1</code>) and
+           publishes <code>g-1</code>: the segment list of every root, plus the
+           drain heads it folded in. From now on readers start from g‑1.</p>`,
+    run: s => {
+      actor(s, 'GC', 'GC → epoch 1', 'gc');
+      addSegment(s, 'seg-M1', ['pack-a1', 'pack-a2', 'pack-b1', 'pack-c1']);
+      gcPublish(s, { main: ['seg-M1'], darwin: ['seg-C'] });
+    },
+  },
+  {
+    title: "GC run 1: sweep",
+    desc: `<p>GC deletes only what <b>neither</b> the new view <b>nor</b> the view it
+           loaded itself can reach. seg‑A/B/D and their heads were in the loaded
+           view, so they stay for one more epoch: a job that listed a minute ago
+           may still be reading through them. <code>pack-e1</code> is referenced
+           by nothing yet, but it is younger than the minimum age — E's upload
+           is simply still in flight.</p>`,
+    run: s => { gcSweep(s); },
+  },
+  {
+    title: "E publishes after g‑1 — still counts",
+    desc: `<p>E's head says base 0, the store is at epoch 1. Readers accept heads
+           from the current or the previous epoch, so racing a single GC run
+           loses nothing.</p>`,
+    run: s => { dropActor(s, 'GC'); addSegment(s, 'seg-E', ['pack-e1', 'pack-a1']); addDrainHead(s, 'main', 'seg-E', 0); },
+  },
+  {
+    title: "Drain F, an ordinary job after GC 1",
+    desc: `<p>Based on epoch 1, reuses <code>pack-c1</code>.</p>`,
+    run: s => {
+      dropActor(s, 'E'); actor(s, 'F', 'drain F → main');
+      addPack(s, 'pack-f1'); addSegment(s, 'seg-F', ['pack-f1', 'pack-c1']); addDrainHead(s, 'main', 'seg-F', 1);
+    },
+  },
+  {
+    title: "GC run 2: seg‑E's tree was evicted",
+    desc: `<p>The cache evicted part of seg‑E, so GC cannot merge it. It is still
+           listed and claimed, though, so GC carries it over <b>as is</b>:
+           main = [<code>seg-M2</code> (M1 + F merged), <code>seg-E</code>].
+           A read error costs an epoch of tidiness, never a path. (If the newest
+           g‑head itself were unreadable, GC would refuse to run.)</p>`,
+    run: s => {
+      dropActor(s, 'F'); actor(s, 'GC', 'GC → epoch 2 (keeps unreadable seg-E unmerged)', 'gc');
+      s.segs.find(x => x.id === 'seg-E').unreadable = true;
+      addSegment(s, 'seg-M2', ['pack-a1', 'pack-a2', 'pack-b1', 'pack-c1', 'pack-f1']);
+      gcPublish(s, { main: ['seg-M2', 'seg-E'], darwin: ['seg-C'] });
+    },
+  },
+  {
+    title: "GC run 2: sweep — epoch‑1 leftovers go",
+    desc: `<p>seg‑A/B/D and their heads are now in neither view: deleted. Their
+           packs all live on inside seg‑M2: kept. seg‑M1, seg‑F, g‑1 and the heads
+           g‑2 just folded were in the loaded view: they go next time.</p>
+           <p>The rule in one line: <b>whatever a current reader can reach
+           survives one more GC run.</b> A reader older than that gets a 404 and
+           falls through to the next substituter.</p>`,
+    run: s => { gcSweep(s); },
+  },
+  {
+    title: "The one hole: a drain that outlives two GC runs",
+    desc: `<p>A head based on epoch 0 arriving at epoch 2 is ignored by every
+           reader and swept later. The cost is a cache miss — the next job
+           pushes those paths again — never a corrupt store. <code>hestia
+           serve</code> re-lists at every drain, so only a single drain that
+           takes longer than two GC intervals can fall in.</p>`,
+    run: s => {
+      dropActor(s, 'GC'); actor(s, 'X', 'drain X, based on epoch 0 at epoch 2 → ignored');
+      addSegment(s, 'seg-X', ['pack-a2']); addDrainHead(s, 'main', 'seg-X', 0);
+    },
+  },
 ];
 
-// ---- build state history ----------------------------------------------
+// Precompute the state after every step so "back" is free.
 const history = [];
-{ let s = emptyState(); for (const st of steps) { s = clone(s); st.run(s); history.push(s); } }
+{
+  let s = emptyState();
+  for (const step of steps) { stepNo++; s = cloneState(s); step.run(s); history.push(s); }
+}
 
-// ---- render ------------------------------------------------------------
+// ===========================================================================
+// Rendering
+// ===========================================================================
+
 const NS = "http://www.w3.org/2000/svg";
-const el = (tag, attrs={}, parent) => { const e = document.createElementNS(NS, tag); for (const [k,v] of Object.entries(attrs)) e.setAttribute(k,v); parent && parent.appendChild(e); return e; };
-const W = 92, H = 26, GAP = 12;
-const lanes = { actor: 34, head: 120, view: 215, seg: 310, pack: 440 };
-const colors = { pack:'var(--pack)', seg:'var(--seg)', h:'var(--h)', c:'var(--c)', g:'var(--g)' };
+function el(tag, attrs = {}, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+const BOX_W = 92, HEAD_W = 150, BOX_H = 26, GAP = 12;
+const laneY = { actor: 34, head: 120, view: 215, seg: 310, pack: 440 };
+const fill = { pack: 'var(--pack)', seg: 'var(--seg)', h: 'var(--h)', g: 'var(--g)' };
 
 function render(i) {
-  const s = history[i]; const st = steps[i];
-  const root = document.getElementById('root'); root.innerHTML = '';
-  const showView = document.getElementById('showview').checked;
-  const ls = liveSegs(s), lp = livePacks(s);
-  const pos = {};
+  const s = history[i], step = steps[i];
+  const root = document.getElementById('root');
+  root.innerHTML = '';
+  const pos = {};                       // id -> {x, top, bot} for arrows
+  const liveSegs = liveSegments(s), livePk = livePacks(s);
+  const g = newestGcHead(s);
+  const liveHeads = new Set([...(g ? [g.id] : []), ...pendingHeads(s).map(h => h.id)]);
 
-  for (const [name,y] of [['actors (CI jobs / GC)',lanes.actor],['heads',lanes.head],['reader view (newest g + pending h/c)',lanes.view],['segments',lanes.seg],['packs',lanes.pack]])
-    el('text',{x:10,y:y-10,class:'lane-label'},root).textContent = name;
-  el('text',{x:600,y:24,class:'lane-label','font-weight':'bold'},root).textContent = `epoch ${s.epoch}`;
+  // lane labels
+  const lanes = [
+    ['actors (CI jobs / GC)', laneY.actor], ['heads', laneY.head],
+    ['reader view (newest g‑head + pending h‑heads)', laneY.view],
+    ['segments', laneY.seg], ['packs', laneY.pack],
+  ];
+  for (const [name, y] of lanes) el('text', { x: 10, y: y - 10, class: 'lane-label' }, root).textContent = name;
+  el('text', { x: 600, y: 24, class: 'lane-label', 'font-weight': 'bold' }, root).textContent = `epoch ${s.epoch}`;
 
-  const place = (list, y, live, wide) => list.filter(o => !o.gone || s.fresh.has(o.id)).forEach((o, k) => {
-    const w = wide||W; const x = 20 + k*(w+GAP);
-    pos[o.id] = { x: x+w/2, top: y, bot: y+H };
-    const cls = ['obj']; if (s.fresh.has(o.id)) cls.push('new'); if (o.gone) cls.push('gone'); else if (o.dead || (live && !live.has(o.id))) cls.push('dead'); if (o.retired === true && !o.gone) cls.push('retired');
-    const g = el('g',{class:cls.join(' ')},root);
-    el('rect',{x,y,width:w,height:H,fill:colors[o.kind]},g);
-    el('text',{x:x+4,y:y+17},g).textContent = o.id.length>22? o.id.slice(0,21)+'…' : o.id;
-    g.appendChild(el('title')).textContent = JSON.stringify(o,null,1);
-  });
-  const headLive = new Set([...(gcHead(s)?[gcHead(s).id]:[]), ...pending(s).map(h=>h.id)]);
-  place(s.heads, lanes.head, headLive, 150);
-  place(s.segs, lanes.seg, ls);
-  place(s.packs, lanes.pack, lp);
-
-  s.actors.forEach((a,k) => {
-    const x = 20 + k*300, y = lanes.actor;
-    const g = el('g',{class:'actor '+a.cls},root);
-    el('rect',{x,y,width:280,height:34},g);
-    el('text',{x:x+8,y:y+21,class:'t'},g).textContent = a.label;
-    pos[a.id] = { x:x+140, top:y, bot:y+34 };
-  });
-
-  const arrow = (from, to, cls='') => {
-    const a = pos[from], b = pos[to]; if (!a||!b) return;
-    const y1 = a.bot, y2 = b.top, mx = (a.x+b.x)/2;
-    el('path',{d:`M${a.x},${y1} C${a.x},${(y1+y2)/2} ${b.x},${(y1+y2)/2} ${b.x},${y2}`, class:'arrow '+cls},root);
-  };
-  for (const h of s.heads) if (!h.gone && (headLive.has(h.id) || s.fresh.has(h.id))) {
-    const n = s.fresh.has(h.id)?'new':'';
-    if (h.kind==='g') for (const seg of Object.values(h.roots)) arrow(h.id, seg, n);
-    else if (h.seg) arrow(h.id, h.seg, n);
+  // one row of boxes; objects deleted earlier are hidden, deleted now are faded
+  function drawRow(objects, y, live, width) {
+    const shown = objects.filter(o => !o.gone || s.fresh.has(o.id));
+    shown.forEach((o, k) => {
+      const x = 20 + k * (width + GAP);
+      pos[o.id] = { x: x + width / 2, top: y, bot: y + BOX_H };
+      const cls = ['obj'];
+      if (s.fresh.has(o.id)) cls.push('new');
+      if (o.gone) cls.push('gone'); else if (!live.has(o.id)) cls.push('dead');
+      if (o.unreadable && !o.gone) cls.push('unreadable');
+      const grp = el('g', { class: cls.join(' ') }, root);
+      el('rect', { x, y, width, height: BOX_H, fill: fill[o.kind] }, grp);
+      el('text', { x: x + 4, y: y + 17 }, grp).textContent = o.id.length > 22 ? o.id.slice(0, 21) + '…' : o.id;
+      el('title', {}, grp).textContent = JSON.stringify(o, null, 1);
+    });
   }
-  for (const x of s.segs) if (!x.gone) for (const p of x.packs) arrow(x.id, p, s.fresh.has(x.id)?'new':(ls.has(x.id)?'':'dim'));
-  // actor → what it wrote this step
-  for (const a of s.actors) for (const id of s.fresh) if (pos[id] && (s.heads.some(h=>h.id===id) )) arrow(a.id, id, 'new');
-  if (s.actors.length===1) for (const id of s.fresh) if (!s.heads.some(h=>h.id===id) && !s.segs.some(x=>x.packs && s.fresh.has(x.id) && x.packs.includes(id))) { if (s.segs.some(x=>x.id===id) && s.heads.some(h=>s.fresh.has(h.id)&&h.seg===id)) continue; arrow(s.actors[0].id, id, 'new'); }
+  drawRow(s.heads, laneY.head, liveHeads, HEAD_W);
+  drawRow(s.segs, laneY.seg, liveSegs, BOX_W);
+  drawRow(s.packs, laneY.pack, livePk, BOX_W);
 
-  if (showView) {
-    const v = view(s); let k = 0;
-    for (const [r, segs] of Object.entries(v)) {
-      const id = 'view-'+r; const x = 20 + k*140, y = lanes.view; k++;
-      const g = el('g',{class:'actor'},root); el('rect',{x,y,width:120,height:28,fill:'#e8f0ff',stroke:'#26a'},g);
-      el('text',{x:x+6,y:y+18,class:'t',fill:'#26a'},g).textContent = `view: ${r}`;
-      pos[id] = { x:x+60, top:y, bot:y+28 };
-      for (const seg of segs) arrow(id, seg, 'view');
+  s.actors.forEach((a, k) => {
+    const x = 20 + k * 300, y = laneY.actor, w = 330;
+    const grp = el('g', { class: 'actor ' + a.cls }, root);
+    el('rect', { x, y, width: w, height: 34 }, grp);
+    el('text', { x: x + 8, y: y + 21, class: 't' }, grp).textContent = a.label;
+    pos[a.id] = { x: x + w / 2, top: y, bot: y + 34 };
+  });
+
+  function arrow(from, to, cls = '') {
+    const a = pos[from], b = pos[to];
+    if (!a || !b) return;
+    const y1 = a.bot, y2 = b.top, mid = (y1 + y2) / 2;
+    el('path', { d: `M${a.x},${y1} C${a.x},${mid} ${b.x},${mid} ${b.x},${y2}`, class: 'arrow ' + cls }, root);
+  }
+
+  // head -> segment(s)
+  for (const h of s.heads) {
+    if (h.gone || !(liveHeads.has(h.id) || s.fresh.has(h.id))) continue;
+    const cls = s.fresh.has(h.id) ? 'new' : '';
+    const targets = h.kind === 'g' ? Object.values(h.roots).flat() : [h.seg];
+    for (const seg of targets) arrow(h.id, seg, cls);
+  }
+  // segment -> packs
+  for (const x of s.segs) {
+    if (x.gone) continue;
+    const cls = s.fresh.has(x.id) ? 'new' : (liveSegs.has(x.id) ? '' : 'dim');
+    for (const p of x.packs) arrow(x.id, p, cls);
+  }
+  // actor -> the heads it wrote this step (and loose packs with no segment yet)
+  const isHead = id => s.heads.some(h => h.id === id);
+  const isPack = id => s.packs.some(p => p.id === id);
+  const packClaimedNow = id => s.segs.some(x => s.fresh.has(x.id) && x.packs.includes(id));
+  for (const a of s.actors) {
+    for (const id of s.fresh) {
+      if (isHead(id) || (isPack(id) && !packClaimedNow(id))) arrow(a.id, id, 'new');
     }
   }
 
-  document.getElementById('svg').setAttribute('width', Math.max(900, 40 + Math.max(s.packs.length, s.segs.filter(o=>!o.gone).length)*(W+GAP), 40 + s.heads.filter(o=>!o.gone||s.fresh.has(o.id)).length*162));
-  document.getElementById('title').textContent = `${i+1}. ${st.title}`;
-  document.getElementById('desc').innerHTML = st.desc;
-  document.getElementById('stepno').textContent = `step ${i+1} / ${steps.length}`;
-  const log = document.getElementById('log'); log.innerHTML = '';
-  steps.forEach((x,j) => { const li = document.createElement('li'); li.textContent = x.title; if (j===i) li.className='cur'; li.onclick=()=>{cur=j;render(cur);}; li.style.cursor='pointer'; log.appendChild(li); });
-  location.hash = '#'+(i+1);
+  if (document.getElementById('showview').checked) {
+    Object.entries(view(s)).forEach(([rootName, segs], k) => {
+      const id = 'view-' + rootName, x = 20 + k * 140, y = laneY.view;
+      const grp = el('g', { class: 'actor' }, root);
+      el('rect', { x, y, width: 120, height: 28, fill: '#e8f0ff', stroke: '#26a' }, grp);
+      el('text', { x: x + 6, y: y + 18, class: 't', fill: '#26a' }, grp).textContent = `view: ${rootName}`;
+      pos[id] = { x: x + 60, top: y, bot: y + 28 };
+      for (const seg of segs) arrow(id, seg, 'view');
+    });
+  }
+
+  const shownHeads = s.heads.filter(o => !o.gone || s.fresh.has(o.id)).length;
+  const shownCols = Math.max(s.packs.length, s.segs.filter(o => !o.gone).length);
+  document.getElementById('svg').setAttribute('width',
+    Math.max(900, 40 + shownCols * (BOX_W + GAP), 40 + shownHeads * (HEAD_W + GAP)));
+
+  document.getElementById('title').textContent = `${i + 1}. ${step.title}`;
+  document.getElementById('desc').innerHTML = step.desc;
+  document.getElementById('stepno').textContent = `step ${i + 1} / ${steps.length}`;
+
+  const log = document.getElementById('log');
+  log.innerHTML = '';
+  steps.forEach((x, j) => {
+    const li = document.createElement('li');
+    li.textContent = x.title;
+    if (j === i) li.className = 'cur';
+    li.onclick = () => { cur = j; render(cur); };
+    log.appendChild(li);
+  });
+  location.hash = '#' + (i + 1);
 }
-let cur = Math.min(steps.length-1, Math.max(0, (parseInt(location.hash.slice(1))||1)-1));
-document.getElementById('next').onclick = () => { if (cur < steps.length-1) render(++cur); };
+
+let cur = Math.min(steps.length - 1, Math.max(0, (parseInt(location.hash.slice(1)) || 1) - 1));
+document.getElementById('next').onclick = () => { if (cur < steps.length - 1) render(++cur); };
 document.getElementById('prev').onclick = () => { if (cur > 0) render(--cur); };
 document.getElementById('reset').onclick = () => render(cur = 0);
 document.getElementById('showview').onchange = () => render(cur);
-document.onkeydown = e => { if (e.key==='ArrowRight'||e.key===' ') document.getElementById('next').click(); if (e.key==='ArrowLeft') document.getElementById('prev').click(); };
+document.onkeydown = e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') document.getElementById('next').click();
+  if (e.key === 'ArrowLeft') document.getElementById('prev').click();
+};
 render(cur);
 </script>
 </html>

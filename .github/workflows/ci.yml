@@ -60,7 +60,7 @@ jobs:
           fi
           for t in "${targets[@]}"; do echo "$t $(readlink -f "$t")"; done > hestia-closure.paths
           nix-store -qR "${targets[@]}" | xargs nix-store --export > hestia-closure.nar
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: hestia-${{ runner.os }}
           path: hestia-closure.*

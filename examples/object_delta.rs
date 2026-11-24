@@ -242,6 +242,51 @@ fn main() {
         unpack,
     );
 
+    // The same, with the base chosen by content as DeltaNAR does: the old
+    // object most of this one's small chunks are found in. No name needed.
+    let old_list: Vec<(&PathBuf, &Vec<u8>)> = old.iter().collect();
+    let mut owner: std::collections::HashMap<[u8; 32], Vec<u32>> = Default::default();
+    for (id, (_, bytes)) in old_list.iter().enumerate() {
+        for c in chunks(bytes, 2048) {
+            let owners = owner.entry(*blake3::hash(c).as_bytes()).or_default();
+            if owners.len() < 8 {
+                owners.push(id as u32);
+            }
+        }
+    }
+    let t = Instant::now();
+    let (mut stored_voted, mut found, mut agree) = (0, 0, 0);
+    for (path, bytes) in new.iter().filter(|(p, b)| old.get(*p) != Some(b)) {
+        let mut votes: std::collections::HashMap<u32, usize> = Default::default();
+        for c in chunks(bytes, 2048) {
+            for id in owner.get(blake3::hash(c).as_bytes()).into_iter().flatten() {
+                *votes.entry(*id).or_default() += 1;
+            }
+        }
+        let best = votes.iter().max_by_key(|v| (*v.1, *v.0)).map(|v| *v.0);
+        stored_voted += match best {
+            Some(id) => {
+                found += 1;
+                agree += usize::from(old_list[id as usize].0 == path);
+                with_prefix(bytes, old_list[id as usize].1).len()
+            }
+            None => plain.compress(bytes).unwrap().len(),
+        };
+    }
+    let pack = mb / t.elapsed().as_secs_f64();
+    row(
+        "delta to most alike",
+        per(stored_voted),
+        per(raw),
+        per(alone),
+        pack,
+        f64::NAN,
+    );
+    println!(
+        "  {:<22} a base found for {found} of {n}; the object of the same path for {agree}",
+        ""
+    );
+
     let mut sizes: Vec<f64> = packed
         .iter()
         .zip(&changed)

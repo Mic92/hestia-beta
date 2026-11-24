@@ -3,6 +3,7 @@
 //!
 //!   cargo run --release --example assumption_bench -- \
 //!       [--dir target/assumption_bench] [--rows 50000000] [--objects dir,dir]
+//!       [--only hashing|memory|disk|merge|sync|request]
 //!
 //! Measured on whatever machine runs it, one core unless stated:
 //!
@@ -103,6 +104,76 @@ fn table(rows: usize) -> Vec<Row> {
     table
 }
 
+/// Keys are hashes, so their top bits spread evenly: a directory from
+/// the top bits to the first row that has them finds a key's handful of
+/// rows in one step instead of a binary search over the whole table.
+struct Directory {
+    shift: u32,
+    starts: Vec<u32>,
+}
+
+impl Directory {
+    /// About `per_bucket` rows a bucket.
+    fn new(table: &[Row], per_bucket: usize) -> Self {
+        assert!(table.len() < u32::MAX as usize);
+        let bits = (table.len() / per_bucket)
+            .max(2)
+            .next_power_of_two()
+            .trailing_zeros();
+        let shift = 64 - bits;
+        let mut starts = vec![0u32; (1usize << bits) + 1];
+        let mut row = 0usize;
+        for (bucket, start) in starts.iter_mut().enumerate() {
+            while row < table.len() && ((table[row][0] >> shift) as usize) < bucket {
+                row += 1;
+            }
+            *start = row as u32;
+        }
+        Directory { shift, starts }
+    }
+    fn bucket(&self, key: &Row) -> usize {
+        (key[0] >> self.shift) as usize
+    }
+    fn rows(&self, bucket: usize) -> std::ops::Range<usize> {
+        self.starts[bucket] as usize..self.starts[bucket + 1] as usize
+    }
+    fn contains(&self, table: &[Row], key: &Row) -> bool {
+        table[self.rows(self.bucket(key))].contains(key)
+    }
+    /// A step's keys at once: the memory every key will touch is asked
+    /// for before any of it is read, so the misses overlap.
+    fn count(&self, table: &[Row], keys: &[Row]) -> usize {
+        let mut buckets = [0usize; 64];
+        let buckets = &mut buckets[..keys.len()];
+        for (bucket, key) in buckets.iter_mut().zip(keys) {
+            *bucket = self.bucket(key);
+            prefetch(&self.starts[*bucket]);
+        }
+        for bucket in buckets.iter() {
+            let rows = self.rows(*bucket);
+            for row in rows.step_by(2) {
+                prefetch(&table[row]);
+            }
+        }
+        buckets
+            .iter()
+            .zip(keys)
+            .filter(|(bucket, key)| table[self.rows(**bucket)].contains(key))
+            .count()
+    }
+}
+
+fn prefetch<T>(at: &T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+            std::ptr::from_ref(at).cast(),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = at;
+}
+
 fn keys_in_memory(table: &[Row]) {
     println!(
         "keys in memory, {} M rows ({:.1} GB)",
@@ -110,7 +181,7 @@ fn keys_in_memory(table: &[Row]) {
         (table.len() * ROW) as f64 / 1e9
     );
     let mut rng = Rng(3);
-    let wanted: Vec<Row> = (0..2_000_000)
+    let wanted: Vec<Row> = (0..3_000_000)
         .map(|_| table[rng.below(table.len())])
         .collect();
     let t = Instant::now();
@@ -128,6 +199,40 @@ fn keys_in_memory(table: &[Row]) {
     line(
         "a step's 30 keys",
         format!("{:.0} us", each * 30.0 * 1e6),
+        "90 us",
+    );
+
+    let directory = Directory::new(table, 8);
+    let t = Instant::now();
+    let found = wanted
+        .iter()
+        .filter(|key| directory.contains(table, key))
+        .count();
+    assert_eq!(found, wanted.len());
+    let each = t.elapsed().as_secs_f64() / wanted.len() as f64;
+    line(
+        "directory of top bits, random keys",
+        format!(
+            "{:.2} us a key, {:.2} bytes a key more",
+            each * 1e6,
+            (directory.starts.len() * 4) as f64 / table.len() as f64
+        ),
+        "-",
+    );
+    let t = Instant::now();
+    let found: usize = wanted
+        .chunks(30)
+        .map(|keys| directory.count(table, keys))
+        .sum();
+    assert_eq!(found, wanted.len());
+    let each = t.elapsed().as_secs_f64() / wanted.len() as f64;
+    line(
+        "directory, a step's 30 keys at once",
+        format!(
+            "{:.2} us a key, {:.1} us a step",
+            each * 1e6,
+            each * 30.0 * 1e6
+        ),
         "90 us",
     );
 }
@@ -256,37 +361,61 @@ fn keys_on_disk(table: &[Row], dir: &Path) {
         ),
         "200 us a batch; 25,000 lookups/s wanted",
     );
+    // The same batch from one thread: ask the kernel for all 30 pages, then
+    // read them. Through the page cache, emptied first.
+    let cached = File::open(&path).unwrap();
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&cached);
+    unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+    let mut rng = Rng(5);
+    let mut page = vec![0u8; PAGE];
+    const BATCHES: usize = 2_000;
+    let mut times = Vec::new();
+    for _ in 0..BATCHES {
+        let keys: Vec<Row> = (0..READERS)
+            .map(|_| table[rng.below(table.len())])
+            .collect();
+        let t = Instant::now();
+        let pages: Vec<usize> = keys
+            .iter()
+            .map(|key| fences.partition_point(|f| f <= key) - 1)
+            .collect();
+        for at in &pages {
+            unsafe { libc::readahead(fd, (at * PAGE) as i64, PAGE) };
+        }
+        for (at, key) in pages.iter().zip(&keys) {
+            let got = cached.read_at(&mut page, (at * PAGE) as u64).unwrap();
+            let rows: &[u8] = &page[..got];
+            let key = row_bytes(std::slice::from_ref(key));
+            assert!(rows.chunks_exact(ROW).any(|row| row == key));
+        }
+        times.push(t.elapsed().as_secs_f64());
+    }
+    times.sort_by(f64::total_cmp);
+    line(
+        "30 lookups, one thread, readahead",
+        format!(
+            "{:.0} us median, {:.0} us p99 a batch",
+            percentile(&times, 0.5) * 1e6,
+            percentile(&times, 0.99) * 1e6
+        ),
+        "200 us a batch",
+    );
     std::fs::remove_file(&path).ok();
 }
 
 // ------------------------------------------------------------ merge
 
-fn merge() {
-    println!("merge");
-    const RUNS: usize = 4;
-    const PER_RUN: usize = 400_000;
-    const BODY: usize = 213;
-    // Bodies: half of every one is random, half repeats, roughly how a
-    // CBOR row of hashes and small integers compresses.
-    let mut rng = Rng(5);
-    let runs: Vec<Vec<(Row, [u8; BODY])>> = (0..RUNS)
-        .map(|_| {
-            let mut run: Vec<(Row, [u8; BODY])> = (0..PER_RUN)
-                .map(|_| {
-                    let mut body = [7u8; BODY];
-                    fill(&mut rng, &mut body[..BODY / 2]);
-                    ([rng.next(), rng.next(), rng.next(), rng.next()], body)
-                })
-                .collect();
-            run.sort_unstable_by_key(|r| r.0);
-            run
-        })
-        .collect();
-    let t = Instant::now();
-    let mut heap: BinaryHeap<std::cmp::Reverse<(Row, usize, usize)>> = (0..RUNS)
+const BODY: usize = 213;
+type Entry = (Row, [u8; BODY]);
+
+/// The merge as first written: a heap of run heads, a new compressor a
+/// frame. Returns raw body bytes, compressed body bytes, key bytes.
+fn merge_heap(runs: &[&[Entry]]) -> (usize, usize, usize) {
+    let mut heap: BinaryHeap<std::cmp::Reverse<(Row, usize, usize)>> = (0..runs.len())
+        .filter(|r| !runs[*r].is_empty())
         .map(|r| std::cmp::Reverse((runs[r][0].0, r, 0)))
         .collect();
-    let mut keys = Vec::with_capacity(RUNS * PER_RUN * ROW);
+    let mut keys = Vec::new();
     let mut frame = Vec::with_capacity(1 << 16);
     let (mut raw, mut packed) = (0usize, 0usize);
     while let Some(std::cmp::Reverse((key, run, at))) = heap.pop() {
@@ -297,20 +426,117 @@ fn merge() {
             packed += zstd::bulk::compress(&frame, 3).unwrap().len();
             frame.clear();
         }
-        if at + 1 < PER_RUN {
+        if at + 1 < runs[run].len() {
             heap.push(std::cmp::Reverse((runs[run][at + 1].0, run, at + 1)));
         }
     }
-    let total = (raw + keys.len()) as f64;
-    line(
-        "4 runs into keys and zstd-3 frames",
-        format!(
-            "{:.0} MB/s (bodies to {:.0}%)",
-            total / t.elapsed().as_secs_f64() / 1e6,
-            packed as f64 / raw as f64 * 100.0
-        ),
-        "200 MB/s (CPU_MERGE_BYTE_S)",
-    );
+    (raw, packed, keys.len())
+}
+
+/// The same output with one compressor kept across frames, the smallest
+/// head found by comparing the few runs directly, and buffers sized once.
+fn merge_scan(runs: &[&[Entry]], level: i32) -> (usize, usize, usize) {
+    let total: usize = runs.iter().map(|r| r.len()).sum();
+    let mut at = vec![0usize; runs.len()];
+    let mut keys: Vec<u8> = Vec::with_capacity(total * ROW);
+    let mut frame: Vec<u8> = Vec::with_capacity((1 << 16) + BODY);
+    let mut out = vec![0u8; zstd::zstd_safe::compress_bound((1 << 16) + BODY)];
+    let mut compressor = zstd::bulk::Compressor::new(level).unwrap();
+    let (mut raw, mut packed) = (0usize, 0usize);
+    for _ in 0..total {
+        let mut best = usize::MAX;
+        for run in 0..runs.len() {
+            if at[run] < runs[run].len()
+                && (best == usize::MAX || runs[run][at[run]].0 < runs[best][at[best]].0)
+            {
+                best = run;
+            }
+        }
+        let entry = &runs[best][at[best]];
+        at[best] += 1;
+        keys.extend_from_slice(row_bytes(std::slice::from_ref(&entry.0)));
+        frame.extend_from_slice(&entry.1);
+        if frame.len() >= 1 << 16 {
+            raw += frame.len();
+            packed += compressor.compress_to_buffer(&frame, &mut out).unwrap();
+            frame.clear();
+        }
+    }
+    (raw, packed, keys.len())
+}
+
+fn merge() {
+    println!("merge");
+    const RUNS: usize = 4;
+    const PER_RUN: usize = 400_000;
+    // Bodies: half of every one is random, half repeats, roughly how a
+    // CBOR row of hashes and small integers compresses.
+    let mut rng = Rng(5);
+    let runs: Vec<Vec<Entry>> = (0..RUNS)
+        .map(|_| {
+            let mut run: Vec<Entry> = (0..PER_RUN)
+                .map(|_| {
+                    let mut body = [7u8; BODY];
+                    fill(&mut rng, &mut body[..BODY / 2]);
+                    ([rng.next(), rng.next(), rng.next(), rng.next()], body)
+                })
+                .collect();
+            run.sort_unstable_by_key(|r| r.0);
+            run
+        })
+        .collect();
+    let whole: Vec<&[Entry]> = runs.iter().map(|r| r.as_slice()).collect();
+    let report = |what: &str, t: Instant, (raw, packed, keys): (usize, usize, usize)| {
+        line(
+            what,
+            format!(
+                "{:.0} MB/s (bodies to {:.0}%)",
+                (raw + keys) as f64 / t.elapsed().as_secs_f64() / 1e6,
+                packed as f64 / raw as f64 * 100.0
+            ),
+            "200 MB/s (CPU_MERGE_BYTE_S)",
+        );
+    };
+    let t = Instant::now();
+    report("heap, a compressor a frame, zstd 3", t, merge_heap(&whole));
+    let t = Instant::now();
+    report("scan, one compressor, zstd 3", t, merge_scan(&whole, 3));
+    let t = Instant::now();
+    report("scan, one compressor, zstd 1", t, merge_scan(&whole, 1));
+
+    // Shards cover disjoint key ranges, so they merge independently: one
+    // a core.
+    const SHARDS: u64 = 16;
+    let shard = |run: &'_ [Entry], i: u64| -> std::ops::Range<usize> {
+        let edge = |i: u64| run.partition_point(|e| e.0[0] >> 60 < i);
+        edge(i)..edge(i + 1)
+    };
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let next = std::sync::atomic::AtomicU64::new(0);
+    let t = Instant::now();
+    let sums = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..cores)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut sum = (0, 0, 0);
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= SHARDS {
+                            return sum;
+                        }
+                        let parts: Vec<&[Entry]> = runs.iter().map(|r| &r[shard(r, i)]).collect();
+                        let (raw, packed, keys) = merge_scan(&parts, 3);
+                        sum = (sum.0 + raw, sum.1 + packed, sum.2 + keys);
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| w.join().unwrap())
+            .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+    });
+    report(&format!("16 shards on {cores} cores, zstd 3"), t, sums);
 }
 
 // ------------------------------------------------------------ sync
@@ -581,6 +807,7 @@ async fn main() {
     let mut dir = PathBuf::from("target/assumption_bench");
     let mut rows = 50_000_000usize;
     let mut object_dirs: Vec<String> = Vec::new();
+    let mut only: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let value = args.next().unwrap_or_else(|| {
@@ -590,6 +817,7 @@ async fn main() {
         match flag.as_str() {
             "--dir" => dir = PathBuf::from(value),
             "--rows" => rows = value.parse().expect("--rows takes a number"),
+            "--only" => only = Some(value),
             "--objects" => object_dirs = value.split(',').map(str::to_string).collect(),
             other => {
                 eprintln!("unknown flag {other}");
@@ -602,13 +830,27 @@ async fn main() {
         "{} cores; one core unless stated\n",
         std::thread::available_parallelism().map_or(1, |n| n.get())
     );
-    hashing();
-    let table = table(rows);
-    keys_in_memory(&table);
-    keys_on_disk(&table, &dir);
-    drop(table);
-    merge();
-    sync(&dir);
-    request().await;
+    let run = |section: &str| only.as_deref().is_none_or(|o| o == section);
+    if run("hashing") {
+        hashing();
+    }
+    if run("memory") || run("disk") {
+        let table = table(rows);
+        if run("memory") {
+            keys_in_memory(&table);
+        }
+        if run("disk") {
+            keys_on_disk(&table, &dir);
+        }
+    }
+    if run("merge") {
+        merge();
+    }
+    if run("sync") {
+        sync(&dir);
+    }
+    if run("request") {
+        request().await;
+    }
     objects(&object_dirs);
 }

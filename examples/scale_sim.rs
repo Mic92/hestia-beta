@@ -35,12 +35,26 @@
 //!                  datacenter, which also hold recent packs and write to the
 //!                  bucket behind the step's back
 //!
+//! `shards` has every step write its own run. Two more rows put one
+//! coordinator in the builders' datacenter between the steps and the index:
+//!
+//!   coordinator    steps send it their rows; it writes them to the bucket in
+//!                  group commits and acknowledges once they are there. A
+//!                  step asks it for the rows no level holds yet and reads
+//!                  the levels from the bucket as before
+//!   coord. serves  it also holds every key table in memory and answers
+//!                  lookups and sampled-chunk queries; chunks and pack
+//!                  indexes still come from the bucket
+//!
+//! The group commit is simulated (Poisson arrivals, one flush at a time);
+//! the block under each table gives the coordinator's load.
+//!
 //! Sizes per path and per chunk are hestia's own. The link figures and the
 //! shape of a build step are assumptions, stated as constants below: the
 //! output is a comparison under them, not a measurement.
 
 mod common;
-use common::MIB;
+use common::{MIB, Rng};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use hestia::chunker::{PackBuilder, chunk_path};
@@ -676,8 +690,7 @@ fn shards(c: &Cluster, m: &Measured) -> Step {
     // Rows not merged yet are in the runs of the last period: list them,
     // fetch them.
     let runs = c.steps_per_s * MERGE_PERIOD_S / 2.0;
-    let run_bytes = STEP_PATHS
-        * (KEY_ROW + BODY_BYTES + m.sampled.new_samples_per_path * (KEY_ROW + SAMPLE_BODY));
+    let run_bytes = run_bytes(m);
     let mut start = Cost::default();
     start.list(link, runs);
     start.get(link, runs, runs * run_bytes);
@@ -757,6 +770,111 @@ fn cache_node(c: &Cluster, m: &Measured) -> Step {
     }
 }
 
+/// Bytes of the rows one step publishes.
+fn run_bytes(m: &Measured) -> f64 {
+    STEP_PATHS * (KEY_ROW + BODY_BYTES + m.sampled.new_samples_per_path * (KEY_ROW + SAMPLE_BODY))
+}
+
+/// A coordinator's group commit: steps arrive at random, one flush runs at
+/// a time and takes every step that arrived before it started.
+struct Commit {
+    /// From a step handing over its rows to their being in the bucket.
+    mean_s: f64,
+    p99_s: f64,
+    flushes_per_s: f64,
+}
+
+fn group_commit(steps_per_s: f64, bytes_per_step: f64) -> Commit {
+    const ARRIVALS: usize = 200_000;
+    let mut rng = Rng(0x5eed);
+    let mut arrivals = Vec::with_capacity(ARRIVALS);
+    let mut t = 0.0;
+    for _ in 0..ARRIVALS {
+        t += rng.exponential(steps_per_s);
+        arrivals.push(t);
+    }
+    let mut waits = Vec::with_capacity(ARRIVALS);
+    let (mut free, mut next, mut flushes) = (0.0f64, 0usize, 0.0);
+    while next < ARRIVALS {
+        let start = free.max(arrivals[next]);
+        let batch = arrivals[next..].partition_point(|a| *a <= start);
+        free = start + BUCKET.put_s + batch as f64 * bytes_per_step / BUCKET.up_bps;
+        waits.extend(arrivals[next..next + batch].iter().map(|a| free - a));
+        next += batch;
+        flushes += 1.0;
+    }
+    waits.sort_by(f64::total_cmp);
+    Commit {
+        mean_s: waits.iter().sum::<f64>() / waits.len() as f64,
+        p99_s: waits[waits.len() * 99 / 100],
+        flushes_per_s: flushes / free,
+    }
+}
+
+/// One coordinator in the builders' datacenter takes every step's rows.
+/// With `serves` it also answers the lookups from memory.
+fn coordinator(c: &Cluster, m: &Measured, serves: bool) -> Step {
+    let mut step = shards(c, m);
+    let commit = group_commit(c.steps_per_s, run_bytes(m));
+    let pending = c.steps_per_s * MERGE_PERIOD_S / 2.0 * run_bytes(m);
+
+    step.start = Cost::default();
+    let mut write_index = Cost::default();
+    if serves {
+        // One batch of keys, the bodies of the inputs back.
+        step.read_index = Cost::default();
+        step.read_index.get(NODE, 1.0, STEP_FETCHES * BODY_BYTES);
+        write_index.get(NODE, 1.0, 0.0);
+    } else {
+        // The rows no level holds yet, in one answer.
+        step.start.get(NODE, 1.0, pending);
+        let index = Index::of(c, m);
+        let hit = shards_hit(STEP_PATHS * m.sampled.lookups_per_path);
+        write_index.get(BUCKET, LEVELS * hit, hit * index.sample_shard());
+    }
+    let loads = STEP_PATHS * m.sampled.loads_per_path;
+    write_index.get(
+        BUCKET,
+        loads,
+        loads * m.sampled.rows_per_load * PACK_INDEX_ROW,
+    );
+    // The rows go to the coordinator, which answers once its flush is done.
+    write_index.put(NODE, 1.0, run_bytes(m));
+    write_index.secs += commit.mean_s;
+    step.write_index = write_index;
+    step
+}
+
+/// What the coordinator itself has to carry.
+fn coordinator_load(c: &Cluster, m: &Measured) {
+    let index = Index::of(c, m);
+    let commit = group_commit(c.steps_per_s, run_bytes(m));
+    let keys = index.path_rows * KEY_ROW + index.sample_rows * (KEY_ROW + SAMPLE_BODY);
+    let mut restart = Cost::default();
+    restart.list(BUCKET, LEVELS * 2.0 * SHARDS);
+    restart.get(BUCKET, LEVELS * 2.0 * SHARDS, keys);
+    // A flush is one PUT however many steps it carries: the ceiling is the
+    // uplink.
+    let ceiling = BUCKET.up_bps / run_bytes(m);
+    println!(
+        "  coordinator: {:.1} steps/s in, {:.0} lookups/s if it serves; commit {:.0} ms mean, {:.0} ms p99 (own run: {:.0} ms); {:.0} index objects/day instead of {:.0} runs",
+        c.steps_per_s,
+        c.steps_per_s * (STEP_LOOKUPS + STEP_PATHS * m.sampled.lookups_per_path),
+        commit.mean_s * 1e3,
+        commit.p99_s * 1e3,
+        BUCKET.put_s * 1e3,
+        commit.flushes_per_s * DAY_S,
+        c.steps_per_s * DAY_S,
+    );
+    println!(
+        "               serving holds {:.2} GB of key tables in memory, {:.0} s to load them after a restart; flushes keep up until {:.0} steps/s ({:.1} M machines)",
+        keys / 1e9,
+        restart.secs,
+        ceiling,
+        ceiling * STEP_S / 1e6,
+    );
+}
+
 fn model(m: &Measured) {
     println!(
         "model: a step is {STEP_LOOKUPS} lookups, {STEP_FETCHES} substituted inputs of {:.2} MiB, {STEP_PATHS} outputs, every {STEP_S} s per machine",
@@ -798,6 +916,8 @@ fn model(m: &Measured) {
             ("today", today(&c, m, false)),
             ("today, kept", today(&c, m, true)),
             ("shards", shards(&c, m)),
+            ("coordinator", coordinator(&c, m, false)),
+            ("coord. serves", coordinator(&c, m, true)),
             ("+ cache node", cache_node(&c, m)),
         ] {
             let mut total = Cost::default();
@@ -828,6 +948,7 @@ fn model(m: &Measured) {
                 step.upkeep_bytes_per_day / 1e9,
             );
         }
+        coordinator_load(&c, m);
         println!(
             "  shards in one level merged every minute: {:.0} GB/day of upkeep; in two (minute, day): {:.0}\n",
             index.upkeep(&[MERGE_PERIOD_S]) / 1e9,

@@ -5,6 +5,7 @@
 //!   cargo run --release --example hybrid_sim
 //!   cargo run --release --example hybrid_sim -- --fine-machines 0 --coarse-machines 500
 //!   cargo run --release --example hybrid_sim -- --object-bytes 10000
+//!   cargo run --release --example hybrid_sim -- --measured
 //!
 //! A design is a set of knobs (`Design`). `evaluate` turns it into dollars a
 //! day: builder time spent waiting on the cache, node hardware, bucket
@@ -57,13 +58,49 @@ const NODE_CORES: f64 = 16.0;
 const NODE_RAM_MAX: f64 = 512.0 * GB;
 const NODE_SSD_MAX: f64 = 8000.0 * GB;
 const NODE_RAM_BASE: f64 = 1.0 * GB;
-const SSD_READ_BPS: f64 = 2e9;
-const CPU_KEY_RAM_S: f64 = 3e-6;
 const CPU_KEY_SSD_S: f64 = 20e-6;
-const SSD_LOOKUP_S: f64 = 0.0002;
 const CPU_WRITE_S: f64 = 50e-6;
-const CPU_BYTE_S: f64 = 1.0 / 2e9; // hashing what passes through
-const CPU_MERGE_BYTE_S: f64 = 1.0 / 200e6; // merging index levels
+
+/// What a node's disk and cores do. `ASSUMED` is what the search was first
+/// run with; `MEASURED` (`--measured`) is what `assumption_bench` saw on a
+/// 4-core VM with a virtio disk, using its faster variants.
+struct Node {
+    ssd_read_bps: f64,
+    /// CPU to find one key held in memory.
+    key_ram_s: f64,
+    /// Wall time for a step's lookups when keys are on disk.
+    ssd_lookup_s: f64,
+    /// Hashing what passes through, per byte.
+    byte_s: f64,
+    /// Merging index levels, per byte.
+    merge_byte_s: f64,
+}
+
+const ASSUMED: Node = Node {
+    ssd_read_bps: 2e9,
+    key_ram_s: 3e-6,
+    ssd_lookup_s: 200e-6,
+    byte_s: 1.0 / 2e9,
+    merge_byte_s: 1.0 / 200e6,
+};
+
+const MEASURED: Node = Node {
+    ssd_read_bps: 1.7e9,
+    key_ram_s: 0.2e-6,
+    ssd_lookup_s: 186e-6,
+    byte_s: 1.0 / 3.2e9,
+    merge_byte_s: 1.0 / 409e6,
+};
+
+static USE_MEASURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn nd() -> &'static Node {
+    if *USE_MEASURED.get().unwrap_or(&false) {
+        &MEASURED
+    } else {
+        &ASSUMED
+    }
+}
 const MAX_LOAD: f64 = 0.7;
 /// A lost node is replaced after this long.
 const REPLACE_S: f64 = 3600.0;
@@ -420,7 +457,7 @@ fn evaluate_embedded(d: &Design, classes: &[Class; 2], w: &World) -> Report {
 
         // Lookups are local. Inputs and outputs cross to the bucket; an
         // output asked for before the keys have synced costs one GET.
-        let mut wait = SSD_LOOKUP_S
+        let mut wait = nd().ssd_lookup_s
             + BUCKET_GET_S
             + c.fetches * c.fetch_bytes / BUCKET_DOWN_BPS
             + RACED * BUCKET_GET_S;
@@ -560,7 +597,11 @@ fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
                 keys.min(d.nodes)
             }
         };
-        let disk = if d.keys_on_ssd { SSD_LOOKUP_S } else { 0.0 };
+        let disk = if d.keys_on_ssd {
+            nd().ssd_lookup_s
+        } else {
+            0.0
+        };
         let mut wait = rpc.slowest_of(fan(c.lookups)) + disk;
         let hit = if d.cache_days[i] >= c.window_days {
             1.0
@@ -600,11 +641,11 @@ fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
             * if d.keys_on_ssd {
                 CPU_KEY_SSD_S
             } else {
-                CPU_KEY_RAM_S
+                nd().key_ram_s
             }
             + outputs_per_s * CPU_WRITE_S * key_copies
             + (c.steps_per_s * fetch_bytes + outputs_per_s * out_bytes * d.replicas[i])
-                * CPU_BYTE_S;
+                * nd().byte_s;
     }
 
     // ---- nodes
@@ -631,7 +672,7 @@ fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
         index_upkeep(d, index_bps, bucket_index, classes[1].window_days);
     let index_up = index_bps * DAY + merged; // the runs, then the levels
     let index_puts = d.nodes * DAY / d.flush_s + merge_puts;
-    cpu += index_up / DAY * CPU_MERGE_BYTE_S;
+    cpu += index_up / DAY * nd().merge_byte_s;
     r.load = cpu / (d.nodes * NODE_CORES);
     if r.load > MAX_LOAD {
         r.infeasible = Some(format!("nodes are {:.0}% busy", r.load * 100.0));
@@ -658,7 +699,7 @@ fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
         5.0 + if d.keys_on_ssd {
             0.0
         } else {
-            keys_bytes / SSD_READ_BPS
+            keys_bytes / nd().ssd_read_bps
         }
     } else {
         index_objects * key_share / 32.0 * BUCKET_GET_S
@@ -1020,6 +1061,10 @@ fn main() {
     let (mut fine_machines, mut coarse_machines) = (450.0, 50.0);
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
+        if flag == "--measured" {
+            USE_MEASURED.set(true).ok();
+            continue;
+        }
         let value: f64 = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
             eprintln!("{flag} takes a number");
             std::process::exit(2);

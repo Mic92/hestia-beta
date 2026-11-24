@@ -104,6 +104,10 @@ fn load(trace: &str, commits: &str, shards: usize) -> Trace {
         steps_cached: 0,
     };
     let mut built: HashSet<String> = HashSet::new();
+    // The bytes each inputs hash first produced. The hash misses what the
+    // command line carries (git stamps its version into version.o), so the
+    // same hash with other bytes is another step.
+    let mut produced: HashMap<String, String> = HashMap::new();
     for (_, _, commit) in &order {
         let Some(outputs) = rows.get(commit) else {
             continue; // did not build
@@ -129,6 +133,14 @@ fn load(trace: &str, commits: &str, shards: usize) -> Trace {
                 files.insert(path.as_str(), (object, new));
                 continue;
             }
+            let key = match produced.get(key) {
+                Some(first) if first != bytes => format!("{key} {bytes}"),
+                Some(_) => key.clone(),
+                None => {
+                    produced.insert(key.clone(), bytes.clone());
+                    key.clone()
+                }
+            };
             if built.insert(key.clone()) {
                 out.steps_run += 1;
                 if new {
@@ -138,7 +150,7 @@ fn load(trace: &str, commits: &str, shards: usize) -> Trace {
                 out.steps_cached += 1;
             }
             let entry = members.entry(group(path)).or_default();
-            entry.0.insert(key.clone());
+            entry.0.insert(key);
             entry.1.push(object);
         }
         // Archives, then the link, which takes the archives as inputs.

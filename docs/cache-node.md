@@ -1,6 +1,7 @@
 # Cache node (design draft)
 
-Status: stage 2 is built, the rest is a design. The numbers come from
+Status: stage 2 is built, with a pack cache on the node; the rest is a
+design. The numbers come from
 `benches/cluster.rs`; what has not been measured is listed at the end.
 
 ## Problem
@@ -93,7 +94,7 @@ started with `--commit-interval <MILLISECONDS>` serves it two requests
    indexes of the packs holding earlier paths of the same names. Those
    are where a rebuild's chunks repeat, so the builder uploads only
    chunks they lack.
-2. The builder uploads its packs to the store itself.
+2. The builder uploads its packs through the node (see below).
 3. `POST /hestia/commit` with the sealed segment. The node merges what
    arrives within its commit interval into one segment, publishes one
    head and answers every builder with its name. A builder's drain has
@@ -119,9 +120,97 @@ the local link. The used lists are the same on every builder here,
 which flatters the upload column.
 
 Not done: the node authenticates nobody, so whoever reaches its port
-can publish under its root. Packs still go from the builder to the
-bucket, not through the node. A commit of nothing but used paths waits
+can publish under its root. A commit of nothing but used paths waits
 for the next drain.
+
+### Packs on the node's disk
+
+A node started with `--pack-cache <DIRECTORY>` keeps packs on local
+disk, up to `--pack-cache-size` (`src/backend/cached.rs`):
+
+- **Uploads.** A builder behind the node sends its packs to
+  `PUT /hestia/pack/<key>`. The node checks the key is the hash of the
+  body, stores the pack in the bucket, keeps it, and then answers. A
+  builder needs no bucket credentials to upload, and a head never names
+  a pack the bucket lacks.
+- **Reads.** What a read is missing is fetched in 256 KiB blocks and
+  kept. Blocks, not the ranges asked for, so a later read that overlaps
+  an earlier one finds it. Whole packs are not fetched: a scattered
+  fetch touches a small part of many packs.
+- **Eviction.** The least recently used pack goes first. A pack GC
+  deletes is dropped by the node that ran the GC at once.
+- **Restart.** A clean exit records what is kept and the next start is
+  warm. After a crash the disk cannot be trusted and the cache starts
+  empty.
+
+The substituter leaves reading ahead to the cache when there is one:
+its own window changes with the order of requests, so the same paths
+asked for twice would fetch different ranges.
+
+Fetching 200 paths through a fresh daemon, same root and link as above:
+
+| | Wall time | Bucket requests | Downloaded |
+|---|---|---|---|
+| Neighbouring paths, no pack cache | 215 ms | 6 | 2.8 MB |
+| Neighbouring paths, node disk empty | 122 ms | 13 | 3.4 MB |
+| Scattered paths, no pack cache | 1713 ms | 225 | 89.7 MB |
+| Scattered paths, node disk empty | 1125 ms | 200 | 52.0 MB |
+| Scattered paths again, node disk filled | 37 ms | 0 | 0 MB |
+
+The block size was chosen on the scattered rows: 128 KiB downloads
+26 MB and 1 MiB downloads 206 MB for the same 200 paths, at about the
+same number of requests. The paths here are 1 KiB each, which favours
+small blocks.
+
+Not done: two reads that miss the same block at the same moment both
+fetch it. The builder's upload returns only after the bucket has the
+pack, so it still waits for the uplink.
+
+### Which pack to evict
+
+`examples/node_cache_sim.rs` replays a CI history against a node's
+disk. The history is real: the 767 commits of 200 merges into git's
+master (ten weeks, topic branches included), each built with a
+derivation per compiled object (`examples/ci_trace/`). CI builds every
+commit once on builders with empty stores; a step that runs reads its
+inputs from the node and writes its output through it. Four test jobs
+a run read the linked binary, which is an assumption. One run writes
+45 MB and touches 82 MB.
+
+Share of the bytes read that came from the bucket, evicting whole
+packs (what one run wrote):
+
+| Disk | LRU, uploads not kept | LRU | FIFO | SIEVE | S3-FIFO |
+|---|---|---|---|---|---|
+| 100 MB | 39.4% | 7.7% | 13.8% | 12.1% | 32.4% |
+| 200 MB | 37.1% | 4.1% | 8.0% | 6.4% | 13.1% |
+| 400 MB | 36.3% | 3.2% | 5.4% | 3.5% | 5.2% |
+| 800 MB | 35.4% | 2.3% | 3.8% | 2.3% | 1.8% |
+| 1600 MB | 34.6% | 1.5% | 2.6% | 1.6% | 1.4% |
+| 3200 MB | 33.6% | 0.5% | 1.5% | 0.6% | 0.5% |
+| 6400 MB | 33.4% | 0.3% | 0.8% | 0.3% | 0.2% |
+
+- Not keeping uploads costs a third of all read bytes at any disk
+  size: a fresh output is read by the next step before anyone fetched
+  it.
+- LRU is best or within a point of best everywhere. S3-FIFO, which
+  holds new entries in a tenth of the disk until they are read, loses
+  badly on small disks because here every output is read at least once,
+  by the step that follows it.
+- Evicting single outputs gives about the same numbers from 200 MB up,
+  so packs are a fine unit.
+- Disk matters more than the order: below about three runs' worth of
+  writes every policy misses a lot, above about seventy there is little
+  left to gain.
+
+Without test jobs the linked binary is never read (13 GB of the 34 GB
+written). LRU on packs then still matches or beats the others up to
+400 MB and is within a point above.
+
+Limits: one project, only compiled objects and no package outputs,
+uncompressed sizes, and git stamps its version into one object, so the
+archive and the binary are rebuilt for every commit and make up most
+of the bytes.
 
 ## Stage 3: compiled objects
 
@@ -135,7 +224,6 @@ as long as the delta, which is not designed yet.
 
 - A node itself: acknowledgement latency with a disk sync, upload lag,
   cache hit rate under a real build's reads.
-- Whole-pack fetch on first touch against caching only the ranges read.
 - Segment metadata of real store paths (references, derivers): the
   synthetic paths have none, so index sizes above are a lower bound.
 - Packet loss and jitter. The fake network models a round trip and a

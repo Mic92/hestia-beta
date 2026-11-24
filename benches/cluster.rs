@@ -14,7 +14,7 @@
 //!   nar url       finding the path a `nar/<hash>.nar.zst` URL names
 //!   fetch         FETCH paths through the substituter, 25 at a time:
 //!                 neighbours in one pack, then paths from all over
-//!                 the scattered ones again through a node's pack cache,
+//!                 both again through a node's pack cache,
 //!                 its disk empty and then filled
 //!   builders      BUILDERS machines fetching FETCH paths each at once, half
 //!                 of them common: a daemon each, then one shared daemon
@@ -257,6 +257,14 @@ async fn main() {
         let dir = tempfile::tempdir().unwrap();
         let packs = Arc::new(PackCache::open(dir.path(), 1 << 40).unwrap());
         let node = Backend::Cached(Cached::new(sim.backend.clone(), Arc::clone(&packs)));
+        fetch_paths(
+            "  node, adjacent, disk empty",
+            &cold,
+            &node,
+            &net,
+            &adjacent,
+        )
+        .await;
         fetch_paths("  node, disk empty", &cold, &node, &net, &scattered).await;
         fetch_paths("  node, disk filled", &cold, &node, &net, &scattered).await;
         println!(

@@ -348,9 +348,10 @@ impl ChunkFetcher {
         &self,
         pack: PackHash,
         range: std::ops::Range<u64>,
+        pack_len: u64,
     ) -> Result<Bytes, FetchError> {
         self.backend
-            .get(&pack_cache_key(&pack), Some(range))
+            .get_pack(&pack_cache_key(&pack), range, pack_len)
             .await?
             .ok_or(FetchError::PackUnavailable(pack))
     }
@@ -460,7 +461,12 @@ impl ChunkFetcher {
                         None => spans.push((l.offset, l.compressed_size)),
                     }
                 }
-                let ranges = plan_pack_reads(&spans, index.size(), |start| state.window_for(start));
+                // A backend that keeps packs reads ahead itself, in blocks
+                // that a later read finds again.
+                let local = self.backend.keeps_packs();
+                let ranges = plan_pack_reads(&spans, index.size(), |start| {
+                    if local { 0 } else { state.window_for(start) }
+                });
                 state.last_end = ranges.last().map(|r| r.end).or(state.last_end);
                 let (tx, rx) = tokio::sync::watch::channel(());
                 let n = ranges.len() as u64;
@@ -495,7 +501,9 @@ impl ChunkFetcher {
                     range_bytes += range.end - range.start;
                     // Slices are in bounds: the backend fails unless the
                     // response is the whole range.
-                    let data = self.read_pack_range(pack, range.clone()).await?;
+                    let data = self
+                        .read_pack_range(pack, range.clone(), index.size())
+                        .await?;
                     let mut cache = self.chunk_cache.lock().expect("chunk cache poisoned");
                     for e in chunks_in_range(&index, &range) {
                         let from = (e.offset - range.start) as usize;

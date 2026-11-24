@@ -73,6 +73,26 @@ impl Backend {
         }
     }
 
+    /// A range of a pack whose length the caller knows. A backend that
+    /// keeps packs locally uses the length to fetch in whole blocks.
+    pub async fn get_pack(
+        &self,
+        key: &str,
+        range: Range<u64>,
+        len: u64,
+    ) -> Result<Option<Bytes>, Error> {
+        match self {
+            Backend::Cached(b) => Box::pin(b.get_pack(key, range, len)).await,
+            _ => self.get(key, Some(range)).await,
+        }
+    }
+
+    /// Whether pack reads are kept locally. Then reading ahead is this
+    /// backend's business, not the reader's.
+    pub fn keeps_packs(&self) -> bool {
+        matches!(self, Backend::Cached(_))
+    }
+
     /// Reset the key's LRU clock where there is one. `false` if the key is gone.
     pub async fn touch(&self, key: &str) -> Result<bool, Error> {
         match self {

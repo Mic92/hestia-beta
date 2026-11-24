@@ -27,6 +27,8 @@ use super::{Backend, Error};
 const PACK_PREFIX: &str = "pack-";
 /// Written by [`PackCache::save`], consumed by [`PackCache::open`].
 const INDEX: &str = "index";
+/// Missing parts of a pack are fetched in multiples of this.
+const BLOCK: u64 = 256 * 1024;
 
 #[derive(Default)]
 struct Entry {
@@ -44,6 +46,25 @@ impl Entry {
             .range(..=range.start)
             .next_back()
             .is_some_and(|(_, &end)| end >= range.end)
+    }
+
+    /// The parts of `range` that are not kept, in order.
+    fn missing(&self, range: &Range<u64>) -> Vec<Range<u64>> {
+        let mut at = range.start;
+        let mut out = Vec::new();
+        if let Some((_, &end)) = self.extents.range(..=at).next_back() {
+            at = at.max(end);
+        }
+        for (&start, &end) in self.extents.range(range.start + 1..range.end) {
+            if start > at {
+                out.push(at..start);
+            }
+            at = at.max(end);
+        }
+        if at < range.end {
+            out.push(at..range.end);
+        }
+        out
     }
 
     /// Returns the bytes the extent added.
@@ -234,14 +255,28 @@ impl PackCache {
         Self::path_in(&self.dir, key)
     }
 
+    /// What a read of `range` still has to fetch. A range that runs past
+    /// the pack's known end is cut there.
+    fn missing(&self, key: &str, range: &Range<u64>) -> Vec<Range<u64>> {
+        let state = self.state.lock().expect("pack cache lock poisoned");
+        match state.entries.get(key) {
+            Some(entry) => {
+                let end = entry.len.map_or(range.end, |len| range.end.min(len));
+                entry.missing(&(range.start.min(end)..end))
+            }
+            None => vec![range.clone()],
+        }
+    }
+
     /// The range, or the whole pack, if all of it is kept.
     fn read(&self, key: &str, range: Option<Range<u64>>) -> Option<Bytes> {
         let range = {
             let mut state = self.state.lock().expect("pack cache lock poisoned");
             let entry = state.entries.get(key)?;
-            let range = match range {
-                Some(range) => range,
-                None => 0..entry.len?,
+            let range = match (range, entry.len) {
+                (Some(range), Some(len)) => range.start.min(len)..range.end.min(len),
+                (Some(range), None) => range,
+                (None, len) => 0..len?,
             };
             if !entry.covers(&range) {
                 return None;
@@ -265,9 +300,9 @@ impl PackCache {
         }
     }
 
-    /// Keeps `data`, which sits at `offset` in the pack. `whole` says the
-    /// data is the entire pack.
-    fn store(&self, key: &str, offset: u64, data: &[u8], whole: bool) {
+    /// Keeps `data`, which sits at `offset` in the pack. `last` says the
+    /// pack ends where the data does.
+    fn store(&self, key: &str, offset: u64, data: &[u8], last: bool) {
         if data.len() as u64 > self.capacity {
             return;
         }
@@ -294,8 +329,8 @@ impl PackCache {
             }
             state.touch(key);
             let entry = state.entries.get_mut(key).expect("just inserted");
-            if whole {
-                entry.len = Some(data.len() as u64);
+            if last {
+                entry.len = Some(offset + data.len() as u64);
             }
             let added = entry.add(offset, offset + data.len() as u64);
             state.used += added;
@@ -349,35 +384,84 @@ impl Cached {
         if !key.starts_with(PACK_PREFIX) {
             return self.inner.get(key, range).await;
         }
-        let kept = {
-            let (packs, key, range) = (Arc::clone(&self.packs), key.to_owned(), range.clone());
-            tokio::task::spawn_blocking(move || packs.read(&key, range))
-                .await
-                .ok()
-                .flatten()
-        };
-        if let Some(data) = kept {
-            self.packs.hits.fetch_add(1, Ordering::Relaxed);
-            self.packs
-                .hit_bytes
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
+        if let Some(data) = self.kept(key, range.clone()).await {
             return Ok(Some(data));
         }
-        let Some(data) = self.inner.get(key, range.clone()).await? else {
+        if let Some(range) = range {
+            return self.fill(key, range.clone(), range).await;
+        }
+        let Some(data) = self.inner.get(key, None).await? else {
             return Ok(None);
         };
         self.packs.misses.fetch_add(1, Ordering::Relaxed);
         self.packs
             .miss_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
-        self.keep(
-            key,
-            range.as_ref().map_or(0, |r| r.start),
-            &data,
-            range.is_none(),
-        )
-        .await;
+        self.keep(key, 0, &data, true).await;
         Ok(Some(data))
+    }
+
+    /// A range of a pack that is `len` bytes long. What is missing is
+    /// fetched in whole blocks, so reads that overlap earlier ones find
+    /// them, and a read's neighbours come along as they would with
+    /// read-ahead.
+    pub async fn get_pack(
+        &self,
+        key: &str,
+        range: Range<u64>,
+        len: u64,
+    ) -> Result<Option<Bytes>, Error> {
+        if let Some(data) = self.kept(key, Some(range.clone())).await {
+            return Ok(Some(data));
+        }
+        let start = range.start / BLOCK * BLOCK;
+        let end = range.end.div_ceil(BLOCK).saturating_mul(BLOCK).min(len);
+        self.fill(key, range.clone(), start..end.max(range.end))
+            .await
+    }
+
+    async fn kept(&self, key: &str, range: Option<Range<u64>>) -> Option<Bytes> {
+        let (packs, key) = (Arc::clone(&self.packs), key.to_owned());
+        let data = tokio::task::spawn_blocking(move || packs.read(&key, range))
+            .await
+            .ok()
+            .flatten()?;
+        self.packs.hits.fetch_add(1, Ordering::Relaxed);
+        self.packs
+            .hit_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        Some(data)
+    }
+
+    /// Fetches what of `around` is not kept and answers `range`, which
+    /// lies inside it.
+    async fn fill(
+        &self,
+        key: &str,
+        range: Range<u64>,
+        around: Range<u64>,
+    ) -> Result<Option<Bytes>, Error> {
+        let mut fetched = 0;
+        for gap in self.packs.missing(key, &around) {
+            let Some(data) = self.inner.get(key, Some(gap.clone())).await? else {
+                return Ok(None);
+            };
+            fetched += data.len() as u64;
+            self.keep(key, gap.start, &data, false).await;
+        }
+        self.packs.misses.fetch_add(1, Ordering::Relaxed);
+        self.packs.miss_bytes.fetch_add(fetched, Ordering::Relaxed);
+        let (packs, owned) = (Arc::clone(&self.packs), key.to_owned());
+        let wanted = range.clone();
+        let kept = tokio::task::spawn_blocking(move || packs.read(&owned, Some(wanted)))
+            .await
+            .ok()
+            .flatten();
+        match kept {
+            Some(data) => Ok(Some(data)),
+            // Evicted in between: this read goes around the cache.
+            None => self.inner.get(key, Some(range)).await,
+        }
     }
 
     pub async fn put(&self, key: &str, data: Bytes) -> Result<bool, Error> {
@@ -415,10 +499,17 @@ mod tests {
         assert_eq!(entry.add(10, 20), 10);
         assert_eq!(entry.add(30, 40), 10);
         assert!(!entry.covers(&(10..40)));
+        assert_eq!(entry.missing(&(5..45)), [5..10, 20..30, 40..45]);
+        assert_eq!(
+            entry.missing(&(15..35)).as_slice(),
+            std::slice::from_ref(&(20..30))
+        );
         assert_eq!(entry.add(15, 35), 10, "only the gap is new");
         assert!(entry.covers(&(10..40)));
         assert_eq!(entry.extents.len(), 1);
         assert_eq!(entry.add(12, 18), 0);
+        assert_eq!(entry.missing(&(0..60)), [0..10, 40..60]);
+        assert_eq!(entry.missing(&(12..30)), []);
         assert_eq!(entry.add(40, 50), 10, "touching extents merge");
         assert_eq!(entry.extents.into_iter().collect::<Vec<_>>(), [(10, 50)]);
         assert_eq!(entry.bytes, 40);
@@ -432,6 +523,11 @@ mod tests {
         assert_eq!(cache.read(&key(1), Some(106..111)).unwrap(), "world");
         assert!(cache.read(&key(1), Some(90..105)).is_none());
         assert!(cache.read(&key(1), None).is_none(), "length unknown");
+        // Once the end of the pack is known, a range past it is cut there.
+        // A read that came back short tells where the pack ends.
+        cache.store(&key(1), 111, b"!", true);
+        assert_eq!(cache.missing(&key(1), &(100..500)), []);
+        assert_eq!(cache.read(&key(1), Some(100..500)).unwrap(), "hello world!");
         cache.store(&key(2), 0, b"whole pack", true);
         assert_eq!(cache.read(&key(2), None).unwrap(), "whole pack");
     }

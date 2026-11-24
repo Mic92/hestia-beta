@@ -103,3 +103,7 @@ divan = "0.1"
 [[bench]]
 name = "backend"
 harness = false
+
+[[bench]]
+name = "cluster"
+harness = false

@@ -2,7 +2,7 @@
 //! roots. `.tree` and pack indexes are fetched on first use.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use futures_util::future::{join_all, try_join_all};
 use tokio::sync::OnceCell;
@@ -45,6 +45,38 @@ pub struct Segment {
     pub digest: SegDigest,
     pub meta: Meta,
     tree: OnceCell<Tree>,
+    /// `(first 8 bytes of the NAR hash, entry)`, sorted. Built on the first
+    /// `nar/<hash>` request, so a scan of every body happens once a segment
+    /// instead of once a request.
+    by_nar: OnceLock<Vec<(u64, u32)>>,
+}
+
+impl Segment {
+    fn new(digest: SegDigest, meta: Meta, tree: Option<Tree>) -> Segment {
+        Segment {
+            digest,
+            meta,
+            tree: OnceCell::new_with(tree),
+            by_nar: OnceLock::new(),
+        }
+    }
+
+    fn by_nar_hash(&self, nar_hash: &Hash32) -> Option<usize> {
+        let key = |h: &Hash32| u64::from_be_bytes(h.0[..8].try_into().expect("8 bytes"));
+        let table = self.by_nar.get_or_init(|| {
+            let mut t: Vec<(u64, u32)> = (0..self.meta.len())
+                .map(|i| (key(&self.meta.body(i).nar_hash), i as u32))
+                .collect();
+            t.sort_unstable();
+            t
+        });
+        let want = key(nar_hash);
+        table[table.partition_point(|(k, _)| *k < want)..]
+            .iter()
+            .take_while(|(k, _)| *k == want)
+            .map(|(_, i)| *i as usize)
+            .find(|&i| self.meta.body(i).nar_hash == *nar_hash)
+    }
 }
 
 /// Where chunks live, plus the index of each pack involved (read-ahead).
@@ -72,7 +104,9 @@ pub struct Snapshot {
     /// Published by this process under the first root and served even
     /// while the listing lags behind, until a GC moves the epoch on.
     published: Vec<(u64, Arc<Segment>)>,
-    pack_indexes: Mutex<HashMap<PackHash, Arc<PackIndex>>>,
+    /// A cell per pack, so concurrent requests for paths of one pack
+    /// fetch its index once.
+    pack_indexes: Mutex<HashMap<PackHash, Arc<OnceCell<Arc<PackIndex>>>>>,
 }
 
 async fn fetch(backend: &Backend, key: &str) -> Result<bytes::Bytes, Error> {
@@ -267,11 +301,7 @@ impl Snapshot {
                     Err(err) => Err(err),
                 };
                 match meta {
-                    Ok(meta) => Some(Arc::new(Segment {
-                        digest: *digest,
-                        meta,
-                        tree: OnceCell::new(),
-                    })),
+                    Ok(meta) => Some(Arc::new(Segment::new(*digest, meta, None))),
                     // Evicted or corrupt: its paths miss and get pushed again.
                     Err(err) => {
                         eprintln!("hestia: skipping segment {digest}: {err}");
@@ -289,8 +319,17 @@ impl Snapshot {
                 segments.insert(0, s.clone());
             }
         }
+        // Only what is loaded: a cell another request is still filling
+        // belongs to the snapshot that request holds.
         let pack_indexes = previous
-            .map(|p| p.pack_indexes.lock().unwrap().clone())
+            .map(|p| {
+                let cells = p.pack_indexes.lock().unwrap();
+                cells
+                    .iter()
+                    .filter(|(_, cell)| cell.initialized())
+                    .map(|(pack, cell)| (*pack, cell.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(Snapshot {
             backend,
@@ -306,11 +345,11 @@ impl Snapshot {
 
     /// Reload after publishing `sealed` under the first root.
     pub async fn refresh_with(&self, sealed: &Sealed) -> Result<Snapshot, Error> {
-        let fresh = Arc::new(Segment {
-            digest: sealed.digest(),
-            meta: Meta::open(&sealed.meta)?,
-            tree: OnceCell::new_with(Some(Tree::open(&sealed.tree)?)),
-        });
+        let fresh = Arc::new(Segment::new(
+            sealed.digest(),
+            Meta::open(&sealed.meta)?,
+            Some(Tree::open(&sealed.tree)?),
+        ));
         Snapshot::load_with(
             self.backend.clone(),
             self.trust.clone(),
@@ -428,8 +467,10 @@ impl Snapshot {
     /// Chunks locatable without a fetch: every pack index loaded so far.
     pub fn known_chunks(&self) -> KnownChunks {
         let mut known = KnownChunks::default();
-        for (pack, index) in self.pack_indexes.lock().unwrap().iter() {
-            known.add(*pack, index);
+        for (pack, cell) in self.pack_indexes.lock().unwrap().iter() {
+            if let Some(index) = cell.get() {
+                known.add(*pack, index);
+            }
         }
         known
     }
@@ -453,10 +494,9 @@ impl Snapshot {
     }
 
     pub fn by_nar_hash(&self, nar_hash: &Hash32) -> Option<PathHash> {
-        self.segments.iter().find_map(|s| {
-            (0..s.meta.len())
-                .find_map(|i| (s.meta.body(i).nar_hash == *nar_hash).then(|| s.meta.hash(i)))
-        })
+        self.segments
+            .iter()
+            .find_map(|s| s.by_nar_hash(nar_hash).map(|i| s.meta.hash(i)))
     }
 
     /// Packs holding chunks of `hash` (empty if unknown).
@@ -511,15 +551,16 @@ impl Snapshot {
     }
 
     async fn pack_index(&self, row: &PackRow) -> Result<Arc<PackIndex>, Error> {
-        if let Some(idx) = self.pack_indexes.lock().unwrap().get(&row.hash) {
-            return Ok(idx.clone());
-        }
-        let idx = Arc::new(fetch_pack_index(&self.backend, row).await?);
-        self.pack_indexes
+        let cell = self
+            .pack_indexes
             .lock()
             .unwrap()
-            .insert(row.hash, idx.clone());
-        Ok(idx)
+            .entry(row.hash)
+            .or_default()
+            .clone();
+        cell.get_or_try_init(|| async { Ok(Arc::new(fetch_pack_index(&self.backend, row).await?)) })
+            .await
+            .cloned()
     }
 
     pub async fn resolve(&self, hash: &PathHash) -> Result<Option<Resolved>, Error> {

@@ -155,6 +155,19 @@ impl SimCache {
     /// published segment names pushed ∪ closure, like the pipeline does.
     pub async fn push(&self, root_key: &str, pushed: &[&SimPath], closure: &[&SimPath]) {
         let snapshot = self.snapshot().await;
+        let closure: Vec<PathHash> = closure.iter().map(|p| p.path_hash()).collect();
+        self.drain(&snapshot, root_key, pushed, &closure).await;
+    }
+
+    /// [`Self::push`] from a snapshot the caller holds, as a running daemon
+    /// drains. Returns what was published.
+    pub async fn drain(
+        &self,
+        snapshot: &Snapshot,
+        root_key: &str,
+        pushed: &[&SimPath],
+        closure: &[PathHash],
+    ) -> Option<hestia::segment::Sealed> {
         let mut known = snapshot.known_chunks();
         let mut builder = PackBuilder::new();
         let mut fresh: Vec<PathEntry> = Vec::new();
@@ -198,8 +211,11 @@ impl SimCache {
         for entry in &fresh {
             store::push_entry(&mut writer, entry, &known).expect("chunks located");
         }
-        for path in pushed.iter().chain(closure) {
-            let hash = path.path_hash();
+        for hash in pushed
+            .iter()
+            .map(|p| p.path_hash())
+            .chain(closure.iter().copied())
+        {
             if !writer.contains(&hash) {
                 snapshot
                     .copy_entry(&hash, &mut writer)
@@ -208,7 +224,7 @@ impl SimCache {
             }
         }
         if writer.is_empty() {
-            return;
+            return None;
         }
         let sealed = writer.seal().expect("seal");
         store::publish(
@@ -221,6 +237,7 @@ impl SimCache {
         )
         .await
         .expect("publish");
+        Some(sealed)
     }
 
     /// Upload a pack no segment references (a drain that crashed before

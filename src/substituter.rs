@@ -26,7 +26,7 @@
 //! Responses are unsigned: the action configures the store URL with
 //! `?trusted=true`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -71,12 +71,17 @@ const CHUNK_CACHE_BUDGET: usize = 256 * 1024 * 1024;
 /// another ~66 ms round trip.
 const PACK_FETCH_GAP_BYTES: u64 = 128 * 1024;
 
-/// Every Range read is extended to at least this many bytes (clamped to
-/// the last known chunk of the pack) and all chunks inside the region go into the
-/// chunk cache. Packs are written in drain order, so the neighbours of a
-/// requested chunk are what nix asks for next; read-ahead turns thousands
-/// of per-path round trips into a few large reads.
+/// A Range read is extended by a window of up to this many bytes (clamped
+/// to the pack) and all chunks inside the region go into the chunk cache.
+/// Packs are written in drain order, so the neighbours of a requested
+/// chunk are often what nix asks for next, and read-ahead turns thousands
+/// of per-path round trips into a few large reads. The window is kept per
+/// pack: it doubles while reads continue where the last one stopped and
+/// halves when they land elsewhere, since for scattered paths of a shared
+/// root everything read ahead is wasted (`benches/cluster.rs`).
 const PACK_READ_AHEAD_BYTES: u64 = 4 * 1024 * 1024;
+const PACK_READ_AHEAD_MIN: u64 = PACK_FETCH_GAP_BYTES;
+const PACK_READ_AHEAD_START: u64 = 1024 * 1024;
 
 /// Maximum number of pack reads in flight across all NAR requests. A pack
 /// read is the unit of GHA cache API traffic (one Twirp URL lookup plus
@@ -207,21 +212,23 @@ impl From<crate::store::Error> for FetchError {
 /// eviction would drop the hot set first.
 #[derive(Default)]
 struct ChunkCache {
-    chunks: HashMap<ChunkHash, Frame>,
-    order: VecDeque<ChunkHash>,
+    /// Frame and the tick of its last use.
+    chunks: HashMap<ChunkHash, (Frame, u64)>,
+    /// Tick of last use to chunk: the first entry is the one to evict.
+    order: BTreeMap<u64, ChunkHash>,
+    tick: u64,
     total: usize,
 }
 
 impl ChunkCache {
     fn get(&mut self, hash: &ChunkHash) -> Option<Frame> {
-        let data = self.chunks.get(hash).cloned()?;
-        // Move-to-back on hit (entry counts are small enough for the
-        // linear scan): a hit must postpone eviction.
-        if let Some(position) = self.order.iter().position(|entry| entry == hash) {
-            let entry = self.order.remove(position).expect("position is valid");
-            self.order.push_back(entry);
-        }
-        Some(data)
+        let (data, used) = self.chunks.get_mut(hash)?;
+        // A hit must postpone eviction.
+        self.order.remove(used);
+        self.tick += 1;
+        *used = self.tick;
+        self.order.insert(self.tick, *hash);
+        Some(data.clone())
     }
 
     fn insert(&mut self, hash: ChunkHash, data: Frame) {
@@ -229,15 +236,78 @@ impl ChunkCache {
             return;
         }
         self.total += data.zstd.len();
-        self.chunks.insert(hash, data);
-        self.order.push_back(hash);
+        self.tick += 1;
+        self.chunks.insert(hash, (data, self.tick));
+        self.order.insert(self.tick, hash);
         while self.total > CHUNK_CACHE_BUDGET {
-            let Some(oldest) = self.order.pop_front() else {
+            let Some((_, oldest)) = self.order.pop_first() else {
                 break;
             };
-            if let Some(dropped) = self.chunks.remove(&oldest) {
+            if let Some((dropped, _)) = self.chunks.remove(&oldest) {
                 self.total -= dropped.zstd.len();
             }
+        }
+    }
+}
+
+/// Range reads of one pack that are under way, and how far to read ahead
+/// in it.
+struct PackReads {
+    inflight: Vec<InflightRead>,
+    window: u64,
+    /// Where the last planned read stops.
+    last_end: Option<u64>,
+}
+
+struct InflightRead {
+    id: u64,
+    range: std::ops::Range<u64>,
+    /// Closed when the read is over, whether it worked or not.
+    done: tokio::sync::watch::Receiver<()>,
+}
+
+impl Default for PackReads {
+    fn default() -> Self {
+        Self {
+            inflight: Vec::new(),
+            window: PACK_READ_AHEAD_START,
+            last_end: None,
+        }
+    }
+}
+
+impl PackReads {
+    /// Adapt the window to where `start` lies relative to the last read.
+    fn window_for(&mut self, start: u64) -> u64 {
+        if let Some(last_end) = self.last_end {
+            self.window = if start.abs_diff(last_end) <= self.window {
+                (self.window * 2).min(PACK_READ_AHEAD_BYTES)
+            } else {
+                (self.window / 2).max(PACK_READ_AHEAD_MIN)
+            };
+        }
+        self.window
+    }
+}
+
+/// Takes this request's reads off the in-flight list, also when the
+/// request is dropped half way, and so wakes whoever waits for them.
+struct ReadGuard<'a> {
+    reads: &'a Mutex<HashMap<PackHash, PackReads>>,
+    pack: PackHash,
+    ids: std::ops::Range<u64>,
+    _done: tokio::sync::watch::Sender<()>,
+}
+
+impl Drop for ReadGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(state) = self
+            .reads
+            .lock()
+            .expect("pack reads poisoned")
+            .get_mut(&self.pack)
+        {
+            state.inflight.retain(|r| !self.ids.contains(&r.id));
         }
     }
 }
@@ -255,6 +325,9 @@ struct ChunkFetcher {
     /// cache hits never pin a permit. FIFO: a many-pack path cannot
     /// starve others.
     fetch_semaphore: Semaphore,
+    /// Concurrent requests for chunks of one region share a read.
+    pack_reads: Mutex<HashMap<PackHash, PackReads>>,
+    next_read_id: std::sync::atomic::AtomicU64,
 }
 
 impl ChunkFetcher {
@@ -264,6 +337,8 @@ impl ChunkFetcher {
             chunk_cache: Mutex::new(ChunkCache::default()),
             path_locks: Mutex::new(HashMap::new()),
             fetch_semaphore: Semaphore::new(MAX_CONCURRENT_PACK_FETCHES),
+            pack_reads: Mutex::new(HashMap::new()),
+            next_read_id: Default::default(),
         }
     }
 
@@ -330,26 +405,13 @@ impl ChunkFetcher {
             }
         }
 
-        // Fetch packs in parallel; each fetch holds one global permit
-        // while it talks to the GHA cache API. The semaphore is never
-        // closed, so acquire only fails after close.
+        // Fetch packs in parallel.
         let fetches = missing.into_iter().map(|(pack, chunks)| {
             let index = Arc::clone(&source.packs[&pack]);
-            async move {
-                let _permit = self
-                    .fetch_semaphore
-                    .acquire()
-                    .await
-                    .expect("fetch semaphore closed");
-                self.fetch_from_pack(pack, chunks, index).await
-            }
+            self.fetch_from_pack(pack, chunks, index)
         });
         for fetched in futures_util::future::try_join_all(fetches).await? {
-            let mut cache = self.chunk_cache.lock().expect("chunk cache poisoned");
-            for (hash, data) in fetched {
-                cache.insert(hash, data.clone());
-                result.insert(hash, data);
-            }
+            result.extend(fetched);
         }
 
         Ok(result)
@@ -357,41 +419,111 @@ impl ChunkFetcher {
 
     /// Fetch a set of chunks from one pack with as few Range requests as
     /// possible (gap coalescing plus read-ahead, see [`plan_pack_reads`]).
-    ///
-    /// Returns the requested chunks plus every other manifest chunk that
-    /// happened to fall inside the fetched regions (read-ahead); the caller
-    /// caches all of them.
+    /// Chunks inside a region another request is reading are waited for
+    /// instead of read again: Nix asks for neighbouring paths in parallel,
+    /// and each of them reading ahead over the same region multiplied the
+    /// download. Every chunk in a fetched region goes into the chunk cache.
     async fn fetch_from_pack(
         &self,
         pack: PackHash,
-        mut chunks: Vec<(ChunkHash, ChunkLocation)>,
+        mut wanted: Vec<(ChunkHash, ChunkLocation)>,
         index: Arc<PackIndex>,
     ) -> Result<Vec<(ChunkHash, Frame)>, FetchError> {
-        chunks.sort_by_key(|(_, location)| location.offset);
-        let chunk_count = chunks.len();
-        let spans: Vec<(u64, u32)> = chunks
-            .iter()
-            .map(|(_, location)| (location.offset, location.compressed_size))
-            .collect();
-        let ranges = plan_pack_reads(&spans, index.size());
-
+        wanted.sort_by_key(|(_, location)| location.offset);
+        let chunk_count = wanted.len();
         let started = Instant::now();
-        let range_count = ranges.len();
-        let mut range_bytes = 0u64;
-        let mut fetched = Vec::new();
-        for range in ranges {
-            let start = range.start;
-            range_bytes += range.end - range.start;
-            // Read-ahead neighbours get cached too. Slices are in bounds:
-            // the backend fails unless the response is the whole range.
-            let data = self.read_pack_range(pack, range.clone()).await?;
-            for e in chunks_in_range(&index, &range) {
-                let from = (e.offset - start) as usize;
-                let frame = Frame {
-                    zstd: data.slice(from..from + e.compressed_size as usize),
-                    size: e.uncompressed_size,
+        let (mut range_count, mut range_bytes) = (0, 0u64);
+        let mut out: Vec<(ChunkHash, Frame)> = Vec::with_capacity(wanted.len());
+        loop {
+            {
+                let mut cache = self.chunk_cache.lock().expect("chunk cache poisoned");
+                wanted.retain(|(hash, _)| match cache.get(hash) {
+                    Some(frame) => {
+                        out.push((*hash, frame));
+                        false
+                    }
+                    None => true,
+                });
+            }
+            if wanted.is_empty() {
+                break;
+            }
+            // Split what is left into chunks someone is already reading
+            // and chunks this request reads, and announce the latter.
+            let mut waits: BTreeMap<u64, tokio::sync::watch::Receiver<()>> = BTreeMap::new();
+            let (ranges, guard) = {
+                let mut reads = self.pack_reads.lock().expect("pack reads poisoned");
+                let state = reads.entry(pack).or_default();
+                let mut spans = Vec::new();
+                for (_, l) in &wanted {
+                    let end = l.offset.saturating_add(u64::from(l.compressed_size));
+                    match state
+                        .inflight
+                        .iter()
+                        .find(|r| r.range.start <= l.offset && end <= r.range.end)
+                    {
+                        Some(r) => _ = waits.insert(r.id, r.done.clone()),
+                        None => spans.push((l.offset, l.compressed_size)),
+                    }
+                }
+                let ranges = plan_pack_reads(&spans, index.size(), |start| state.window_for(start));
+                state.last_end = ranges.last().map(|r| r.end).or(state.last_end);
+                let (tx, rx) = tokio::sync::watch::channel(());
+                let n = ranges.len() as u64;
+                let first = self
+                    .next_read_id
+                    .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                for (id, range) in (first..).zip(&ranges) {
+                    state.inflight.push(InflightRead {
+                        id,
+                        range: range.clone(),
+                        done: rx.clone(),
+                    });
+                }
+                let guard = ReadGuard {
+                    reads: &self.pack_reads,
+                    pack,
+                    ids: first..first + n,
+                    _done: tx,
                 };
-                fetched.push((e.hash, frame));
+                (ranges, guard)
+            };
+            if !ranges.is_empty() {
+                // One global permit while this talks to the store. The
+                // semaphore is never closed, so acquire cannot fail.
+                let _permit = self
+                    .fetch_semaphore
+                    .acquire()
+                    .await
+                    .expect("fetch semaphore closed");
+                for range in ranges {
+                    range_count += 1;
+                    range_bytes += range.end - range.start;
+                    // Slices are in bounds: the backend fails unless the
+                    // response is the whole range.
+                    let data = self.read_pack_range(pack, range.clone()).await?;
+                    let mut cache = self.chunk_cache.lock().expect("chunk cache poisoned");
+                    for e in chunks_in_range(&index, &range) {
+                        let from = (e.offset - range.start) as usize;
+                        let frame = Frame {
+                            zstd: data.slice(from..from + e.compressed_size as usize),
+                            size: e.uncompressed_size,
+                        };
+                        // Handed over directly: a cache over budget may
+                        // not keep them until the next round.
+                        if let Some(i) = wanted.iter().position(|(h, _)| *h == e.hash) {
+                            wanted.swap_remove(i);
+                            out.push((e.hash, frame.clone()));
+                        }
+                        cache.insert(e.hash, frame);
+                    }
+                }
+            }
+            drop(guard);
+            // A read that failed or whose chunks were evicted again
+            // leaves them wanted, and the next round reads them itself.
+            for mut done in waits.into_values() {
+                let _ = done.changed().await;
             }
         }
         // One line per pack fetch (= per burst of GHA cache traffic): shows
@@ -401,24 +533,26 @@ impl ChunkFetcher {
         // (RUNNER_DEBUG=1).
         if std::env::var_os("RUNNER_DEBUG").is_some_and(|value| value == "1") {
             eprintln!(
-                "hestia substituter: pack {}: {chunk_count} chunks requested, {} fetched \
-                 in {range_count} range reads ({}, {:.1}s)",
+                "hestia substituter: pack {}: {chunk_count} chunks requested                  in {range_count} range reads ({}, {:.1}s)",
                 pack_cache_key(&pack),
-                fetched.len(),
                 crate::drain::human_bytes(range_bytes),
                 started.elapsed().as_secs_f64(),
             );
         }
-        Ok(fetched)
+        Ok(out)
     }
 }
 
 /// Plan the Range reads for one pack: coalesce chunk spans whose gap is at
-/// most [`PACK_FETCH_GAP_BYTES`], extend each read to at least
-/// [`PACK_READ_AHEAD_BYTES`] (clamped to `pack_end`), and merge reads that
-/// the extension made overlap. `spans` are `(offset, size)`, sorted by
-/// offset.
-fn plan_pack_reads(spans: &[(u64, u32)], pack_end: u64) -> Vec<std::ops::Range<u64>> {
+/// most [`PACK_FETCH_GAP_BYTES`], extend each read to at least the
+/// read-ahead `window` for its start (clamped to `pack_end`), and merge
+/// reads that the extension made overlap. `spans` are `(offset, size)`,
+/// sorted by offset.
+fn plan_pack_reads(
+    spans: &[(u64, u32)],
+    pack_end: u64,
+    mut window: impl FnMut(u64) -> u64,
+) -> Vec<std::ops::Range<u64>> {
     let mut runs: Vec<std::ops::Range<u64>> = Vec::new();
     for &(offset, size) in spans {
         // Checked: offsets come from the manifest; a corrupt value near
@@ -433,15 +567,12 @@ fn plan_pack_reads(spans: &[(u64, u32)], pack_end: u64) -> Vec<std::ops::Range<u
     }
     let mut reads: Vec<std::ops::Range<u64>> = Vec::new();
     for run in runs {
-        let read_ahead = run
-            .start
-            .saturating_add(PACK_READ_AHEAD_BYTES)
-            .min(pack_end);
-        let end = run.end.max(read_ahead);
-        match reads.last_mut() {
-            Some(read) if run.start <= read.end => read.end = read.end.max(end),
-            _ => reads.push(run.start..end),
+        if let Some(read) = reads.last_mut().filter(|read| run.start <= read.end) {
+            read.end = read.end.max(run.end);
+            continue;
         }
+        let read_ahead = run.start.saturating_add(window(run.start)).min(pack_end);
+        reads.push(run.start..run.end.max(read_ahead));
     }
     reads
 }
@@ -1197,23 +1328,47 @@ mod tests {
         let gap = PACK_FETCH_GAP_BYTES;
         let ahead = PACK_READ_AHEAD_BYTES;
         let pack_size = 100 * ahead;
+        let plan = |spans: &[(u64, u32)], end| plan_pack_reads(spans, end, |_| ahead);
 
         // Small gap merges, big gap splits.
         let spans = [(0, 100), (gap + 100, 100), (10 * ahead, 100)];
-        let reads = plan_pack_reads(&spans, pack_size);
+        let reads = plan(&spans, pack_size);
         assert_eq!(reads, vec![0..ahead, 10 * ahead..11 * ahead]);
 
         // Read-ahead never runs past the pack end...
-        let reads = plan_pack_reads(&[(pack_size - 50, 50)], pack_size);
+        let reads = plan(&[(pack_size - 50, 50)], pack_size);
         assert_eq!(reads, vec![pack_size - 50..pack_size]);
 
         // ...and never truncates a run that is already larger.
-        let reads = plan_pack_reads(&[(0, u32::MAX)], 100);
+        let reads = plan(&[(0, u32::MAX)], 100);
         assert_eq!(reads, vec![0..u64::from(u32::MAX)]);
 
-        // Runs that only overlap after extension merge into one read.
-        let reads = plan_pack_reads(&[(0, 100), (2 * gap, 100)], pack_size);
-        assert_eq!(reads, vec![0..2 * gap + ahead]);
+        // A run inside the read-ahead of the one before joins its read.
+        let reads = plan(&[(0, 100), (2 * gap, 100)], pack_size);
+        assert_eq!(reads, vec![0..ahead]);
+    }
+
+    #[test]
+    fn read_ahead_grows_on_sequential_reads_and_shrinks_on_scattered_ones() {
+        let mut reads = PackReads::default();
+        let mut at = 0;
+        let mut windows = Vec::new();
+        for _ in 0..4 {
+            let w = reads.window_for(at);
+            windows.push(w);
+            at += w;
+            reads.last_end = Some(at);
+        }
+        let start = PACK_READ_AHEAD_START;
+        assert_eq!(windows, vec![start, 2 * start, 4 * start, 4 * start]);
+        assert_eq!(4 * start, PACK_READ_AHEAD_BYTES);
+
+        let far = 1 << 40;
+        for i in 1..=8 {
+            let w = reads.window_for(i * far);
+            reads.last_end = Some(i * far + w);
+        }
+        assert_eq!(reads.window, PACK_READ_AHEAD_MIN);
     }
 
     #[test]

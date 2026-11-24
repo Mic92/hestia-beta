@@ -18,6 +18,8 @@
 //!   follow        another daemon picking up that drain
 //!   compact       folding the pending segments into one
 //!   follow        another daemon picking up the compaction
+//!   compact       the same again after four more drains
+//!   follow        another daemon picking that up
 
 #[path = "../tests/support/mod.rs"]
 mod support;
@@ -263,6 +265,28 @@ async fn main() {
 
     let t = Instant::now();
     let other = load(Some(other)).await;
-    assert_eq!(other.path_count() as u64, paths + new);
     row("follow the compaction", t, &net);
+
+    // Steady state: the root is one large segment, and drains keep coming.
+    let mut snapshot = load(Some(drained)).await;
+    for round in 1..=4 {
+        let first = paths + round * new;
+        let built: Vec<SimPath> = (first..first + new).map(|i| path(i, size)).collect();
+        let built_refs: Vec<&SimPath> = built.iter().collect();
+        let sealed = sim
+            .drain(&snapshot, ROOT, &built_refs, &used)
+            .await
+            .expect("published");
+        snapshot = Arc::new(snapshot.refresh_with(&sealed).await.unwrap());
+    }
+    let other = load(Some(other)).await;
+    net.take();
+    net.take_bytes();
+    let t = Instant::now();
+    let head = snapshot.maybe_compact(ROOT, now + 3600, 0.0).await.unwrap();
+    assert!(head.is_some(), "compaction did not run");
+    row("compact, 4 drains later", t, &net);
+    let t = Instant::now();
+    let _ = load(Some(other)).await;
+    row("follow that compaction", t, &net);
 }

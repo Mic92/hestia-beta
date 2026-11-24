@@ -360,11 +360,15 @@ impl Snapshot {
         .await
     }
 
-    /// Fold `root`'s pending segments into one `c-*` when this drain
+    /// Fold pending segments of `root` into one `c-*` when this drain
     /// elects itself: enough are pending, no compaction for the root is in
     /// flight, and `coin` (uniform in 0..1) beats odds that let about one
     /// of the drains expected within the window win. Frees nothing, only
     /// shortens the next reader's load.
+    ///
+    /// Only segments of similar size are folded (see [`compaction_set`]):
+    /// folding all of them rewrote the whole root for every few drains,
+    /// and every reader then fetched it again.
     pub async fn maybe_compact(
         &self,
         root: &str,
@@ -375,26 +379,37 @@ impl Snapshot {
             return Ok(None);
         };
         let id = root_id(root);
-        let created = |key: &str| HeadName::parse(key).map_or(now, |h| h.time());
         let in_flight = self.listed.iter().any(|l| {
             matches!(HeadName::parse(&l.key), Some(HeadName::Compaction { root, time, .. })
                 if root == id && time + COMPACT_WINDOW > now)
         });
         // Head and segment stay paired so `subsumes` never names a head
         // whose segment `replaces` lacks.
-        let pending: Vec<(&str, &Arc<Segment>)> = self
+        let mut pending: Vec<(&str, &Arc<Segment>)> = self
             .view
             .heads
             .iter()
             .filter(|(_, d)| live.contains(d))
             .filter_map(|(n, d)| Some((n.as_str(), self.segments.iter().find(|s| s.digest == *d)?)))
             .collect();
+        pending.sort_by_key(|(_, s)| s.meta.len());
+        let sizes: Vec<usize> = pending.iter().map(|(_, s)| s.meta.len()).collect();
+        let pending = &pending[compaction_set(&sizes)];
         if in_flight || pending.len() < COMPACT_MIN {
             return Ok(None);
         }
-        let oldest = pending.iter().map(|(n, _)| created(n)).min().unwrap_or(now);
+        // The rate of drains, from the drain heads about to be folded: a
+        // head that has been pending for long says nothing about it.
+        let drains: Vec<u64> = pending
+            .iter()
+            .filter_map(|(n, _)| match HeadName::parse(n)? {
+                HeadName::Drain { time, .. } => Some(time),
+                _ => None,
+            })
+            .collect();
+        let oldest = drains.iter().copied().min().unwrap_or(now);
         let expected =
-            pending.len() as f64 * COMPACT_WINDOW as f64 / now.saturating_sub(oldest).max(1) as f64;
+            drains.len() as f64 * COMPACT_WINDOW as f64 / now.saturating_sub(oldest).max(1) as f64;
         if coin * expected.max(1.0) >= 1.0 {
             return Ok(None);
         }
@@ -725,6 +740,30 @@ pub fn push_entry(
 /// and how long a published `c-*` holds off the next attempt.
 const COMPACT_MIN: usize = 4;
 const COMPACT_WINDOW: u64 = 60;
+/// A segment joins a compaction when it has at most this many times the
+/// entries of all smaller pending segments together.
+const COMPACT_RATIO: usize = 4;
+
+/// Which of the pending segments to fold, given their entry counts in
+/// ascending order: the first run of at least [`COMPACT_MIN`] in which
+/// each segment is not more than [`COMPACT_RATIO`] times those before it
+/// in the run. A large segment is thus rewritten only once smaller ones
+/// add up to a fair share of it, which leaves a root with a number of
+/// segments logarithmic in its size and rewrites each entry as often.
+fn compaction_set(sizes: &[usize]) -> std::ops::Range<usize> {
+    for start in 0..sizes.len() {
+        let mut folded = sizes[start];
+        let mut end = start + 1;
+        while end < sizes.len() && sizes[end] <= COMPACT_RATIO.saturating_mul(folded) {
+            folded = folded.saturating_add(sizes[end]);
+            end += 1;
+        }
+        if end - start >= COMPACT_MIN {
+            return start..end;
+        }
+    }
+    0..0
+}
 
 async fn put_segment(backend: &Backend, sealed: &Sealed) -> Result<SegDigest, Error> {
     let (tree, meta) = (tree_key(&sealed.tree_digest()), meta_key(&sealed.digest()));
@@ -787,4 +826,28 @@ pub async fn publish(
     }
     backend.put(&name, body.into()).await?;
     Ok(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compaction_set;
+
+    #[test]
+    fn compaction_leaves_segments_much_larger_than_the_rest() {
+        // Drains of similar size all fold.
+        assert_eq!(compaction_set(&[10, 10, 12, 15]), 0..4);
+        // The root's large segment stays until the small ones add up.
+        assert_eq!(compaction_set(&[10, 10, 10, 10, 1_000_000]), 0..4);
+        assert_eq!(compaction_set(&[10, 10, 10, 250_000, 1_000_000]), 0..0);
+        assert_eq!(compaction_set(&[10, 10, 10, 100, 1_000_000]), 0..4);
+        assert_eq!(
+            compaction_set(&[100_000, 100_000, 100_000, 1_000_000]),
+            0..4
+        );
+        // One small segment does not hold up a pile of larger ones.
+        assert_eq!(compaction_set(&[10, 5000, 5000, 5000, 5000]), 1..5);
+        // Tiers that each dwarf the one below are left as they are.
+        assert_eq!(compaction_set(&[1, 100, 10_000, 1_000_000]), 0..0);
+        assert_eq!(compaction_set(&[]), 0..0);
+    }
 }

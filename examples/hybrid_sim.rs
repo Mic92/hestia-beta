@@ -6,6 +6,7 @@
 //!   cargo run --release --example hybrid_sim -- --fine-machines 0 --coarse-machines 500
 //!   cargo run --release --example hybrid_sim -- --object-bytes 10000
 //!   cargo run --release --example hybrid_sim -- --measured
+//!   cargo run --release --example hybrid_sim -- --step-s 0.3 --lookups 28 --object-bytes 33000
 //!
 //! A design is a set of knobs (`Design`). `evaluate` turns it into dollars a
 //! day: builder time spent waiting on the cache, node hardware, bucket
@@ -35,6 +36,9 @@ use common::Rng;
 const DAY: f64 = 86400.0;
 /// `--object-bytes`: compressed size of a compiled object.
 static OBJECT_BYTES: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+/// `--step-s`, `--lookups`: seconds a compile takes and inputs it looks up.
+static FINE_STEP_S: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+static FINE_LOOKUPS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 const GB: f64 = 1e9;
 const KEY_ROW: f64 = 32.0;
 const PACK_BYTES: f64 = 64.0 * 1048576.0;
@@ -177,12 +181,13 @@ struct Class {
 /// A compiled object per step: scale_sim's `--fine`.
 fn fine(machines: f64) -> Class {
     let object = *OBJECT_BYTES.get().unwrap_or(&17000.0);
+    let step_s = *FINE_STEP_S.get().unwrap_or(&10.0);
     Class {
         name: "fine",
-        steps_per_s: machines * 16.0 / 10.0,
-        step_s: 10.0,
+        steps_per_s: machines * 16.0 / step_s,
+        step_s,
         slot: 1.0 / 16.0,
-        lookups: 30.0,
+        lookups: *FINE_LOOKUPS.get().unwrap_or(&30.0),
         fetches: 2.0,
         fetch_bytes: object,
         outputs: 1.0,
@@ -368,6 +373,9 @@ struct Report {
     /// Dollars a day, in the order of `TERMS`.
     terms: [f64; 8],
     infeasible: Option<String>,
+    /// How far past its limits an infeasible design is: what the search
+    /// descends on until something works.
+    over: f64,
     wait_s: [f64; 2],
     ram_gb: f64,
     ssd_gb: f64,
@@ -385,6 +393,16 @@ impl Report {
             f64::INFINITY
         } else {
             self.terms.iter().sum()
+        }
+    }
+
+    /// What the search minimises: dollars, or far above any dollars and
+    /// growing with the overrun.
+    fn search_cost(&self) -> f64 {
+        if self.infeasible.is_some() {
+            1e12 * (1.0 + self.over)
+        } else {
+            self.total()
         }
     }
 }
@@ -443,6 +461,7 @@ fn evaluate_embedded(d: &Design, classes: &[Class; 2], w: &World) -> Report {
         }
         if !d.bucket[i] {
             r.infeasible = Some(format!("{} has nowhere to go without nodes", c.name));
+            r.over += 10.0;
         }
         let saved = if d.sampled[i] { c.sample_saves } else { 0.0 };
         let samples = if d.sampled[i] { c.sample_rows } else { 0.0 };
@@ -502,6 +521,7 @@ fn evaluate_embedded(d: &Design, classes: &[Class; 2], w: &World) -> Report {
     r.terms[4] = (bucket_data + live_index) / GB * w.store_gb_day;
     r.terms[5] = up / GB * w.upload_gb + down / GB * w.download_gb;
     if up / DAY > UPLINK_BPS {
+        r.over += up / DAY / UPLINK_BPS;
         r.infeasible = Some(format!("the uplink would carry {:.0} MB/s", up / DAY / 1e6));
     }
     r
@@ -555,6 +575,7 @@ fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
         body_bytes += live * (row_bytes - KEY_ROW * (1.0 + samples));
 
         if !d.bucket[i] && d.cache_days[i] < c.window_days {
+            r.over += 10.0;
             r.infeasible = Some(format!(
                 "{} is in no bucket and expires on the nodes",
                 c.name
@@ -660,9 +681,11 @@ fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
     r.ram_gb = ram / GB;
     r.ssd_gb = ssd / GB;
     if ram > NODE_RAM_MAX {
+        r.over += ram / NODE_RAM_MAX;
         r.infeasible = Some(format!("a node needs {:.0} GB of memory", ram / GB));
     }
     if ssd > NODE_SSD_MAX {
+        r.over += ssd / NODE_SSD_MAX;
         r.infeasible = Some(format!("a node needs {:.0} GB of disk", ssd / GB));
     }
     let machine = if d.hosted { 0.0 } else { w.node_per_day };
@@ -675,6 +698,7 @@ fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
     cpu += index_up / DAY * nd().merge_byte_s;
     r.load = cpu / (d.nodes * NODE_CORES);
     if r.load > MAX_LOAD {
+        r.over += r.load / MAX_LOAD;
         r.infeasible = Some(format!("nodes are {:.0}% busy", r.load * 100.0));
     }
     let queue = 1.0 / (1.0 - r.load.min(0.99));
@@ -687,6 +711,7 @@ fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
     r.up_gb_per_day = (up_bps * DAY + index_up) / GB;
     r.puts_per_day = data_puts + index_puts;
     if up_bps + index_up / DAY > UPLINK_BPS {
+        r.over += (up_bps + index_up / DAY) / UPLINK_BPS;
         r.infeasible = Some(format!(
             "the uplink would carry {:.0} MB/s",
             (up_bps + index_up / DAY) / 1e6
@@ -919,7 +944,11 @@ fn improve_within(
                 continue;
             }
             let r = evaluate(&next, classes, w, rpc);
-            if r.total() < best.as_ref().map_or(report.total(), |b| b.2.total()) {
+            if r.search_cost()
+                < best
+                    .as_ref()
+                    .map_or(report.search_cost(), |b| b.2.search_cost())
+            {
                 best = Some((name, next, r));
             }
         }
@@ -937,6 +966,8 @@ fn improve_within(
                 .unwrap();
             let why = if report.total().is_finite() {
                 format!("{term} {delta:+.2}")
+            } else if let Some(reason) = &r.infeasible {
+                format!("still infeasible: {reason}")
             } else {
                 "feasible".into()
             };
@@ -1074,6 +1105,12 @@ fn main() {
             "--coarse-machines" => coarse_machines = value,
             "--object-bytes" => {
                 OBJECT_BYTES.set(value).ok();
+            }
+            "--step-s" => {
+                FINE_STEP_S.set(value).ok();
+            }
+            "--lookups" => {
+                FINE_LOOKUPS.set(value).ok();
             }
             other => {
                 eprintln!("unknown flag {other}");

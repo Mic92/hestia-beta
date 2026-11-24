@@ -581,9 +581,10 @@ impl PipelineContext {
             known_chunks.add(pack.hash, &pack.index());
         }
 
-        // The segment is this drain's whole claim on the root: pushed,
-        // already stored, and substituted paths. GC keeps what drains since
-        // its last run named and drops the rest of the root.
+        // The segment is this drain's whole claim on the root: entries for
+        // what it pushed, and the hashes of stored and substituted paths
+        // it used. GC keeps what drains since its last run pushed or used
+        // and drops the rest of the root.
         let mut writer = SegmentWriter::default();
         for entry in &prepared {
             store::push_entry(&mut writer, entry, &known_chunks)
@@ -591,8 +592,8 @@ impl PipelineContext {
         }
         stats.pushed = prepared.len();
         for hash in &root_paths {
-            if !writer.contains(hash) {
-                snapshot.copy_entry(hash, &mut writer).await?;
+            if !writer.contains(hash) && snapshot.contains(hash) {
+                writer.use_path(hash);
             }
         }
         if writer.is_empty() {

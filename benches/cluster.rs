@@ -254,7 +254,7 @@ async fn main() {
 
     let t = Instant::now();
     let other = load(Some(other)).await;
-    assert_eq!(other.path_count() as u64, paths + new + used.len() as u64);
+    assert_eq!(other.path_count() as u64, paths + new);
     row("follow the drain", t, &net);
 
     let t = Instant::now();

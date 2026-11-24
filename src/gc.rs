@@ -4,16 +4,18 @@
 //! deleter and the only clock (`docs/spec/segments.qnt`).
 
 use std::collections::{BTreeSet, HashMap};
+
+use bytes::Bytes;
 use std::process::ExitCode;
 
 use crate::backend::{self, Backend, Listed};
 use crate::chunker::{PackBuilder, coalesce_adjacent, extract_chunk, pack_cache_key};
 use crate::cli::GcArgs;
 use crate::heads::{GcRecord, HeadName, RootId, RootRow, root_id};
-use crate::manifest::{ChunkHash, PackHash, SegDigest};
+use crate::manifest::{ChunkHash, PackHash, PathHash, SegDigest};
 use crate::pipeline::{now_unix, upload_pack};
 use crate::segment::{self, Meta, PackRow, Relocated, Tree};
-use crate::store::{self, Heads, fetch_pack_index, meta_key, tree_key};
+use crate::store::{self, Heads, fetch_pack_index, meta_key, tree_key, uses_key};
 use crate::trust::Trust;
 
 pub const SECS_PER_HOUR: u64 = 3_600;
@@ -89,6 +91,17 @@ struct Root {
     name: String,
     stamp: u64,
     inputs: Vec<(SegDigest, Meta)>,
+    /// Segments outside the inputs holding paths the inputs name as used.
+    pool: Vec<Pooled>,
+}
+
+/// A segment some of whose paths a root's inputs name as used.
+struct Pooled {
+    meta: Meta,
+    tree: Tree,
+    wanted: BTreeSet<PathHash>,
+    /// Per pack row, the chunks the wanted paths need.
+    live_bits: Vec<Vec<u8>>,
 }
 
 /// Live chunks of one pack, OR-ed over every input segment.
@@ -154,6 +167,7 @@ impl Repacker {
 fn object_keys(seg: &SegDigest, meta: &Meta) -> impl Iterator<Item = String> {
     [meta_key(seg), tree_key(&meta.tree)]
         .into_iter()
+        .chain(meta.uses.iter().map(uses_key))
         .chain(meta.packs.iter().map(|p| pack_cache_key(&p.hash)))
 }
 
@@ -191,8 +205,10 @@ impl Gc {
             .filter_map(|l| Some((PackHash::from_hex(l.key.strip_prefix("pack-")?)?, l)))
             .collect();
 
-        // Roots: a drain's segment names every path it wants kept, so once
-        // any drain published, the previous GC segment is not an input.
+        // Roots: a drain's segment names every path it wants kept, by entry
+        // or as used, so once any drain published, the previous GC segment
+        // is not an input. Used paths are taken from wherever they are
+        // stored: that segment first, then any other live one.
         let prev_rows: HashMap<&str, &RootRow> = prev
             .into_iter()
             .flat_map(|g| g.roots.iter().map(|r| (r.name.as_str(), r)))
@@ -207,7 +223,9 @@ impl Gc {
             })
             .collect();
         let mut roots = Vec::new();
-        let mut retired: BTreeSet<SegDigest> = heads.view.segments();
+        let all_segments = heads.view.segments();
+        let mut bodies: HashMap<SegDigest, Option<Bytes>> = HashMap::new();
+        let mut retired: BTreeSet<SegDigest> = all_segments.clone();
         for (name, segs) in &heads.view.roots {
             let base = prev_rows.get(name.as_str());
             let stamp = match base {
@@ -228,25 +246,108 @@ impl Gc {
                     None => eprintln!("hestia gc: segment {d} of {name} is gone, so are its paths"),
                 }
             }
+            let mut used: BTreeSet<PathHash> = BTreeSet::new();
+            for (d, meta) in &inputs {
+                match store::fetch_uses(&self.backend, meta).await {
+                    Ok(u) => used.extend(u),
+                    Err(store::Error::Missing(_)) => {
+                        eprintln!("hestia gc: what segment {d} of {name} used is gone")
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            used.retain(|h| !inputs.iter().any(|(_, m)| m.find(h).is_some()));
+            let mut pool = Vec::new();
+            let held: BTreeSet<SegDigest> = inputs.iter().map(|(d, _)| *d).collect();
+            let own_base = base.map(|b| b.seg).filter(|b| segs.contains(b));
+            let elsewhere = all_segments
+                .iter()
+                .copied()
+                .filter(|d| Some(*d) != own_base);
+            for d in own_base.into_iter().chain(elsewhere) {
+                if used.is_empty() {
+                    break;
+                }
+                if held.contains(&d) {
+                    continue;
+                }
+                let body = match bodies.get(&d) {
+                    Some(body) => body.clone(),
+                    None => {
+                        let body = self.backend.get(&meta_key(&d), None).await?;
+                        bodies.insert(d, body.clone());
+                        body
+                    }
+                };
+                let Some(body) = body else {
+                    continue;
+                };
+                let meta = Meta::open(&body)?;
+                let here: BTreeSet<PathHash> = used
+                    .iter()
+                    .filter(|h| meta.find(h).is_some())
+                    .cloned()
+                    .collect();
+                if here.is_empty() {
+                    continue;
+                }
+                used.retain(|h| !here.contains(h));
+                let Some(tree) = self.backend.get(&tree_key(&meta.tree), None).await? else {
+                    eprintln!("hestia gc: the tree of segment {d} is gone, so are its paths");
+                    continue;
+                };
+                let tree = Tree::open(&tree)?;
+                let mut live_bits = vec![Vec::new(); meta.packs.len()];
+                for h in &here {
+                    let i = meta.find(h).expect("found above");
+                    tree.node(i)?.for_each_chunk(&mut |c| {
+                        let bits: &mut Vec<u8> = &mut live_bits[c.pack as usize];
+                        let at = c.chunk as usize;
+                        if bits.len() <= at / 8 {
+                            bits.resize(at / 8 + 1, 0);
+                        }
+                        bits[at / 8] |= 1 << (at % 8);
+                    });
+                }
+                pool.push(Pooled {
+                    meta,
+                    tree,
+                    wanted: here,
+                    live_bits,
+                });
+            }
             roots.push(Root {
                 name: name.clone(),
                 stamp,
                 inputs,
+                pool,
             });
         }
 
         // Repack packs whose live ratio over all inputs is too low.
         let mut usage: HashMap<PackHash, PackUse> = HashMap::new();
-        for (_, meta) in roots.iter().flat_map(|r| &r.inputs) {
-            for row in &meta.packs {
-                usage
-                    .entry(row.hash)
-                    .or_insert(PackUse {
-                        row: PackRow::new(row.hash, row.size, row.chunks),
-                        bits: Vec::new(),
-                    })
-                    .add(&row.live_bits);
+        let rows = roots.iter().flat_map(|r| {
+            let inputs = r
+                .inputs
+                .iter()
+                .flat_map(|(_, m)| m.packs.iter().map(|row| (row, &row.live_bits)));
+            let pooled = r
+                .pool
+                .iter()
+                .flat_map(|p| p.meta.packs.iter().zip(&p.live_bits));
+            inputs.chain(pooled)
+        });
+        for (row, bits) in rows {
+            if bits.iter().all(|b| *b == 0) {
+                continue;
             }
+            usage
+                .entry(row.hash)
+                .or_insert(PackUse {
+                    row: PackRow::new(row.hash, row.size, row.chunks),
+                    bits: Vec::new(),
+                })
+                .add(bits);
         }
         let mut lost: BTreeSet<PackHash> = usage
             .keys()
@@ -282,11 +383,12 @@ impl Gc {
         for root in roots {
             let clean = root.inputs.len() == 1
                 && heads.view.roots[&root.name].len() == 1
+                && root.inputs[0].1.uses.is_none()
                 && !touched(&root.inputs[0].1);
             let (seg, meta) = if clean {
                 root.inputs.into_iter().next().unwrap()
             } else {
-                self.merge(&root.inputs, &lost, &repacker, &mut stats)
+                self.merge(&root.inputs, &root.pool, &lost, &repacker, &mut stats)
                     .await?
             };
             live_packs.extend(meta.packs.iter().map(|p| p.hash));
@@ -409,10 +511,12 @@ impl Gc {
     async fn merge(
         &self,
         inputs: &[(SegDigest, Meta)],
+        pool: &[Pooled],
         lost: &BTreeSet<PackHash>,
         repacker: &Repacker,
         stats: &mut GcStats,
     ) -> Result<(SegDigest, Meta), Error> {
+        // The pool goes first: an input's own entry for a path wins.
         let mut trees = Vec::new();
         for (_, m) in inputs {
             let body = self
@@ -422,8 +526,14 @@ impl Gc {
                 .ok_or_else(|| store::Error::Missing(tree_key(&m.tree)))?;
             trees.push(Tree::open(&body)?);
         }
-        let pairs: Vec<(&Meta, &Tree)> = inputs.iter().map(|(_, m)| m).zip(&trees).collect();
-        let (sealed, dropped) = segment::merge(&pairs, |row, i| {
+        let pairs: Vec<(&Meta, &Tree)> = pool
+            .iter()
+            .map(|p| (&p.meta, &p.tree))
+            .chain(inputs.iter().map(|(_, m)| m).zip(&trees))
+            .collect();
+        let wanted =
+            |at: usize, hash: &PathHash| pool.get(at).is_none_or(|p| p.wanted.contains(hash));
+        let (sealed, dropped) = segment::merge(&pairs, &[], wanted, |row: &PackRow, i| {
             if lost.contains(&row.hash) {
                 return None;
             }

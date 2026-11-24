@@ -6,8 +6,13 @@
 //!           body = u8 name_len | name | cbor MetaBody
 //! .tree   = "HST1" | u32 index_len | index | u32 frames | u32 frame_end[frames] | zstd frames
 //!           body = cbor Node, TREE_FRAME_ENTRIES bodies per frame
+//! .uses  = "HSU1" | u32 n | 20 B PathHash[n] sorted
 //! pack index = "HSP1" | u32 n | (16 B ChunkHash, u64 offset, u32 compressed, u32 raw)[n]
 //! ```
+//!
+//! `.uses` lists paths the writer used and wants kept without holding
+//! their entries: a drain names its whole closure this way instead of
+//! copying every entry. Only compaction and GC read it.
 //!
 //! `.meta` is fetched whole and bodies are decoded on lookup. `.tree` keeps
 //! bodies compressed and inflates one frame at a time. The pack table is in
@@ -26,6 +31,7 @@ use crate::manifest::{
 const MAGIC_META: &[u8; 4] = b"HSM1";
 const MAGIC_TREE: &[u8; 4] = b"HST1";
 const MAGIC_PACK_INDEX: &[u8; 4] = b"HSP1";
+const MAGIC_USES: &[u8; 4] = b"HSU1";
 const ZSTD_LEVEL: i32 = 9;
 pub const TREE_FRAME_ENTRIES: usize = 256;
 
@@ -132,6 +138,9 @@ struct Header {
     /// `None` is 0, kept optional so older segments decode.
     #[n(2)]
     features: Option<u32>,
+    /// Digest of the `.uses` object, if the writer used paths it does not hold.
+    #[n(3)]
+    uses: Option<SegDigest>,
 }
 
 /// A chunk by location: row in the segment's pack table, entry in that pack's index.
@@ -361,6 +370,8 @@ pub struct Meta {
     pub packs: Vec<PackRow>,
     /// Digest of the `.tree` that goes with it.
     pub tree: SegDigest,
+    /// Digest of the `.uses` that goes with it, if any.
+    pub uses: Option<SegDigest>,
     pub features: u32,
     index: Index,
     bodies: Vec<u8>,
@@ -403,6 +414,7 @@ impl Meta {
         let mut meta = Meta {
             packs: header.packs,
             tree: header.tree,
+            uses: header.uses,
             features: header.features.unwrap_or(0),
             index,
             bodies: raw,
@@ -603,6 +615,7 @@ impl Tree {
 pub struct Sealed {
     pub meta: Vec<u8>,
     pub tree: Vec<u8>,
+    pub uses: Option<Vec<u8>>,
 }
 
 impl Sealed {
@@ -613,6 +626,24 @@ impl Sealed {
     pub fn tree_digest(&self) -> SegDigest {
         SegDigest::digest(&self.tree)
     }
+    pub fn uses_digest(&self) -> Option<SegDigest> {
+        self.uses.as_deref().map(SegDigest::digest)
+    }
+}
+
+/// Decode a `.uses` object.
+pub fn decode_uses(bytes: &[u8]) -> Result<Vec<PathHash>, Error> {
+    if bytes.get(..4) != Some(MAGIC_USES) {
+        return Err(bad("not a .uses object"));
+    }
+    let n = read_u32(bytes, 4)?;
+    if n > MAX_ENTRIES || bytes.len() != 8 + n * 20 {
+        return Err(bad(".uses length mismatch"));
+    }
+    Ok(bytes[8..]
+        .chunks_exact(20)
+        .map(|b| PathHash(StorePathHash::new(b.try_into().unwrap())))
+        .collect())
 }
 
 /// Builds one segment. Entries may arrive in any order. The same key pushed
@@ -622,6 +653,7 @@ pub struct SegmentWriter {
     packs: Vec<PackRow>,
     pack_pos: HashMap<PackHash, u16>,
     entries: BTreeMap<Key, Entry>,
+    uses: BTreeSet<Key>,
 }
 
 impl SegmentWriter {
@@ -635,6 +667,7 @@ impl SegmentWriter {
             packs,
             pack_pos,
             entries: BTreeMap::new(),
+            uses: BTreeSet::new(),
         }
     }
 
@@ -651,12 +684,18 @@ impl SegmentWriter {
         self.packs.iter().map(|p| p.hash)
     }
 
+    /// Nothing to publish: no entry and no used path.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.uses.is_empty()
     }
 
     pub fn contains(&self, hash: &PathHash) -> bool {
         self.entries.contains_key(key_of(hash))
+    }
+
+    /// Name a path stored elsewhere as used, so GC keeps it.
+    pub fn use_path(&mut self, hash: &PathHash) {
+        self.uses.insert(*key_of(hash));
     }
 
     pub fn push(&mut self, entry: Entry) {
@@ -771,10 +810,21 @@ impl SegmentWriter {
         }
         tree.extend(&frames);
 
+        self.uses.retain(|k| !self.entries.contains_key(k));
+        let uses = (!self.uses.is_empty()).then(|| {
+            let mut out = Vec::with_capacity(8 + self.uses.len() * 20);
+            out.extend(MAGIC_USES);
+            push_u32(&mut out, self.uses.len());
+            for k in &self.uses {
+                out.extend(k);
+            }
+            out
+        });
         let header = Header {
             packs: self.packs,
             tree: SegDigest::digest(&tree),
             features: None,
+            uses: uses.as_deref().map(SegDigest::digest),
         };
         let header = minicbor::to_vec(header).expect("Vec write");
         let mut meta = Vec::new();
@@ -782,7 +832,7 @@ impl SegmentWriter {
         push_u32(&mut meta, header.len());
         meta.extend(&header);
         meta.extend(zstd::bulk::compress(&meta_raw, ZSTD_LEVEL)?);
-        Ok(Sealed { meta, tree })
+        Ok(Sealed { meta, tree, uses })
     }
 }
 
@@ -790,16 +840,23 @@ impl SegmentWriter {
 pub type Relocated = (PackHash, u64, u32, u16);
 
 /// Merge segments of one root: later inputs win on the same key, pack
-/// tables are unioned and unreferenced packs dropped. `relocate` maps a
-/// chunk of an input pack row to its current home, `None` drops the entry
-/// (its pack is gone). Returns how many paths were dropped.
+/// tables are unioned and unreferenced packs dropped. `keep` says whether
+/// an entry of the input at that position is wanted at all. `relocate`
+/// maps a chunk of an input pack row to its current home, `None` drops the
+/// entry (its pack is gone). `uses` are named as used unless an entry for
+/// them made it in. Returns how many paths were dropped.
 pub fn merge(
     inputs: &[(&Meta, &Tree)],
+    uses: &[PathHash],
+    keep: impl Fn(usize, &PathHash) -> bool,
     relocate: impl Fn(&PackRow, u16) -> Option<Relocated>,
 ) -> Result<(Sealed, usize), Error> {
     let mut writer = SegmentWriter::default();
+    for hash in uses {
+        writer.use_path(hash);
+    }
     let mut dropped = BTreeSet::new();
-    for (meta, tree) in inputs {
+    for (at, (meta, tree)) in inputs.iter().enumerate() {
         if meta.features & !KNOWN_FEATURES != 0 {
             return Err(bad(format!(
                 "segment uses format features {:#x} this build cannot rewrite",
@@ -810,6 +867,9 @@ pub fn merge(
             return Err(bad(".meta and .tree disagree on entry count"));
         }
         'entries: for i in 0..meta.len() {
+            if !keep(at, &meta.hash(i)) {
+                continue;
+            }
             let mut node = tree.node(i)?;
             let mut lost = false;
             node.map_chunks(
@@ -1086,9 +1146,12 @@ mod tests {
 
         let (ma, ta, _) = roundtrip(vec![e1.clone(), e2_old, lost.clone()], pa);
         let (mb, tb, _) = roundtrip(vec![e2_new.clone(), e3.clone()], pb);
-        let sealed = merge(&[(&ma, &ta), (&mb, &tb)], |row, c| {
-            (row.hash != gone).then_some((row.hash, row.size, row.chunks, c))
-        })
+        let sealed = merge(
+            &[(&ma, &ta), (&mb, &tb)],
+            &[],
+            |_, _| true,
+            |row: &PackRow, c| (row.hash != gone).then_some((row.hash, row.size, row.chunks, c)),
+        )
         .unwrap()
         .0;
         let (m, t) = (
@@ -1118,7 +1181,7 @@ mod tests {
         let (mut meta, tree, _) = roundtrip(vec![entry(1, &[], &[c(0, 0)])], packs(1));
         meta.features = 1 << 31;
         assert!(matches!(
-            merge(&[(&meta, &tree)], in_place),
+            merge(&[(&meta, &tree)], &[], |_, _| true, in_place),
             Err(Error::Format(_))
         ));
     }
@@ -1132,7 +1195,7 @@ mod tests {
         assert_eq!(meta.realisation("b.drv^lib"), Some(i));
         assert_eq!(meta.realisation("b.drv^out"), None);
         assert_eq!(meta.entry(i, e.tree.clone()).realises, e.realises);
-        let (sealed, _) = merge(&[(&meta, &tree)], in_place).unwrap();
+        let (sealed, _) = merge(&[(&meta, &tree)], &[], |_, _| true, in_place).unwrap();
         let merged = Meta::open(&sealed.meta).unwrap();
         assert_eq!(merged.realisation("a.drv^out"), merged.find(&e.key()));
     }
@@ -1140,7 +1203,7 @@ mod tests {
     #[test]
     fn merge_drops_unreferenced_packs() {
         let (m, t, _) = roundtrip(vec![entry(1, &[], &[c(2, 0)])], packs(3));
-        let (sealed, _) = merge(&[(&m, &t)], in_place).unwrap();
+        let (sealed, _) = merge(&[(&m, &t)], &[], |_, _| true, in_place).unwrap();
         let m2 = Meta::open(&sealed.meta).unwrap();
         assert_eq!(
             m2.packs.iter().map(|p| p.hash).collect::<Vec<_>>(),

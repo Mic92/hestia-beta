@@ -40,6 +40,17 @@ pub fn meta_key(d: &SegDigest) -> String {
 pub fn tree_key(d: &SegDigest) -> String {
     format!("tree-{d}")
 }
+pub fn uses_key(d: &SegDigest) -> String {
+    format!("use-{d}")
+}
+
+/// The paths a segment names as used without holding them.
+pub async fn fetch_uses(backend: &Backend, meta: &Meta) -> Result<Vec<PathHash>, Error> {
+    match &meta.uses {
+        Some(d) => Ok(segment::decode_uses(&fetch(backend, &uses_key(d)).await?)?),
+        None => Ok(Vec::new()),
+    }
+}
 
 pub struct Segment {
     pub digest: SegDigest,
@@ -419,7 +430,16 @@ impl Snapshot {
             .zip(trees)
             .map(|((_, s), t)| (&s.meta, t))
             .collect();
-        let (sealed, _) = segment::merge(&inputs, segment::in_place)?;
+        let uses: Vec<PathHash> = try_join_all(
+            pending
+                .iter()
+                .map(|(_, s)| fetch_uses(&self.backend, &s.meta)),
+        )
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
+        let (sealed, _) = segment::merge(&inputs, &uses, |_, _| true, segment::in_place)?;
         let record = CompactionRecord {
             root: root.to_owned(),
             added: put_segment(&self.backend, &sealed).await?,
@@ -767,6 +787,9 @@ fn compaction_set(sizes: &[usize]) -> std::ops::Range<usize> {
 
 async fn put_segment(backend: &Backend, sealed: &Sealed) -> Result<SegDigest, Error> {
     let (tree, meta) = (tree_key(&sealed.tree_digest()), meta_key(&sealed.digest()));
+    if let (Some(uses), Some(d)) = (&sealed.uses, sealed.uses_digest()) {
+        backend.put(&uses_key(&d), uses.clone().into()).await?;
+    }
     tokio::try_join!(
         backend.put(&tree, sealed.tree.clone().into()),
         backend.put(&meta, sealed.meta.clone().into()),

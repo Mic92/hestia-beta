@@ -83,7 +83,7 @@ fn object(key: &str) -> String {
     };
     let dir = match kind {
         "pack" => "pack",
-        "seg" | "tree" => "seg",
+        "seg" | "tree" | "use" => "seg",
         _ => return format!("heads/{key}"),
     };
     match hash.get(..2) {

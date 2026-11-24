@@ -347,7 +347,10 @@ async fn gc_over_dav() {
         sim.push("main", &[], &[&a, &b]).await;
         let stats = sim.run_gc(policy, T0 + 4 * HOUR).await;
         assert!(stats.deleted >= 1, "retired segment: {stats:?}");
-        assert_eq!((count("pack"), count("seg")), (2, 1));
+        // The compacted segment, and what it was made from, which stays
+        // for one more run: the previous compacted segment and the
+        // drain's, which only named what it used.
+        assert_eq!((count("pack"), count("seg")), (2, 3));
         sim.assert_readable(&[&a, &b]).await;
         sim.assert_no_dangling_references().await;
     })

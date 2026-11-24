@@ -36,6 +36,44 @@ async fn stored_pack_bytes(fake: &FakeGha, sim: &SimCache) -> u64 {
     packs.iter().map(|e| e.size_in_bytes).sum()
 }
 
+/// A drain names stored paths it used by hash only. GC takes their entries
+/// from the root's previous segment and drops what no drain named.
+#[tokio::test]
+async fn used_paths_are_kept_and_unused_ones_dropped() {
+    timed(async {
+        let (fake, sim) = setup().await;
+        let a = SimPath::new("a", 1, 200_000);
+        let b = SimPath::new("b", 2, 200_000);
+        let c = SimPath::new("c", 3, 200_000);
+        sim.push(ROOT, &[&a, &b], &[&a, &b]).await;
+        fake.set_clock(T0 + 2 * HOUR);
+        sim.run_gc(GcPolicy::default(), T0 + 2 * HOUR).await;
+
+        // Builds c, uses a, and has no use for b.
+        sim.push(ROOT, &[&c], &[&a]).await;
+        assert_eq!(sim.stored_keys("use-").await.len(), 1);
+        sim.assert_readable(&[&a, &b, &c]).await;
+
+        fake.set_clock(T0 + 4 * HOUR);
+        let stats = sim.run_gc(GcPolicy::default(), T0 + 4 * HOUR).await;
+        assert_eq!(stats.segments_written, 1, "{stats:?}");
+        sim.assert_readable(&[&a, &c]).await;
+        sim.assert_unavailable(&[&b]).await;
+        sim.assert_no_dangling_references().await;
+
+        // The list of used paths goes with the segment that named it.
+        fake.set_clock(T0 + 6 * HOUR);
+        sim.push(ROOT, &[], &[&a, &c]).await;
+        sim.run_gc(GcPolicy::default(), T0 + 6 * HOUR).await;
+        fake.set_clock(T0 + 8 * HOUR);
+        sim.push(ROOT, &[], &[&a, &c]).await;
+        sim.run_gc(GcPolicy::default(), T0 + 8 * HOUR).await;
+        assert_eq!(sim.stored_keys("use-").await.len(), 1);
+        sim.assert_readable(&[&a, &c]).await;
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn compacts_each_root_to_one_segment_and_folds_heads() {
     timed(async {
@@ -54,7 +92,8 @@ async fn compacts_each_root_to_one_segment_and_folds_heads() {
         let stats = sim.run_gc(GcPolicy::default(), T0 + 2 * HOUR).await;
         assert_eq!(
             (stats.epoch, stats.roots, stats.segments_written),
-            (1, 2, 1)
+            (1, 2, 2),
+            "the other root's drain only named b as used, GC gave it the entry"
         );
         assert_eq!(stats.deleted, 3, "just the heads");
 
@@ -66,14 +105,14 @@ async fn compacts_each_root_to_one_segment_and_folds_heads() {
         assert!(sim.stored_keys("h-").await.is_empty());
         sim.assert_readable(&[&a, &b]).await;
         // Inputs are retired, not deleted: a reader may still hold them.
-        assert_eq!(sim.stored_keys("seg-").await.len(), 4);
+        assert_eq!(sim.stored_keys("seg-").await.len(), 5);
 
         fake.set_clock(T0 + 4 * HOUR);
         let stats = sim.run_gc(GcPolicy::default(), T0 + 4 * HOUR).await;
         assert_eq!(
             stats.deleted,
-            2 * 2 + 1,
-            "two segments and the previous g-*"
+            3 * 2 + 1 + 1,
+            "three segments, one list of used paths and the previous g-*"
         );
         assert_eq!(sim.stored_keys("seg-").await.len(), 2);
         sim.assert_readable(&[&a, &b]).await;

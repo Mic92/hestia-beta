@@ -307,15 +307,18 @@ async fn gc_over_ghcr_deletes_by_version_id() {
         assert_eq!(fake.versions("pack-"), 3, "old's pack waits one epoch");
         assert_eq!(
             fake.versions("seg-"),
-            2,
-            "main's merged segment and old's, retired"
+            4,
+            "main's merged segment, and retired: the one before, the drain's and old's"
         );
         assert!(
             fake.api_calls() - calls < 20,
             "ledger resumes: one versions page plus deletes, got {}",
             fake.api_calls() - calls
         );
+        // A new process, as every GC run is: its ledger learns of what
+        // the runs above wrote after their own sync.
         fake.set_clock(T0 + 60 * HOUR);
+        let sim = SimCache::with(fake.backend(&http), fake.clock());
         let stats = sim.run_gc(GcPolicy::default(), T0 + 60 * HOUR).await;
         assert!(stats.deleted >= 2, "{stats:?}");
         assert_eq!(fake.versions("pack-"), 2);

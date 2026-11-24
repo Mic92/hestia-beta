@@ -105,13 +105,13 @@ impl Backend {
         Ok(self.list("", None).await?.expect("unbounded"))
     }
 
-    /// GC only: all `pack-`/`seg-`/`tree-` objects with creation times.
+    /// GC only: all `pack-`/`seg-`/`tree-`/`use-` objects with creation times.
     pub async fn list_objects(&self) -> Result<Vec<Listed>, Error> {
         if let Backend::Oci(b) = self {
             return b.list_objects().await;
         }
         let mut out = Vec::new();
-        for prefix in ["pack-", "seg-", "tree-"] {
+        for prefix in ["pack-", "seg-", "tree-", "use-"] {
             let listed = self.list(prefix, None).await?.ok_or(Error::InvalidEnv {
                 name: ENV_S3,
                 reason: "an http(s):// store is read-only and cannot be collected".into(),

@@ -64,7 +64,10 @@ A segment is what one writer published for one root: `.meta` holds a
 sorted path index, per-path narinfo fields and a pack table with a
 live-chunk bitset per pack; `.tree` holds the file trees, where a
 file's contents is a list of `(pack row, index in pack)` references
-plus reference rewrites (see below). Nothing in a segment is ever
+plus reference rewrites (see below). A segment holds entries only for
+paths its writer stored. Paths the writer found stored already and used
+are named in a third object, `use-<sha256>`, as a sorted list of path
+hashes that only compaction and GC read. Nothing in a segment is ever
 modified, so there is no merge conflict to resolve: concurrent drains
 simply publish one segment each. The `.meta` header and bodies are CBOR,
 so fields can be added without breaking older readers; a `features`
@@ -148,9 +151,11 @@ serving. Any disagreement is a 404, and Nix falls through.
 ### Roots and GC
 
 What stays alive is decided by roots, one per branch and system (e.g.
-`main-x86_64-linux`). Every drain publishes a segment naming what the
-job pushed, found stored, or substituted. GC compacts each root to the
-union of what drains named since its previous run, so matrix legs and
+`main-x86_64-linux`). Every drain publishes a segment with the entries
+of what the job pushed and the hashes of what it found stored or
+substituted. GC compacts each root to the union of what drains pushed
+or used since its previous run, taking the entries of used paths from
+the root's previous segment or any other live one, so matrix legs and
 re-runs accumulate while closures no job uses any more die. GC is the
 only deleter: it repacks mostly-dead packs, publishes the new GC head
 and only then deletes what neither the new view nor the previous one

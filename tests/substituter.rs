@@ -793,9 +793,16 @@ async fn narinfo_hits_join_the_root_at_next_drain() {
             .unwrap()
             .unwrap();
         let meta = hestia::segment::Meta::open(&body).unwrap();
-        assert!(meta.find(&path_hash_of(&fixture_a)).is_some());
         assert!(
-            meta.find(&path_hash_of(&fixture_b)).is_none(),
+            meta.is_empty(),
+            "a stored path is named as used, not copied"
+        );
+        let used = hestia::store::fetch_uses(&fake.backend(&http), &meta)
+            .await
+            .unwrap();
+        assert_eq!(
+            used,
+            vec![path_hash_of(&fixture_a)],
             "never-accessed, never-pushed path is not named again"
         );
     })

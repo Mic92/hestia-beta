@@ -216,11 +216,8 @@ impl SimCache {
             .map(|p| p.path_hash())
             .chain(closure.iter().copied())
         {
-            if !writer.contains(&hash) {
-                snapshot
-                    .copy_entry(&hash, &mut writer)
-                    .await
-                    .expect("copy entry");
+            if !writer.contains(&hash) && snapshot.contains(&hash) {
+                writer.use_path(&hash);
             }
         }
         if writer.is_empty() {

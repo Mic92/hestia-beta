@@ -73,7 +73,7 @@ pub struct Oci {
 
 fn content_digest(key: &str) -> Option<String> {
     let (kind, hex) = key.split_once('-')?;
-    (matches!(kind, "pack" | "seg" | "tree") && Hash32::from_hex(hex).is_some())
+    (matches!(kind, "pack" | "seg" | "tree" | "use") && Hash32::from_hex(hex).is_some())
         .then(|| format!("sha256:{hex}"))
 }
 
@@ -570,7 +570,7 @@ impl Oci {
             return Ok(l.objects());
         }
         let mut tags = Vec::new();
-        for prefix in ["pack-", "seg-", "tree-"] {
+        for prefix in ["pack-", "seg-", "tree-", "use-"] {
             tags.extend(self.tags(prefix, None).await?.expect("unbounded"));
         }
         let listed = futures_util::stream::iter(tags)

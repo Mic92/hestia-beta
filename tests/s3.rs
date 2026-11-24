@@ -452,7 +452,9 @@ async fn gc_over_s3_with_lagging_listing() {
         fake.set_clock(T0 + 60 * HOUR);
         sim.push("main", &[], &[&a, &b]).await;
         sim.run_gc(policy, T0 + 60 * HOUR).await;
-        assert_eq!((count("pack"), count("seg")), (2, 1));
+        // The compacted segment, and the drain's that named what it used:
+        // an input stays for one more run.
+        assert_eq!((count("pack"), count("seg")), (2, 2));
         sim.assert_readable(&[&a, &b]).await;
         sim.assert_no_dangling_references().await;
     })

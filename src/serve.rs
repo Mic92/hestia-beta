@@ -91,6 +91,8 @@ struct DaemonState {
     /// As a cache node: what builders sealed and wait to see published.
     commits: Mutex<Vec<PendingCommit>>,
     commit_wake: tokio::sync::Notify,
+    /// Nodes that are told of every head published here.
+    peers: std::sync::OnceLock<Vec<crate::node::NodeClient>>,
     /// Names this process to builders ([`Plan::boot`]).
     boot: u64,
     /// Last time anything happened (for idle-exit).
@@ -237,7 +239,7 @@ impl DaemonState {
             return;
         }
         let _work = self.begin_work();
-        let _guard = self.drain_lock.lock().await;
+        let guard = self.drain_lock.lock().await;
         let accessed = self.access_log.take();
         let (parts, waiting): (Vec<_>, Vec<_>) = pending
             .into_iter()
@@ -251,9 +253,41 @@ impl DaemonState {
         if outcome.is_err() {
             self.access_log.extend(accessed);
         }
+        drop(guard);
+        if let Ok(head) = &outcome {
+            self.announce(head).await;
+        }
         for reply in waiting {
             let _ = reply.send(outcome.clone());
         }
+    }
+
+    /// Tell the peers of `head` before builders hear it is published: a
+    /// build that needs it may start behind any of them.
+    async fn announce(&self, head: &str) {
+        let peers = self.peers.get().map_or(&[][..], Vec::as_slice);
+        let told = peers.iter().map(|peer| async move {
+            if let Err(err) = peer.announce(head).await {
+                eprintln!(
+                    "hestia serve: peer {} does not serve {head} yet: {err}",
+                    peer.base()
+                );
+            }
+        });
+        futures_util::future::join_all(told).await;
+    }
+
+    /// Load what the store lists now. Whether `head` is served after.
+    async fn follow_now(&self, head: &str) -> Result<bool, pipeline::Error> {
+        let _work = self.begin_work();
+        let _guard = self.drain_lock.lock().await;
+        let served = self.pipeline.publish.as_ref().expect("set by bind");
+        if has_head(served, head) {
+            return Ok(true);
+        }
+        let snapshot = self.pipeline.relist().await?;
+        report_early(served.set_followed(snapshot));
+        Ok(has_head(served, head))
     }
 
     async fn handle_request(&self, request: Request) -> Response {
@@ -353,6 +387,7 @@ impl Daemon {
                 drain_lock: tokio::sync::Mutex::new(()),
                 commits: Mutex::default(),
                 commit_wake: tokio::sync::Notify::new(),
+                peers: std::sync::OnceLock::new(),
                 boot: {
                     use std::hash::{BuildHasher as _, Hasher as _};
                     std::collections::hash_map::RandomState::new()
@@ -483,6 +518,20 @@ impl Daemon {
             }
         }
 
+        async fn head(State(state): Shared, body: bytes::Bytes) -> (StatusCode, Vec<u8>) {
+            let Ok(name) = std::str::from_utf8(&body) else {
+                return (StatusCode::BAD_REQUEST, b"not a head name".to_vec());
+            };
+            match state.follow_now(name).await {
+                Ok(true) => (StatusCode::OK, b"served".to_vec()),
+                Ok(false) => (
+                    StatusCode::NOT_FOUND,
+                    b"the store does not list it".to_vec(),
+                ),
+                Err(err) => (StatusCode::BAD_GATEWAY, err.to_string().into_bytes()),
+            }
+        }
+
         let state = Arc::clone(&self.state);
         let committer = tokio::spawn({
             let state = Arc::clone(&state);
@@ -499,9 +548,15 @@ impl Daemon {
             .route("/hestia/plan", axum::routing::post(plan))
             .route("/hestia/commit", axum::routing::post(commit))
             .route("/hestia/pack/{key}", axum::routing::put(pack))
+            .route("/hestia/head", axum::routing::post(head))
             .layer(axum::extract::DefaultBodyLimit::max(MAX_COMMIT_BYTES))
             .with_state(state);
         (router, committer)
+    }
+
+    /// As a cache node: tell `peers` of every head published here.
+    pub fn set_peers(&self, peers: Vec<crate::node::NodeClient>) {
+        let _ = self.state.peers.set(peers);
     }
 
     /// The daemon's access log (shared with the substituter).
@@ -651,8 +706,24 @@ async fn load_published(
 ) {
     let previous = manifest_store.snapshot();
     match Snapshot::load(backend.clone(), trust.clone(), roots, previous.as_deref()).await {
-        Ok(snapshot) => manifest_store.set_snapshot(Arc::new(snapshot)),
+        Ok(snapshot) => report_early(manifest_store.set_followed(Arc::new(snapshot))),
         Err(err) => eprintln!("hestia serve: cannot list heads, substituting nothing: {err}"),
+    }
+}
+
+fn has_head(served: &ManifestStore, head: &str) -> bool {
+    served
+        .snapshot()
+        .is_some_and(|s| s.view.heads.iter().any(|(h, _)| h == head))
+}
+
+/// `early` paths that just became servable were asked for here before.
+fn report_early(early: usize) {
+    if early > 0 {
+        eprintln!(
+            "hestia serve: {early} paths were asked for here before this node saw them; \
+             each may have been built twice"
+        );
     }
 }
 
@@ -920,6 +991,12 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         })
     });
     let mut router = substituter.into_router();
+    daemon.set_peers(
+        args.peer
+            .iter()
+            .map(|url| crate::node::NodeClient::new(http.clone(), url))
+            .collect(),
+    );
     let commit_task = args.commit_interval.map(|ms| {
         let (node, committer) = daemon.node_router(Duration::from_millis(ms));
         router = std::mem::take(&mut router).merge(node);

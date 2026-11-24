@@ -379,7 +379,8 @@ async fn a_node_takes_a_pack_before_the_store_has_it() {
     let dir = tempfile::tempdir().unwrap();
     let packs = Arc::new(PackCache::open(dir.path(), 1 << 20).unwrap());
     let node = Cached::new(store.clone(), Arc::clone(&packs));
-    let (key, data) = (pack_key(1), Bytes::from(vec![7u8; 5000]));
+    let data = Bytes::from(vec![7u8; 5000]);
+    let key = key("pack", &data);
 
     dav.set_rtt(Duration::from_millis(300));
     assert_eq!(node.put_behind(&key, data.clone()).await.unwrap(), None);
@@ -409,7 +410,8 @@ async fn a_pack_the_store_refused_fails_its_commit_until_handed_in_again() {
     let dir = tempfile::tempdir().unwrap();
     let packs = Arc::new(PackCache::open(dir.path(), 1 << 20).unwrap());
     let node = Cached::new(store.clone(), Arc::clone(&packs));
-    let (key, data) = (pack_key(2), Bytes::from(vec![3u8; 5000]));
+    let data = Bytes::from(vec![3u8; 5000]);
+    let key = key("pack", &data);
     let keys = std::slice::from_ref(&key);
 
     dav.set_read_only(true);
@@ -417,6 +419,13 @@ async fn a_pack_the_store_refused_fails_its_commit_until_handed_in_again() {
     assert!(node.settled(keys).await.is_err());
     assert!(node.settled(keys).await.is_err(), "and stays failed");
     assert_eq!(packs.stats().used, 0, "a pack the store lacks is not kept");
+
+    // A pack whose kept copy no longer hashes to its name stays out of
+    // the store.
+    let wrong = pack_key(8);
+    assert_eq!(node.put_behind(&wrong, data.clone()).await.unwrap(), None);
+    let refused = node.settled(std::slice::from_ref(&wrong)).await;
+    assert!(refused.is_err_and(|e| e.contains("damaged")));
 
     dav.set_read_only(false);
     assert_eq!(node.put_behind(&key, data.clone()).await.unwrap(), None);

@@ -15,6 +15,12 @@
 //!    waits until the store has the packs the segment names, merges what arrives within its commit interval into one segment,
 //!    publishes one head for it and answers every builder with its name.
 //!
+//! A node with peers (`--peer`) then tells them the head's name
+//! (`POST /hestia/head`) and waits a moment for them to load it, so a
+//! build that needs the new paths finds them behind any node. A peer
+//! that was not told finds the head when it next follows the store, and
+//! a path asked for in between is a miss.
+//!
 //! The node trusts the builders it serves as the store trusts anyone who
 //! can write to it: a segment naming packs that do not exist is published
 //! as it is and its paths fail when fetched.
@@ -27,6 +33,8 @@ use crate::store::KnownChunks;
 
 const MAGIC_PLAN: &[u8; 4] = b"HNP1";
 const MAGIC_COMMIT: &[u8; 4] = b"HNC1";
+/// How long a commit waits for a peer to load the new head.
+const ANNOUNCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -224,6 +232,21 @@ impl NodeClient {
             )));
         }
         Ok(body.as_ref() != b"existed")
+    }
+
+    /// Tells a peer node that `head` is published, so it serves the
+    /// head's paths now and not at its next look at the store. A hint:
+    /// the peer loads from the store, never from this message.
+    pub async fn announce(&self, head: &str) -> Result<(), Error> {
+        let sent = self.post("head", head.as_bytes().to_vec());
+        match tokio::time::timeout(ANNOUNCE_TIMEOUT, sent).await {
+            Ok(answer) => answer.map(|_| ()),
+            Err(_) => Err(Error::Refused("no answer in time".to_owned())),
+        }
+    }
+
+    pub fn base(&self) -> &str {
+        &self.base
     }
 
     /// Returns the head the node published for this and other drains.

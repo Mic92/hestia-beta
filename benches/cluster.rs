@@ -335,7 +335,7 @@ async fn main() {
         let pack = |mode: u64, b: u64| {
             let mut data = vec![0u8; pack_mb << 20];
             data[..16].copy_from_slice(&[mode.to_le_bytes(), b.to_le_bytes()].concat());
-            let key = format!("pack-{}", hestia::manifest::Hash32::digest(&data[..16]));
+            let key = format!("pack-{}", hestia::manifest::Hash32::digest(&data));
             (key, bytes::Bytes::from(data))
         };
         let t = Instant::now();

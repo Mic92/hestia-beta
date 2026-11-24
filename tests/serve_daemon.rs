@@ -949,6 +949,78 @@ async fn builders_drain_through_a_node() {
     server.abort();
 }
 
+/// A path one node published is served by its peer when the builder's
+/// drain returns, and a miss the peer answered before that is counted.
+#[tokio::test]
+async fn a_peer_serves_what_another_node_published() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let seeded = store.add_fixture("peer-seed", 211);
+    let built = store.add_fixture("peer-built", 213);
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let only = |p: &Path| std::collections::BTreeSet::from([p.to_string_lossy().into_owned()]);
+    pipeline_context(&fake, &http, store.database())
+        .run(only(&seeded), Default::default())
+        .await
+        .expect("seeding drain");
+
+    let sockets = tempfile::tempdir().unwrap();
+    let mut nodes = Vec::new();
+    for name in ["a", "b"] {
+        let served = ManifestStore::new();
+        served.set_snapshot(load_snapshot(&fake, &http).await);
+        let daemon = Daemon::bind(
+            &sockets.path().join(name),
+            None,
+            pipeline_context(&fake, &http, store.database()),
+            AccessLog::new(),
+            served.clone(),
+        )
+        .expect("binding daemon failed");
+        let (router, committer) = daemon.node_router(Duration::from_millis(50));
+        let backend = fake.backend(&http);
+        let nix = Substituter::new(
+            Default::default(),
+            served.clone(),
+            AccessLog::new(),
+            backend,
+        );
+        let router = router.merge(nix.into_router());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        nodes.push((daemon, served, url, committer, server));
+    }
+    let (a, b) = (&nodes[0], &nodes[1]);
+    a.0.set_peers(vec![hestia::node::NodeClient::new(http.clone(), &b.2)]);
+
+    // Someone asks the peer for the path before it is built.
+    let narinfo = format!("{}/{}.narinfo", b.2, path_hash_of(&built));
+    assert_eq!(http.get(&narinfo).send().await.unwrap().status(), 404);
+
+    let builder = PipelineContext {
+        node: Some(hestia::node::NodeClient::new(http.clone(), &a.2)),
+        ..pipeline_context(&fake, &http, store.database())
+    };
+    let stats = builder
+        .run(only(&built), Default::default())
+        .await
+        .expect("drain through a");
+    assert_eq!(stats.pushed, 1);
+
+    // No waiting: the drain returned, so the peer serves it.
+    assert_eq!(http.get(&narinfo).send().await.unwrap().status(), 200);
+    assert_eq!(b.1.early_misses(), 1, "the miss before is on record");
+    assert_eq!(a.1.early_misses(), 0, "a published it itself");
+
+    for (_, _, _, committer, server) in &nodes {
+        committer.abort();
+        server.abort();
+    }
+}
+
 #[tokio::test]
 async fn serve_becomes_ready_while_cache_api_stalls() {
     // A stalled GHA cache API at startup must not block the daemon's

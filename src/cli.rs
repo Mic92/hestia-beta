@@ -62,6 +62,12 @@ pub struct ServeArgs {
     #[arg(long, value_name = "MILLISECONDS")]
     pub commit_interval: Option<u64>,
 
+    /// As a cache node: another node serving the same root. It is told
+    /// of every head published here, so it serves the new paths at once.
+    /// Repeat for each peer.
+    #[arg(long, value_name = "URL")]
+    pub peer: Vec<String>,
+
     /// Keep the packs written and read through this daemon in this
     /// directory, so later reads do not go to the store. For a cache node.
     #[arg(long, value_name = "DIRECTORY")]

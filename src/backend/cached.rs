@@ -28,6 +28,8 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 
 use super::{Backend, Error};
+use crate::chunker::pack_cache_key;
+use crate::manifest::PackHash;
 
 const PACK_PREFIX: &str = "pack-";
 /// Written by [`PackCache::save`], consumed by [`PackCache::open`].
@@ -570,12 +572,18 @@ impl Cached {
             let data = match data {
                 Some(data) => data,
                 None => {
+                    // The key was checked against the bytes that came
+                    // in; these are the bytes the disk gave back.
                     let (packs, owned) = (Arc::clone(&self.packs), key.to_owned());
-                    tokio::task::spawn_blocking(move || packs.read(&owned, None))
-                        .await
-                        .ok()
-                        .flatten()
-                        .ok_or("the kept copy is gone")?
+                    tokio::task::spawn_blocking(move || {
+                        let data = packs.read(&owned, None).ok_or("the kept copy is gone")?;
+                        let name = pack_cache_key(&PackHash::digest(&data));
+                        (name == owned)
+                            .then_some(data)
+                            .ok_or("the kept copy is damaged")
+                    })
+                    .await
+                    .map_err(|err| err.to_string())??
                 }
             };
             if !self.inner.put(key, data).await.map_err(|e| e.to_string())? {

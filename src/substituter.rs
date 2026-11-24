@@ -139,18 +139,72 @@ impl ManifestView {
 #[derive(Clone, Default)]
 pub struct ManifestStore {
     inner: Arc<RwLock<Arc<ManifestView>>>,
+    asked: Arc<Mutex<Asked>>,
 }
+
+/// Paths that were asked for and not served, to tell how often a path
+/// another node published was asked for here before this node saw it.
+#[derive(Default)]
+struct Asked {
+    missed: HashMap<PathHash, std::time::Instant>,
+    /// Misses of paths a later [`ManifestStore::set_followed`] brought.
+    early: u64,
+}
+
+/// A miss older than this says nothing about a path that shows up now.
+const ASKED_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+const ASKED_MAX: usize = 100_000;
 
 impl ManifestStore {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Serve `snapshot`, which this daemon published into.
     pub fn set_snapshot(&self, snapshot: Arc<Snapshot>) {
+        self.replace(snapshot, false);
+    }
+
+    /// Serve `snapshot`, which was loaded from the store and may hold
+    /// what others published. Returns how many of its paths were asked
+    /// for here, and missed, before this call: each may have been built
+    /// a second time.
+    pub fn set_followed(&self, snapshot: Arc<Snapshot>) -> usize {
+        self.replace(snapshot, true)
+    }
+
+    fn replace(&self, snapshot: Arc<Snapshot>, followed: bool) -> usize {
+        let early = {
+            let mut asked = self.asked.lock().expect("asked lock poisoned");
+            let before = asked.missed.len();
+            asked
+                .missed
+                .retain(|hash, at| at.elapsed() < ASKED_WINDOW && !snapshot.contains(hash));
+            before - asked.missed.len()
+        };
         *self.inner.write().expect("manifest lock poisoned") = Arc::new(ManifestView {
             snapshot: Some(snapshot),
             missing_packs: Mutex::default(),
         });
+        if !followed {
+            return 0;
+        }
+        self.asked.lock().expect("asked lock poisoned").early += early as u64;
+        early
+    }
+
+    /// A path was asked for and is not served.
+    fn note_miss(&self, hash: PathHash) {
+        let mut asked = self.asked.lock().expect("asked lock poisoned");
+        if asked.missed.len() >= ASKED_MAX {
+            asked.missed.clear();
+        }
+        asked.missed.insert(hash, std::time::Instant::now());
+    }
+
+    /// Misses of paths that a later load from the store brought.
+    pub fn early_misses(&self) -> u64 {
+        self.asked.lock().expect("asked lock poisoned").early
     }
 
     pub fn snapshot(&self) -> Option<Arc<Snapshot>> {
@@ -806,6 +860,7 @@ async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>
 
     let view = state.manifest.view();
     let Some(entry) = view.lookup(&path_hash) else {
+        state.manifest.note_miss(path_hash);
         return StatusCode::NOT_FOUND.into_response();
     };
 

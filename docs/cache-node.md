@@ -124,6 +124,39 @@ Not done: the node authenticates nobody, so whoever reaches its port
 can publish under its root. A commit of nothing but used paths waits
 for the next drain.
 
+### More than one node
+
+Nodes agree only through the bucket. A node serves a path once it has
+loaded the head that names it: at once on the node that published it,
+on any other when it next follows the bucket (`--follow`). A path asked
+for in between is a miss, and whoever asked may build it a second time.
+That is allowed; the rule is only that a node never answers for a path
+it cannot deliver.
+
+To keep such misses rare, a node started with `--peer <URL>` for each
+other node tells them the name of every head it publishes
+(`POST /hestia/head`) and waits up to two seconds for them to load it
+from the bucket, before it answers the builders. So when a drain
+returns, every peer that could be reached serves its paths. The
+message is a hint: a peer loads from the bucket, never from the
+message. A peer that was down or cut off finds the head when it next
+follows.
+
+Each node counts the misses that were early: paths it answered 404 for
+in the last ten minutes that a later load from the bucket brought. It
+logs the count when it is not zero. The count is an upper bound on
+second builds, since a path that was asked for, then built elsewhere
+and published, counts too.
+
+What this costs a commit is not measured through real nodes. Loading
+one new head takes a follower 99 ms and 4 requests in the bench above,
+and peers load at the same time, so about that much on a commit of
+920 ms.
+
+Nix remembers a miss: `narinfo-cache-negative-ttl` is an hour by
+default. A builder that asked a moment too early does not ask again
+for that long, so builders behind nodes want it at a few seconds.
+
 ### Packs on the node's disk
 
 A node started with `--pack-cache <DIRECTORY>` keeps packs on local
@@ -187,6 +220,9 @@ three rules keep a published segment whole:
 - A node that died forgot which packs it still owed. The plan carries
   a number that names the node process, the commit sends it back, and a
   node refuses a commit planned with another process.
+
+A waiting pack is hashed again when it is read back for the bucket,
+so a disk that damaged it cannot put it there under its name.
 
 Packs waiting for the bucket may fill half the cache. Past that an
 upload waits for room, and a pack larger than that half goes to the

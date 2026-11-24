@@ -12,6 +12,8 @@ setups, or hacking on hestia).
 | `--listen <ADDR>` | `127.0.0.1:37515` | Substituter HTTP address. |
 | `--idle-exit <SECONDS>` | — | Drain and exit after this much inactivity (fallback for setups without post steps). |
 | `--follow <SECONDS>` | — | Reload the served roots this often, to pick up what other writers publish. For a daemon many builders share as their cache. |
+| `--node <URL>` | — | Drain through the cache node at this URL: it says what is stored and publishes for this daemon, which then loads no index at all and substitutes nothing itself; point Nix at the node. |
+| `--commit-interval <MILLISECONDS>` | — | Be a cache node for the drains of daemons started with `--node`: publish what they hand in as one segment, at most once per interval. |
 | `--branch <NAME>` | `$GITHUB_REF_NAME`, else `local` | Branch part of the root key. |
 | `--system <SYSTEM>` | detected | Nix system part of the root key (e.g. `x86_64-linux`). |
 | `--serve-branch <BRANCH>` | `main` | Also serve what these branches' roots hold (repeatable). |

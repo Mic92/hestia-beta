@@ -30,10 +30,11 @@ use crate::chunker::{
 };
 use crate::gha::Error as GhaError;
 use crate::manifest::{ChunkHash, ChunkList, FileTree, NarHash, PathEntry, PathHash};
+use crate::node::NodeClient;
 use crate::pathinfo::{Error as PathInfoError, Lookup, PathInfo, StoreDatabase};
 use crate::protocol::DrainStats;
 use crate::refnorm::RefTable;
-use crate::segment::SegmentWriter;
+use crate::segment::{Sealed, SegmentWriter};
 use crate::store::{self, Snapshot};
 use crate::substituter::ManifestStore;
 use crate::trust::Trust;
@@ -73,6 +74,12 @@ pub enum Error {
 
     #[error(transparent)]
     Store(#[from] store::Error),
+
+    #[error(transparent)]
+    Node(#[from] crate::node::Error),
+
+    #[error("the root was collected since this drain was planned; drain again")]
+    StalePlan,
 }
 
 /// Shared record of paths served through the substituter.
@@ -105,6 +112,19 @@ impl AccessLog {
     /// All paths accessed so far.
     pub fn snapshot(&self) -> BTreeSet<PathHash> {
         self.inner.lock().expect("access log lock poisoned").clone()
+    }
+
+    /// The paths accessed since the last call. A node that never exits
+    /// names each access once, in the next segment it publishes.
+    pub fn take(&self) -> BTreeSet<PathHash> {
+        std::mem::take(&mut *self.inner.lock().expect("access log lock poisoned"))
+    }
+
+    pub fn extend(&self, hashes: impl IntoIterator<Item = PathHash>) {
+        self.inner
+            .lock()
+            .expect("access log lock poisoned")
+            .extend(hashes);
     }
 }
 
@@ -184,6 +204,9 @@ pub struct PipelineContext {
     pub publish: Option<ManifestStore>,
     /// Unix seconds for head names.
     pub clock: Clock,
+    /// Drain through this cache node: it says what is stored and publishes
+    /// the segment, so no index is loaded here ([`crate::node`]).
+    pub node: Option<NodeClient>,
 }
 
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -245,21 +268,10 @@ impl PipelineContext {
         }
 
         let load_started = Instant::now();
-        // Relisted every drain: a GC since the last one may have retired
-        // segments the served snapshot still names. Their bodies are reused.
-        let previous = self.publish.as_ref().and_then(ManifestStore::snapshot);
-        let roots = previous
-            .as_ref()
-            .map_or_else(|| vec![self.root_key.clone()], |p| p.roots.clone());
-        let snapshot = Arc::new(
-            Snapshot::load(
-                self.backend.clone(),
-                self.trust.clone(),
-                &roots,
-                previous.as_deref(),
-            )
-            .await?,
-        );
+        let snapshot = match &self.node {
+            Some(_) => None,
+            None => Some(self.relist().await?),
+        };
         // Blocking sqlite I/O happens off the async runtime.
         let store = self.store.clone();
         let expand_closure = self.expand_closure;
@@ -290,8 +302,7 @@ impl PipelineContext {
         .expect("store database query task panicked")?;
 
         let mut root_paths: BTreeSet<PathHash> = accessed;
-        // Paths that need chunking + upload.
-        let mut to_push: Vec<(String, PathInfo)> = Vec::new();
+        let mut candidates: Vec<(String, PathInfo)> = Vec::new();
 
         for (path, lookup) in lookups {
             let info = match lookup {
@@ -315,29 +326,59 @@ impl PipelineContext {
                 continue;
             }
 
-            let hash = info.path_hash();
-
-            // A path whose pack the substituter saw evicted goes up again.
-            let cached = match &self.publish {
-                Some(p) => p.available(&hash).await,
-                None => snapshot.contains(&hash),
-            };
-            if cached {
-                root_paths.insert(hash);
-                stats.skipped_existing += 1;
-                continue;
-            }
-
-            to_push.push((path, info));
+            candidates.push((path, info));
         }
-        // A rebuild mostly repeats the chunks of the previous build under
-        // the same name, so those pack indexes are worth loading.
-        let names = to_push
-            .iter()
-            .map(|(_, i)| i.store_path.name().as_ref())
-            .collect();
-        snapshot.load_indexes_for(&names).await?;
-        let known_chunks = Arc::new(snapshot.known_chunks());
+
+        // What is stored already, and where chunks worth reusing lie: a
+        // rebuild mostly repeats the chunks of the previous build under
+        // the same name, so the indexes of those packs are the ones wanted.
+        let mut plan = None;
+        let mut present: BTreeSet<PathHash> = BTreeSet::new();
+        match (&self.node, &snapshot) {
+            (Some(node), _) => {
+                let asked = candidates
+                    .iter()
+                    .map(|(_, i)| (i.path_hash(), i.store_path.name().to_string()))
+                    .collect();
+                let answer = node.plan(asked).await?;
+                present.extend(answer.present.iter().copied());
+                plan = Some(answer);
+            }
+            (None, Some(snapshot)) => {
+                for (_, info) in &candidates {
+                    let hash = info.path_hash();
+                    // A path whose pack the substituter saw evicted goes up
+                    // again.
+                    let cached = match &self.publish {
+                        Some(p) => p.available(&hash).await,
+                        None => snapshot.contains(&hash),
+                    };
+                    if cached {
+                        present.insert(hash);
+                    }
+                }
+            }
+            (None, None) => unreachable!("a drain without a node lists the root"),
+        }
+        // Paths that need chunking + upload.
+        let (stored, to_push): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|(_, info)| present.contains(&info.path_hash()));
+        stats.skipped_existing += stored.len();
+        root_paths.extend(stored.iter().map(|(_, info)| info.path_hash()));
+        let known_chunks = match (&plan, &snapshot) {
+            (Some(plan), _) => plan.known_chunks(),
+            (None, Some(snapshot)) => {
+                let names = to_push
+                    .iter()
+                    .map(|(_, i)| i.store_path.name().as_ref())
+                    .collect();
+                snapshot.load_indexes_for(&names).await?;
+                snapshot.known_chunks()
+            }
+            (None, None) => unreachable!(),
+        };
+        let known_chunks = Arc::new(known_chunks);
 
         stats.load_ms = load_started.elapsed().as_millis() as u64;
 
@@ -592,7 +633,8 @@ impl PipelineContext {
         }
         stats.pushed = prepared.len();
         for hash in &root_paths {
-            if !writer.contains(hash) && snapshot.contains(hash) {
+            // A node filters what it does not store when it commits.
+            if !writer.contains(hash) && snapshot.as_ref().is_none_or(|s| s.contains(hash)) {
                 writer.use_path(hash);
             }
         }
@@ -601,28 +643,78 @@ impl PipelineContext {
         }
         let commit_started = Instant::now();
         let sealed = writer.seal().map_err(store::Error::from)?;
-        let now = (self.clock)();
-        stats.head = Some(
-            store::publish(
-                &self.backend,
-                &self.trust,
-                &snapshot.view,
-                &self.root_key,
-                &sealed,
-                now,
+        stats.head = Some(match (&self.node, plan, snapshot) {
+            (Some(node), Some(plan), _) => node.commit(plan.epoch, &sealed).await?,
+            (_, _, Some(snapshot)) => self.publish_sealed(&snapshot, &sealed).await?,
+            _ => unreachable!(),
+        });
+        stats.commit_ms = commit_started.elapsed().as_millis() as u64;
+        Ok(stats)
+    }
+
+    /// List the root's heads again. A GC since the last drain may have
+    /// retired segments the served snapshot still names; the bodies of
+    /// those still live are reused.
+    async fn relist(&self) -> Result<Arc<Snapshot>, Error> {
+        let previous = self.publish.as_ref().and_then(ManifestStore::snapshot);
+        let roots = previous
+            .as_ref()
+            .map_or_else(|| vec![self.root_key.clone()], |p| p.roots.clone());
+        Ok(Arc::new(
+            Snapshot::load(
+                self.backend.clone(),
+                self.trust.clone(),
+                &roots,
+                previous.as_deref(),
             )
             .await?,
-        );
+        ))
+    }
+
+    /// As a cache node: publish one segment for the drains of several
+    /// builders, each sealed from a plan of GC epoch `.0`. `accessed` are
+    /// paths the node served since it last published.
+    pub async fn commit_group(
+        &self,
+        parts: &[(u64, Sealed)],
+        accessed: &BTreeSet<PathHash>,
+    ) -> Result<String, Error> {
+        let snapshot = self.relist().await?;
+        if parts.iter().any(|(epoch, _)| *epoch != snapshot.view.epoch) {
+            return Err(Error::StalePlan);
+        }
+        let sealed: Vec<Sealed> = parts.iter().map(|(_, s)| s.clone()).collect();
+        let stored = accessed
+            .iter()
+            .filter(|h| snapshot.contains(h))
+            .copied()
+            .collect();
+        let merged = store::merge_sealed(&sealed, &stored)?;
+        self.publish_sealed(&snapshot, &merged).await
+    }
+
+    /// Publish `sealed` under this root, serve it, and compact the root
+    /// if it is due.
+    async fn publish_sealed(&self, snapshot: &Snapshot, sealed: &Sealed) -> Result<String, Error> {
+        let now = (self.clock)();
+        let head = store::publish(
+            &self.backend,
+            &self.trust,
+            &snapshot.view,
+            &self.root_key,
+            sealed,
+            now,
+        )
+        .await?;
         // Readers that cannot list need the head index to name this head.
         if let Err(err) = self.backend.flush().await {
             eprintln!("hestia: cannot update the head index: {err}");
         }
-        stats.commit_ms = commit_started.elapsed().as_millis() as u64;
-        let next = match snapshot.refresh_with(&sealed).await {
+        let next = match snapshot.refresh_with(sealed).await {
             Ok(next) => next,
             Err(err) => {
                 eprintln!("hestia: cannot refresh the served segments: {err}");
-                return Ok(stats);
+                return Ok(head);
             }
         };
         let nanos = SystemTime::now()
@@ -645,7 +737,7 @@ impl PipelineContext {
         if let Some(publish) = &self.publish {
             publish.set_snapshot(Arc::new(next));
         }
-        Ok(stats)
+        Ok(head)
     }
 }
 

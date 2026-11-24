@@ -33,6 +33,7 @@ pub fn pipeline_context(
 ) -> PipelineContext {
     PipelineContext {
         clock: fake.clock(),
+        node: None,
         ..pipeline_context_with(fake.backend(http), store)
     }
 }
@@ -52,6 +53,7 @@ pub fn pipeline_context_with(backend: Backend, store: StoreDatabase) -> Pipeline
         read_only: Arc::new(AtomicBool::new(false)),
         publish: None,
         clock: system_clock(),
+        node: None,
     }
 }
 

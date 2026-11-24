@@ -832,6 +832,78 @@ async fn following_daemon_serves_what_another_writer_published() {
         .expect("the daemon never saw the other writer's paths");
 }
 
+/// Two builders drain through a node at once. Neither lists the root or
+/// publishes; the node publishes one head for both and serves both paths.
+/// A third drain learns from the node that its path is stored.
+#[tokio::test]
+async fn builders_drain_through_a_node() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let seeded = store.add_fixture("node-seed", 201);
+    let (first, second) = (
+        store.add_fixture("node-a", 203),
+        store.add_fixture("node-b", 205),
+    );
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let only = |p: &Path| std::collections::BTreeSet::from([p.to_string_lossy().into_owned()]);
+
+    // The root exists before the node starts.
+    pipeline_context(&fake, &http, store.database())
+        .run(only(&seeded), Default::default())
+        .await
+        .expect("seeding drain");
+
+    let manifest_store = ManifestStore::new();
+    manifest_store.set_snapshot(load_snapshot(&fake, &http).await);
+    let daemon = Daemon::bind(
+        &store_socket_path(&store),
+        None,
+        pipeline_context(&fake, &http, store.database()),
+        AccessLog::new(),
+        manifest_store.clone(),
+    )
+    .expect("binding daemon failed");
+    let (router, committer) = daemon.node_router(Duration::from_millis(200));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    // The node served this path; whoever publishes next names it as used.
+    daemon.access_log().record(path_hash_of(&seeded));
+
+    let builder = || PipelineContext {
+        node: Some(hestia::node::NodeClient::new(http.clone(), &url)),
+        ..pipeline_context(&fake, &http, store.database())
+    };
+    let heads_before = load_snapshot(&fake, &http).await.view.heads.len();
+    let (a, b) = (builder(), builder());
+    let (a, b) = tokio::join!(
+        a.run(only(&first), Default::default()),
+        b.run(only(&second), Default::default()),
+    );
+    let (a, b) = (a.expect("first builder"), b.expect("second builder"));
+    assert_eq!((a.pushed, b.pushed), (1, 1));
+    assert!(a.head.is_some());
+    assert_eq!(a.head, b.head, "one head for both drains");
+
+    for path in [&seeded, &first, &second] {
+        assert!(manifest_store.available(&path_hash_of(path)).await);
+    }
+    let published = load_snapshot(&fake, &http).await;
+    assert_eq!(published.view.heads.len(), heads_before + 1);
+    assert_eq!(published.path_count(), 3);
+
+    let again = builder()
+        .run(only(&first), Default::default())
+        .await
+        .expect("third drain");
+    assert_eq!((again.pushed, again.skipped_existing), (0, 1));
+
+    committer.abort();
+    server.abort();
+}
+
 #[tokio::test]
 async fn serve_becomes_ready_while_cache_api_stalls() {
     // A stalled GHA cache API at startup must not block the daemon's

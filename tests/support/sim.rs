@@ -22,7 +22,7 @@ use hestia::manifest::{
 use hestia::pathinfo::StoreDir;
 use hestia::pipeline::{AccessLog, Clock, upload_pack};
 use hestia::refnorm::RefTable;
-use hestia::segment::SegmentWriter;
+use hestia::segment::{Sealed, SegmentWriter};
 use hestia::store::{self, Snapshot};
 use hestia::substituter::{ManifestStore, Substituter};
 
@@ -167,7 +167,20 @@ impl SimCache {
         root_key: &str,
         pushed: &[&SimPath],
         closure: &[PathHash],
-    ) -> Option<hestia::segment::Sealed> {
+    ) -> Option<Sealed> {
+        let sealed = self.prepare(snapshot, pushed, closure).await?;
+        self.publish(snapshot, root_key, &sealed).await;
+        Some(sealed)
+    }
+
+    /// A drain up to its last step: packs uploaded, segment sealed, nothing
+    /// published.
+    pub async fn prepare(
+        &self,
+        snapshot: &Snapshot,
+        pushed: &[&SimPath],
+        closure: &[PathHash],
+    ) -> Option<Sealed> {
         let mut known = snapshot.known_chunks();
         let mut builder = PackBuilder::new();
         let mut fresh: Vec<PathEntry> = Vec::new();
@@ -223,18 +236,21 @@ impl SimCache {
         if writer.is_empty() {
             return None;
         }
-        let sealed = writer.seal().expect("seal");
+        Some(writer.seal().expect("seal"))
+    }
+
+    /// Publish what [`Self::prepare`] sealed under `root_key`.
+    pub async fn publish(&self, snapshot: &Snapshot, root_key: &str, sealed: &Sealed) {
         store::publish(
             &self.backend,
             &self.trust,
             &snapshot.view,
             root_key,
-            &sealed,
+            sealed,
             (self.clock)(),
         )
         .await
         .expect("publish");
-        Some(sealed)
     }
 
     /// Upload a pack no segment references (a drain that crashed before

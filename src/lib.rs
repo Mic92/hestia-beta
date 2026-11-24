@@ -15,6 +15,7 @@ pub mod listing;
 pub mod manifest;
 pub mod matrix;
 pub mod narzstd;
+pub mod node;
 pub mod pathinfo;
 pub mod pipeline;
 pub mod prefetch;

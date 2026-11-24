@@ -48,9 +48,12 @@ const MAX_PACK_VERIFY_ENTRIES: u64 = 1000;
 
 use crate::backend::Backend;
 use crate::cli::ServeArgs;
+use crate::manifest::PathHash;
+use crate::node::{Plan, PlanRequest};
 use crate::pathinfo::StoreDatabase;
 use crate::pipeline::{self, AccessLog, PipelineContext};
 use crate::protocol::{DrainStats, Request, Response, encode_line};
+use crate::segment::Sealed;
 use crate::store::Snapshot;
 use crate::substituter::{ManifestStore, Substituter, verify_packs};
 use crate::trust::Trust;
@@ -68,6 +71,10 @@ const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 /// buffer an unbounded line in memory.
 const MAX_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Upper bound for a plan or commit request to a cache node. A sealed
+/// segment has some hundred bytes a path.
+const MAX_COMMIT_BYTES: usize = 256 * 1024 * 1024;
+
 /// Shared state of a running daemon.
 struct DaemonState {
     /// Store paths registered by hooks, waiting for the next drain.
@@ -78,6 +85,9 @@ struct DaemonState {
     pipeline: PipelineContext,
     /// Serializes drains: concurrent drain requests run one at a time.
     drain_lock: tokio::sync::Mutex<()>,
+    /// As a cache node: what builders sealed and wait to see published.
+    commits: Mutex<Vec<PendingCommit>>,
+    commit_wake: tokio::sync::Notify,
     /// Last time anything happened (for idle-exit).
     last_activity: Arc<Mutex<Instant>>,
     /// Number of operations currently in progress (drains, substituter
@@ -95,6 +105,14 @@ struct DaemonState {
     /// drain client's stats) is flushed before the process exits.
     connections: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// A builder's sealed segment, the GC epoch it was planned in, and where
+/// the head it ends up under (or why it did not) is reported.
+type PendingCommit = (
+    u64,
+    Sealed,
+    tokio::sync::oneshot::Sender<Result<String, String>>,
+);
 
 /// Keeps the daemon alive while held: counts as in-flight work for the
 /// idle-exit timer and restarts the idle clock when dropped.
@@ -175,6 +193,60 @@ impl DaemonState {
                     .extend(paths);
                 Err(err)
             }
+        }
+    }
+
+    /// Answer a builder's plan request from what this daemon serves.
+    async fn plan(&self, request: PlanRequest) -> Result<Plan, String> {
+        let served = self.pipeline.publish.as_ref().expect("set by bind");
+        let Some(snapshot) = served.snapshot() else {
+            return Err("the root is not loaded yet".to_owned());
+        };
+        let mut present = Vec::new();
+        let mut names = BTreeSet::new();
+        for (hash, name) in &request.paths {
+            let hash: PathHash = hash.parse().map_err(|_| format!("bad path hash {hash}"))?;
+            if served.available(&hash).await {
+                present.push(hash);
+            } else {
+                names.insert(name.as_str());
+            }
+        }
+        let packs = snapshot
+            .indexes_for(&names)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(Plan {
+            epoch: snapshot.view.epoch,
+            present,
+            packs: packs.into_iter().collect(),
+        })
+    }
+
+    /// Publish everything builders handed in as one segment and tell each
+    /// of them the head.
+    async fn commit_pending(&self) {
+        let pending = std::mem::take(&mut *self.commits.lock().expect("commit lock poisoned"));
+        if pending.is_empty() {
+            return;
+        }
+        let _work = self.begin_work();
+        let _guard = self.drain_lock.lock().await;
+        let accessed = self.access_log.take();
+        let (parts, waiting): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .map(|(epoch, sealed, reply)| ((epoch, sealed), reply))
+            .unzip();
+        let outcome = self
+            .pipeline
+            .commit_group(&parts, &accessed)
+            .await
+            .map_err(|err| err.to_string());
+        if outcome.is_err() {
+            self.access_log.extend(accessed);
+        }
+        for reply in waiting {
+            let _ = reply.send(outcome.clone());
         }
     }
 
@@ -273,6 +345,8 @@ impl Daemon {
                 access_log,
                 pipeline,
                 drain_lock: tokio::sync::Mutex::new(()),
+                commits: Mutex::default(),
+                commit_wake: tokio::sync::Notify::new(),
                 last_activity: Arc::new(Mutex::new(Instant::now())),
                 in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -302,6 +376,66 @@ impl Daemon {
                 reload().await;
             }
         })
+    }
+
+    /// The routes that make this daemon a cache node for builders'
+    /// drains ([`crate::node`]), and the task that publishes what they
+    /// hand in, at most once every `interval`.
+    pub fn node_router(&self, interval: Duration) -> (axum::Router, tokio::task::JoinHandle<()>) {
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        type Shared = State<Arc<DaemonState>>;
+
+        async fn plan(State(state): Shared, body: bytes::Bytes) -> (StatusCode, Vec<u8>) {
+            let request = match serde_json::from_slice::<PlanRequest>(&body) {
+                Ok(request) => request,
+                Err(err) => return (StatusCode::BAD_REQUEST, err.to_string().into_bytes()),
+            };
+            match state.plan(request).await {
+                Ok(plan) => (StatusCode::OK, plan.encode()),
+                Err(err) => (StatusCode::SERVICE_UNAVAILABLE, err.into_bytes()),
+            }
+        }
+        async fn commit(State(state): Shared, body: bytes::Bytes) -> (StatusCode, Vec<u8>) {
+            if state.pipeline.read_only.load(Ordering::Relaxed) {
+                return (StatusCode::FORBIDDEN, b"this node is read-only".to_vec());
+            }
+            let (epoch, sealed) = match crate::node::decode_commit(&body) {
+                Ok(commit) => commit,
+                Err(err) => return (StatusCode::BAD_REQUEST, err.to_string().into_bytes()),
+            };
+            let (reply, published) = tokio::sync::oneshot::channel();
+            state
+                .commits
+                .lock()
+                .expect("commit lock poisoned")
+                .push((epoch, sealed, reply));
+            state.commit_wake.notify_one();
+            match published.await {
+                Ok(Ok(head)) => (StatusCode::OK, head.into_bytes()),
+                Ok(Err(err)) => (StatusCode::CONFLICT, err.into_bytes()),
+                Err(_) => (StatusCode::SERVICE_UNAVAILABLE, b"node is exiting".to_vec()),
+            }
+        }
+
+        let state = Arc::clone(&self.state);
+        let committer = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                loop {
+                    state.commit_wake.notified().await;
+                    // Whoever hands in during the wait shares the head.
+                    tokio::time::sleep(interval).await;
+                    state.commit_pending().await;
+                }
+            }
+        });
+        let router = axum::Router::new()
+            .route("/hestia/plan", axum::routing::post(plan))
+            .route("/hestia/commit", axum::routing::post(commit))
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_COMMIT_BYTES))
+            .with_state(state);
+        (router, committer)
     }
 
     /// The daemon's access log (shared with the substituter).
@@ -631,6 +765,10 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         // Replaced by Daemon::bind with the daemon's shared ManifestStore.
         publish: None,
         clock: crate::pipeline::system_clock(),
+        node: args
+            .node
+            .as_deref()
+            .map(|url| crate::node::NodeClient::new(http.clone(), url)),
     };
 
     let manifest_store = ManifestStore::new();
@@ -696,8 +834,14 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
             })
         })
     });
+    let mut router = substituter.into_router();
+    let commit_task = args.commit_interval.map(|ms| {
+        let (node, committer) = daemon.node_router(Duration::from_millis(ms));
+        router = std::mem::take(&mut router).merge(node);
+        committer
+    });
     let substituter_task = tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, substituter.into_router()).await {
+        if let Err(err) = axum::serve(listener, router).await {
             eprintln!("hestia serve: substituter server failed: {err}");
         }
     });
@@ -725,9 +869,14 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         let trust = trust.clone();
         let manifest_store = manifest_store.clone();
         let wait_head = args.wait_head.clone();
+        // Behind a node this daemon only pushes: Nix substitutes from the
+        // node, and the root's index is never loaded here.
+        let behind_node = args.node.is_some();
         tokio::spawn(async move {
             let reload = || load_published(&backend, &trust, &manifest_store, &serve_roots);
-            wait_for_head(&manifest_store, wait_head.as_deref(), reload).await;
+            if !behind_node {
+                wait_for_head(&manifest_store, wait_head.as_deref(), reload).await;
+            }
             let _ = manifest_ready_tx.send(true);
             verify_packs(&backend, &manifest_store, MAX_PACK_VERIFY_ENTRIES).await;
         })
@@ -793,6 +942,9 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
 
     let result = daemon.run(shutdown).await;
     load_task.abort();
+    if let Some(task) = commit_task {
+        task.abort();
+    }
     if let Some(task) = follow_task {
         task.abort();
     }

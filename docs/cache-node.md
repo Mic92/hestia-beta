@@ -1,7 +1,7 @@
 # Cache node (design draft)
 
-Status: a design, not code. The numbers come from `benches/cluster.rs`;
-what has not been measured is listed at the end.
+Status: stage 2 is built, the rest is a design. The numbers come from
+`benches/cluster.rs`; what has not been measured is listed at the end.
 
 ## Problem
 
@@ -81,10 +81,47 @@ The shared daemon's index was loaded beforehand, as a running node's
 is. Most of what the per-builder daemons download is the index, 46 MB
 each. The link between builders and the shared daemon is not modelled.
 
-Not built: drains through the node. A builder still needs its own
-daemon and index to push. The plan is that it chunks, asks the node
-which chunks and paths are new, uploads packs through stage 1, and the
-node publishes one segment for many builders' drains.
+### Drains through the node
+
+A builder started with `--node <URL>` loads no index: it substitutes
+from the node and its own daemon only pushes. A node
+started with `--commit-interval <MILLISECONDS>` serves it two requests
+(`src/node.rs`):
+
+1. `POST /hestia/plan` with the hash and name of every path the builder
+   is about to push. The node answers which are stored, and sends the
+   indexes of the packs holding earlier paths of the same names. Those
+   are where a rebuild's chunks repeat, so the builder uploads only
+   chunks they lack.
+2. The builder uploads its packs to the store itself.
+3. `POST /hestia/commit` with the sealed segment. The node merges what
+   arrives within its commit interval into one segment, publishes one
+   head and answers every builder with its name. A builder's drain has
+   returned only once its paths are published, as before.
+
+The node adds the paths it served since its last commit as used, so a
+path that is fetched but never rebuilt stays alive across GC. A commit
+planned before a GC moved chunks is refused and the builder drains
+again.
+
+The bench plays the store side of this: 20 builders that each built 20
+paths and used 2000 stored ones finish at once.
+
+| | Wall time | Requests | Uploaded | A follower then needs |
+|---|---|---|---|---|
+| A segment and head each | 1341 ms | 100 | 1.05 MB | 23 requests |
+| One segment and head for all | 982 ms | 24 | 0.28 MB | 4 requests |
+
+The first row leaves out what each builder pays to know the root
+before it can drain: 471 ms and 46 MB to load it, or about 100 ms to
+bring a loaded one up to date. Through the node that is one request on
+the local link. The used lists are the same on every builder here,
+which flatters the upload column.
+
+Not done: the node authenticates nobody, so whoever reaches its port
+can publish under its root. Packs still go from the builder to the
+bucket, not through the node. A commit of nothing but used paths waits
+for the next drain.
 
 ## Stage 3: compiled objects
 

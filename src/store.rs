@@ -489,6 +489,15 @@ impl Snapshot {
 
     /// Load the pack indexes behind stored entries with these names.
     pub async fn load_indexes_for(&self, names: &BTreeSet<&str>) -> Result<(), Error> {
+        self.indexes_for(names).await.map(|_| ())
+    }
+
+    /// The indexes of the packs behind stored entries with these names.
+    pub async fn indexes_for(
+        &self,
+        names: &BTreeSet<&str>,
+    ) -> Result<BTreeMap<PackHash, Arc<PackIndex>>, Error> {
+        let mut found = BTreeMap::new();
         for seg in &self.segments {
             let hits: Vec<usize> = (0..seg.meta.len())
                 .filter(|&i| names.contains(seg.meta.name(i)))
@@ -504,13 +513,15 @@ impl Snapshot {
             }
             // An evicted pack has no hints to give; its paths go up again.
             for p in packs {
-                match self.pack_index(&seg.meta.packs[p as usize]).await {
-                    Ok(_) | Err(Error::MissingPack(_)) => {}
+                let row = &seg.meta.packs[p as usize];
+                match self.pack_index(row).await {
+                    Ok(index) => _ = found.insert(row.hash, index),
+                    Err(Error::MissingPack(_)) => {}
                     Err(err) => return Err(err),
                 }
             }
         }
-        Ok(())
+        Ok(found)
     }
 
     /// Chunks locatable without a fetch: every pack index loaded so far.
@@ -826,6 +837,24 @@ async fn put_compaction(
     let name = record.head_name(base_epoch, &body).to_string();
     backend.put(&name, body.into()).await?;
     Ok(name)
+}
+
+/// One segment for what several drains sealed, so that a node publishing
+/// for many builders adds one head where they would add one each. `used`
+/// are named as used on top of what the parts name.
+pub fn merge_sealed(parts: &[Sealed], used: &BTreeSet<PathHash>) -> Result<Sealed, Error> {
+    let mut opened = Vec::with_capacity(parts.len());
+    let mut uses = used.clone();
+    for part in parts {
+        opened.push((Meta::open(&part.meta)?, Tree::open(&part.tree)?));
+        if let Some(bytes) = &part.uses {
+            uses.extend(segment::decode_uses(bytes)?);
+        }
+    }
+    let inputs: Vec<(&Meta, &Tree)> = opened.iter().map(|(m, t)| (m, t)).collect();
+    let uses: Vec<PathHash> = uses.into_iter().collect();
+    let (sealed, _) = segment::merge(&inputs, &uses, |_, _| true, segment::in_place)?;
+    Ok(sealed)
 }
 
 /// Upload a sealed segment and a head for it under `root`. A root the

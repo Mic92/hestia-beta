@@ -341,6 +341,57 @@ async fn main() {
     let other = load(Some(other)).await;
     row("follow that compaction", t, &net);
 
+    // BUILDERS machines finish a build at once. Each publishes its own
+    // segment, as today; then each hands what it sealed to one committer
+    // that publishes a single segment for all, as a cache node would.
+    let snapshot = load(Some(snapshot)).await;
+    let other = load(Some(other)).await;
+    let outputs = |wave: u64| -> Vec<Vec<SimPath>> {
+        (0..builders)
+            .map(|b| {
+                let first = paths + (5000 + wave * builders + b) * new;
+                (first..first + new).map(|i| path(i, size)).collect()
+            })
+            .collect()
+    };
+    net.take();
+    net.take_bytes();
+    let wave = outputs(0);
+    let t = Instant::now();
+    futures_util::future::join_all(wave.iter().map(|built| {
+        let refs: Vec<&SimPath> = built.iter().collect();
+        let (sim, snapshot, used) = (&sim, &snapshot, &used);
+        async move {
+            sim.drain(snapshot, ROOT, &refs, used)
+                .await
+                .expect("published")
+        }
+    }))
+    .await;
+    row(&format!("{builders} builders drain, a head each"), t, &net);
+    let t = Instant::now();
+    let other = load(Some(other)).await;
+    row("follow them", t, &net);
+
+    let mut snapshot = load(Some(snapshot)).await;
+    net.take();
+    net.take_bytes();
+    let wave = outputs(1);
+    let t = Instant::now();
+    let parts: Vec<_> = futures_util::future::join_all(wave.iter().map(|built| {
+        let refs: Vec<&SimPath> = built.iter().collect();
+        let (sim, snapshot, used) = (&sim, &snapshot, &used);
+        async move { sim.prepare(snapshot, &refs, used).await.expect("sealed") }
+    }))
+    .await;
+    let merged = hestia::store::merge_sealed(&parts, &BTreeSet::new()).unwrap();
+    sim.publish(&snapshot, ROOT, &merged).await;
+    row(&format!("{builders} builders drain, one head"), t, &net);
+    let t = Instant::now();
+    let other = load(Some(other)).await;
+    row("follow them", t, &net);
+    println!("{:<34} {} segments live", "", other.view.roots[ROOT].len());
+
     // A day in the life of the root: many small drains, a compaction for
     // every four, no GC in between. What do the heads cost by then?
     let history = env("HESTIA_BENCH_HISTORY", 0);

@@ -612,6 +612,7 @@ impl Tree {
 // ---------------------------------------------------------------- writer
 
 /// Encoded segment, uploaded as `seg-<digest>.meta` and `.tree`.
+#[derive(Clone)]
 pub struct Sealed {
     pub meta: Vec<u8>,
     pub tree: Vec<u8>,
@@ -629,6 +630,21 @@ impl Sealed {
     pub fn uses_digest(&self) -> Option<SegDigest> {
         self.uses.as_deref().map(SegDigest::digest)
     }
+}
+
+fn uses_object(keys: &BTreeSet<Key>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + keys.len() * 20);
+    out.extend(MAGIC_USES);
+    push_u32(&mut out, keys.len());
+    for k in keys {
+        out.extend(k);
+    }
+    out
+}
+
+/// A `.uses` object for `hashes`; also how a list of path hashes travels.
+pub fn encode_uses<'a>(hashes: impl IntoIterator<Item = &'a PathHash>) -> Vec<u8> {
+    uses_object(&hashes.into_iter().map(|h| *key_of(h)).collect())
 }
 
 /// Decode a `.uses` object.
@@ -811,15 +827,7 @@ impl SegmentWriter {
         tree.extend(&frames);
 
         self.uses.retain(|k| !self.entries.contains_key(k));
-        let uses = (!self.uses.is_empty()).then(|| {
-            let mut out = Vec::with_capacity(8 + self.uses.len() * 20);
-            out.extend(MAGIC_USES);
-            push_u32(&mut out, self.uses.len());
-            for k in &self.uses {
-                out.extend(k);
-            }
-            out
-        });
+        let uses = (!self.uses.is_empty()).then(|| uses_object(&self.uses));
         let header = Header {
             packs: self.packs,
             tree: SegDigest::digest(&tree),

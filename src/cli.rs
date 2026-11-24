@@ -52,6 +52,16 @@ pub struct ServeArgs {
     #[arg(long, value_name = "SECONDS")]
     pub follow: Option<u64>,
 
+    /// Drain through the cache node at this URL: it says what is stored
+    /// and publishes for this daemon, which then loads no index to drain.
+    #[arg(long, value_name = "URL")]
+    pub node: Option<String>,
+
+    /// Be a cache node for other daemons' drains (`--node`): publish what
+    /// they hand in as one segment, at most once in this many milliseconds.
+    #[arg(long, value_name = "MILLISECONDS")]
+    pub commit_interval: Option<u64>,
+
     /// Branch name for the manifest root key
     /// [default: $GITHUB_REF_NAME, or "local"].
     #[arg(long)]

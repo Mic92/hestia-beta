@@ -17,6 +17,11 @@
 //! the mixed cluster, for each workload alone, and under shifted prices and
 //! failure rates, to see which choices survive all of them.
 //!
+//! Last, the mix is scaled from 1 to 2000 machines and the search confined
+//! to one deployment at a time: no nodes (every builder keeps the keys and
+//! uses the bucket itself), one node, two or more. `DETAIL=1` prints the
+//! three designs behind each row.
+//!
 //! Everything under "assumptions" is assumed: link and node figures,
 //! prices, failure rates, the shape of both steps. The per-path figures of
 //! the coarse step are scale_sim's trace. The output ranks designs under
@@ -48,7 +53,7 @@ const UPLINK_BPS: f64 = 600e6;
 const NODE_CORES: f64 = 16.0;
 const NODE_RAM_MAX: f64 = 512.0 * GB;
 const NODE_SSD_MAX: f64 = 8000.0 * GB;
-const NODE_RAM_BASE: f64 = 8.0 * GB;
+const NODE_RAM_BASE: f64 = 1.0 * GB;
 const SSD_READ_BPS: f64 = 2e9;
 const CPU_KEY_RAM_S: f64 = 3e-6;
 const CPU_KEY_SSD_S: f64 = 20e-6;
@@ -227,6 +232,12 @@ struct Design {
     /// A step reports before its outputs are uploaded; whoever asks for
     /// them early waits.
     write_behind: bool,
+    /// No cache nodes: every builder keeps the keys on its own disk, synced
+    /// from the bucket, and reads and writes blobs there itself. One of
+    /// them merges the index.
+    embedded: bool,
+    /// A cache node is a process on a builder machine, not a machine.
+    hosted: bool,
 }
 
 /// The hybrid design as first written down.
@@ -251,6 +262,8 @@ fn first_draft() -> Design {
         local_checkpoint: false,
         fetch_with_lookup: false,
         write_behind: false,
+        embedded: false,
+        hosted: false,
     }
 }
 
@@ -335,7 +348,128 @@ impl Report {
     }
 }
 
+/// The bucket's index above the runs: levels with periods spread evenly
+/// (in ratio) between the flush and the top. Bytes and PUTs a day that
+/// merging them costs, and the objects they are stored in.
+fn index_upkeep(d: &Design, index_bps: f64, live_bytes: f64, window_days: f64) -> (f64, f64, f64) {
+    let top = d.top_days * DAY;
+    let levels = d.levels as usize;
+    let period = |i: usize| match d.expiry {
+        // p0 = flush .. p(levels-1) = top
+        Expiry::Merge if levels == 1 => top,
+        Expiry::Merge => d.flush_s * (top / d.flush_s).powf(i as f64 / (levels - 1) as f64),
+        // p0 = flush .. p(levels) = top, the partition itself
+        Expiry::Partitions => d.flush_s * (top / d.flush_s).powf(i as f64 / levels as f64),
+    };
+    let (mut up, mut puts, mut objects) = (0.0, 0.0, 0.0);
+    for i in 0..levels {
+        let held = if i + 1 < levels || d.expiry == Expiry::Partitions {
+            index_bps * period(i + 1).min(top) / 2.0
+        } else {
+            live_bytes
+        };
+        let shards = if d.shards > 0.0 {
+            d.shards
+        } else {
+            (held / d.shard_bytes).ceil().max(1.0)
+        };
+        let merges = DAY / period(i);
+        up += merges * held;
+        puts += merges * shards;
+        objects += shards;
+    }
+    if d.expiry == Expiry::Partitions {
+        // Older partitions are kept, not rewritten.
+        objects *= (window_days / d.top_days).max(1.0);
+    }
+    (up, puts, objects)
+}
+
+/// A design without nodes: builders against the bucket, keys on their own
+/// disks.
+fn evaluate_embedded(d: &Design, classes: &[Class; 2], w: &World) -> Report {
+    let mut r = Report::default();
+    let slot_s = |c: &Class| w.builder_per_hour / 3600.0 * c.slot;
+    let machines: f64 = classes
+        .iter()
+        .map(|c| c.steps_per_s * c.step_s * c.slot)
+        .sum();
+    let (mut key_disk, mut bucket_data, mut index_bps, mut live_index) = (0.0, 0.0, 0.0, 0.0);
+    let (mut puts, mut gets, mut up, mut down, mut runs_per_s) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for (i, c) in classes.iter().enumerate() {
+        if c.steps_per_s == 0.0 {
+            continue;
+        }
+        if !d.bucket[i] {
+            r.infeasible = Some(format!("{} has nowhere to go without nodes", c.name));
+        }
+        let saved = if d.sampled[i] { c.sample_saves } else { 0.0 };
+        let samples = if d.sampled[i] { c.sample_rows } else { 0.0 };
+        let outputs_per_s = c.steps_per_s * c.outputs;
+        let row_bytes = KEY_ROW + c.body_bytes + samples * 2.0 * KEY_ROW;
+        let live = outputs_per_s * c.window_days * DAY;
+        let out_bytes = c.outputs * c.out_bytes * (1.0 - saved);
+        key_disk += live * row_bytes;
+        live_index += live * row_bytes;
+        bucket_data += outputs_per_s * c.out_bytes * (1.0 - saved) * c.window_days * DAY;
+        index_bps += outputs_per_s * row_bytes + live * c.touched / DAY * KEY_ROW;
+
+        // Lookups are local. Inputs and outputs cross to the bucket; an
+        // output asked for before the keys have synced costs one GET.
+        let mut wait = SSD_LOOKUP_S
+            + BUCKET_GET_S
+            + c.fetches * c.fetch_bytes / BUCKET_DOWN_BPS
+            + RACED * BUCKET_GET_S;
+        if d.sampled[i] && c.sample_load_bytes > 0.0 {
+            wait += BUCKET_GET_S;
+        }
+        let write = 2.0 * BUCKET_PUT_S + out_bytes / BUCKET_UP_BPS;
+        wait += if d.write_behind { RACED * write } else { write };
+        r.wait_s[i] = wait;
+        r.terms[i] = wait * c.steps_per_s * DAY * slot_s(c);
+
+        // A pack and a run per step, or per machine and flush when the
+        // step does not wait for them.
+        let class_machines = c.steps_per_s * c.step_s * c.slot;
+        let writes = if d.write_behind {
+            (c.steps_per_s).min(class_machines / d.flush_s)
+        } else {
+            c.steps_per_s
+        };
+        runs_per_s += writes;
+        puts += 2.0 * writes * DAY;
+        gets += c.steps_per_s * (c.fetches + RACED) * DAY;
+        up += outputs_per_s * c.out_bytes * (1.0 - saved) * DAY;
+        down += c.steps_per_s * c.fetches * c.fetch_bytes * DAY;
+    }
+    // One builder merges; every builder lists once a flush and fetches what
+    // is new: the runs, or the first level's shards if those are fewer.
+    let (merged, merge_puts, _) = index_upkeep(d, index_bps, live_index, classes[1].window_days);
+    let first_level = if d.shards > 0.0 { d.shards } else { 1.0 };
+    let syncs = machines * DAY / d.flush_s;
+    puts += merge_puts + syncs; // a LIST is priced as a PUT
+    gets += syncs * (runs_per_s * d.flush_s).min(first_level).max(1.0);
+    // A row comes down once as a run and once more from every level.
+    down += machines * index_bps * DAY * (1.0 + d.levels);
+    up += index_bps * DAY + merged;
+    r.puts_per_day = puts;
+    r.up_gb_per_day = up / GB;
+    r.index_up_gb_per_day = (index_bps * DAY + merged) / GB;
+    r.ssd_gb = key_disk / GB;
+    r.terms[2] = machines * key_disk / GB * w.ssd_gb_day;
+    r.terms[3] = puts * w.put + gets * w.get;
+    r.terms[4] = (bucket_data + live_index) / GB * w.store_gb_day;
+    r.terms[5] = up / GB * w.upload_gb + down / GB * w.download_gb;
+    if up / DAY > UPLINK_BPS {
+        r.infeasible = Some(format!("the uplink would carry {:.0} MB/s", up / DAY / 1e6));
+    }
+    r
+}
+
 fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
+    if d.embedded {
+        return evaluate_embedded(d, classes, w);
+    }
     let mut r = Report::default();
     let slot_s = |c: &Class| w.builder_per_hour / 3600.0 * c.slot;
     // Share of a class's blobs one node holds, and of all keys.
@@ -486,42 +620,13 @@ fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
     if ssd > NODE_SSD_MAX {
         r.infeasible = Some(format!("a node needs {:.0} GB of disk", ssd / GB));
     }
-    r.terms[2] = d.nodes * (w.node_per_day + ram / GB * w.ram_gb_day + ssd / GB * w.ssd_gb_day);
+    let machine = if d.hosted { 0.0 } else { w.node_per_day };
+    r.terms[2] = d.nodes * (machine + ram / GB * w.ram_gb_day + ssd / GB * w.ssd_gb_day);
 
-    // ---- the bucket's index: runs, then levels with periods spread evenly
-    // (in ratio) between the flush and the top
-    let top = d.top_days * DAY;
-    let levels = d.levels as usize;
-    let period = |i: usize| match d.expiry {
-        // p0 = flush .. p(levels-1) = top
-        Expiry::Merge if levels == 1 => top,
-        Expiry::Merge => d.flush_s * (top / d.flush_s).powf(i as f64 / (levels - 1) as f64),
-        // p0 = flush .. p(levels) = top, the partition itself
-        Expiry::Partitions => d.flush_s * (top / d.flush_s).powf(i as f64 / levels as f64),
-    };
-    let mut index_up = index_bps * DAY; // the runs
-    let mut index_puts = d.nodes * DAY / d.flush_s;
-    let mut index_objects = 0.0;
-    for i in 0..levels {
-        let held = if i + 1 < levels || d.expiry == Expiry::Partitions {
-            index_bps * period(i + 1).min(top) / 2.0
-        } else {
-            bucket_index
-        };
-        let shards = if d.shards > 0.0 {
-            d.shards
-        } else {
-            (held / d.shard_bytes).ceil().max(1.0)
-        };
-        let merges = DAY / period(i);
-        index_up += merges * held;
-        index_puts += merges * shards;
-        index_objects += shards;
-    }
-    if d.expiry == Expiry::Partitions {
-        // Older partitions are kept, not rewritten.
-        index_objects *= (classes[1].window_days / d.top_days).max(1.0);
-    }
+    let (merged, merge_puts, index_objects) =
+        index_upkeep(d, index_bps, bucket_index, classes[1].window_days);
+    let index_up = index_bps * DAY + merged; // the runs, then the levels
+    let index_puts = d.nodes * DAY / d.flush_s + merge_puts;
     cpu += index_up / DAY * CPU_MERGE_BYTE_S;
     r.load = cpu / (d.nodes * NODE_CORES);
     if r.load > MAX_LOAD {
@@ -571,7 +676,6 @@ fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
     // the bucket (or at all, for a class the bucket never gets).
     let recopy_days = node_data / NODE_BPS / DAY;
     let losses = d.nodes * w.node_losses;
-    let everyone: f64 = classes.iter().map(|c| c.steps_per_s * slot_s(c)).sum();
     let mut redo = 0.0;
     let mut redone = 0.0;
     for (i, c) in classes.iter().enumerate() {
@@ -614,15 +718,18 @@ fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
         }
     }
     // With one copy of the keys, nobody can look anything up while its node
-    // is away.
+    // is away: every machine idles.
     if key_copies == 1.0 {
+        let idle: f64 = classes
+            .iter()
+            .map(|c| c.steps_per_s * c.step_s * slot_s(c))
+            .sum();
         let away = if d.nodes == 1.0 {
             REPLACE_S
         } else {
             r.restart_s.max(60.0)
         };
-        r.terms[7] += restarts * r.restart_s * everyone * r.restart_s / 2.0
-            + losses * away * everyone * away / 2.0;
+        r.terms[7] += (restarts * r.restart_s + losses * away) * idle;
     }
     r.terms[6] = redo;
     r.redone_steps_per_year = redone;
@@ -651,6 +758,13 @@ fn mutations() -> Vec<Mutation> {
         ("coarse: one copy fewer", |d, _| {
             d.replicas[1] = (d.replicas[1] - 1.0).max(1.0)
         }),
+        (
+            "no nodes: builders hold the keys and use the bucket",
+            |d, _| (d.embedded, d.bucket) = (true, [true, true]),
+        ),
+        ("cache nodes", |d, _| d.embedded = false),
+        ("nodes run on builder machines", |d, _| d.hosted = true),
+        ("nodes are machines of their own", |d, _| d.hosted = false),
         ("inputs come with the lookup", |d, _| {
             d.fetch_with_lookup = true
         }),
@@ -730,7 +844,19 @@ fn mutations() -> Vec<Mutation> {
 }
 
 fn improve(classes: &[Class; 2], w: &World, rpc: &Rpc, verbose: bool) -> (Design, Report) {
-    let mut design = first_draft();
+    improve_within(classes, w, rpc, verbose, first_draft(), |_| true)
+}
+
+/// The search from `start`, over designs `allowed` admits.
+fn improve_within(
+    classes: &[Class; 2],
+    w: &World,
+    rpc: &Rpc,
+    verbose: bool,
+    start: Design,
+    allowed: fn(&Design) -> bool,
+) -> (Design, Report) {
+    let mut design = start;
     let mut report = evaluate(&design, classes, w, rpc);
     if verbose {
         println!(
@@ -744,7 +870,7 @@ fn improve(classes: &[Class; 2], w: &World, rpc: &Rpc, verbose: bool) -> (Design
         for (name, apply) in mutations() {
             let mut next = design.clone();
             apply(&mut next, classes);
-            if next == design {
+            if next == design || !allowed(&next) {
                 continue;
             }
             let r = evaluate(&next, classes, w, rpc);
@@ -792,6 +918,26 @@ fn reason(r: &Report) -> String {
 
 fn describe(d: &Design, r: &Report, classes: &[Class; 2]) {
     let on = |b: bool, yes: &'static str, no: &'static str| if b { yes } else { no };
+    if d.embedded {
+        println!(
+            "    no nodes: builders keep the keys ({:.1} GB each), sync every {:.0} s, upload {}; waits {:.0} ms (fine), {:.0} ms (coarse)",
+            r.ssd_gb,
+            d.flush_s,
+            on(
+                d.write_behind,
+                "after the step reports",
+                "before the step reports"
+            ),
+            r.wait_s[0] * 1e3,
+            r.wait_s[1] * 1e3,
+        );
+        print!("    $/day:");
+        for (name, v) in TERMS.iter().zip(r.terms) {
+            print!("  {name} {v:.2}");
+        }
+        println!("  = {}", money(r.total()));
+        return;
+    }
     println!(
         "    {} nodes; inputs {}; outputs uploaded {}, acknowledged by {}; every {:.0} s to the bucket; {}; keys {}",
         d.nodes,
@@ -955,5 +1101,73 @@ fn main() {
             reason(&transplanted)
         );
         describe(&d, &r, &classes);
+    }
+
+    // The same mix at other sizes, the search confined to one deployment
+    // at a time.
+    println!(
+        "\nother cluster sizes, nine machines in ten compiling objects: $ a day by deployment"
+    );
+    println!(
+        "  {:>8} | {:>9} {:>9} {:>9} | {:>7} | best: nodes, copies (fine, coarse), fine kept in, waits fine / coarse",
+        "machines", "no nodes", "one node", "two up", "of cost"
+    );
+    let modes: [fn(&Design) -> bool; 3] = [
+        |d| d.embedded,
+        |d| !d.embedded && d.nodes == 1.0,
+        |d| !d.embedded && d.nodes >= 2.0,
+    ];
+    for machines in [1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 500.0, 2000.0] {
+        let classes = [fine(machines * 0.9), coarse(machines * 0.1)];
+        let results = modes.map(|allowed| {
+            let mut start = first_draft();
+            start.embedded = allowed(&Design {
+                embedded: true,
+                ..first_draft()
+            });
+            start.nodes = if allowed(&Design {
+                nodes: 1.0,
+                replicas: [1.0, 1.0],
+                ..first_draft()
+            }) {
+                start.replicas = [1.0, 1.0];
+                1.0
+            } else {
+                4.0
+            };
+            improve_within(&classes, &WORLD, &rpc, false, start, allowed)
+        });
+        let (d, r) = results
+            .iter()
+            .min_by(|a, b| a.1.total().total_cmp(&b.1.total()))
+            .unwrap();
+        if std::env::var("DETAIL").is_ok() {
+            for (d, r) in &results {
+                describe(d, r, &classes);
+            }
+        }
+        let builders = machines * 24.0 * WORLD.builder_per_hour;
+        println!(
+            "  {:>8} | {:>9} {:>9} {:>9} | {:>6.2}% | {}, ({}, {}), {}, {:.0} / {:.0} ms",
+            machines,
+            money(results[0].1.total()),
+            money(results[1].1.total()),
+            money(results[2].1.total()),
+            r.total() / builders * 100.0,
+            if d.embedded {
+                "none".to_string()
+            } else {
+                format!("{}{}", d.nodes, if d.hosted { " on builders" } else { "" })
+            },
+            d.replicas[0],
+            d.replicas[1],
+            if d.embedded || d.bucket[0] {
+                "bucket"
+            } else {
+                "nodes only"
+            },
+            r.wait_s[0] * 1e3,
+            r.wait_s[1] * 1e3,
+        );
     }
 }

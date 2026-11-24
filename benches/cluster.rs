@@ -308,6 +308,62 @@ async fn main() {
     futures_util::future::join_all(needs.iter().map(|wanted| substitute(&base, wanted))).await;
     row(&format!("{builders} builders, one shared daemon"), t, &net);
     server.abort();
+    // The same daemon with a pack cache that never read these packs: the
+    // half every builder needs is missed by all of them at once.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let packs = Arc::new(PackCache::open(dir.path(), 1 << 40).unwrap());
+        let cached = Backend::Cached(Cached::new(sim.backend.clone(), packs));
+        let (base, server) = serve(&node, &cached).await;
+        let t = Instant::now();
+        futures_util::future::join_all(needs.iter().map(|wanted| substitute(&base, wanted))).await;
+        row(
+            &format!("{builders} builders, one node, disk empty"),
+            t,
+            &net,
+        );
+        server.abort();
+    }
+
+    // BUILDERS machines hand a pack to the node at once. The node stores
+    // each before it answers, or answers from its disk and stores after.
+    {
+        let pack_mb = env("HESTIA_BENCH_PACK_MB", 16) as usize;
+        let dir = tempfile::tempdir().unwrap();
+        let packs = Arc::new(PackCache::open(dir.path(), 1 << 40).unwrap());
+        let cached = Cached::new(sim.backend.clone(), packs);
+        let pack = |mode: u64, b: u64| {
+            let mut data = vec![0u8; pack_mb << 20];
+            data[..16].copy_from_slice(&[mode.to_le_bytes(), b.to_le_bytes()].concat());
+            let key = format!("pack-{}", hestia::manifest::Hash32::digest(&data[..16]));
+            (key, bytes::Bytes::from(data))
+        };
+        let t = Instant::now();
+        futures_util::future::join_all((0..builders).map(|b| {
+            let (key, data) = pack(0, b);
+            let cached = &cached;
+            async move { cached.put(&key, data).await.unwrap() }
+        }))
+        .await;
+        row(
+            &format!("{builders} x {pack_mb} MiB packs, store first"),
+            t,
+            &net,
+        );
+        let t = Instant::now();
+        let keys: Vec<String> = futures_util::future::join_all((0..builders).map(|b| {
+            let (key, data) = pack(1, b);
+            let cached = &cached;
+            async move {
+                assert_eq!(cached.put_behind(&key, data).await.unwrap(), None);
+                key
+            }
+        }))
+        .await;
+        row("  node answers first: answered", t, &net);
+        cached.settled(&keys).await.unwrap();
+        row("  node answers first: stored", t, &net);
+    }
 
     // A second daemon that loaded before the drain below.
     let other = load(None).await;

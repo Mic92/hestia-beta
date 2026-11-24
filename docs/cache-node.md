@@ -95,10 +95,11 @@ started with `--commit-interval <MILLISECONDS>` serves it two requests
    are where a rebuild's chunks repeat, so the builder uploads only
    chunks they lack.
 2. The builder uploads its packs through the node (see below).
-3. `POST /hestia/commit` with the sealed segment. The node merges what
-   arrives within its commit interval into one segment, publishes one
-   head and answers every builder with its name. A builder's drain has
-   returned only once its paths are published, as before.
+3. `POST /hestia/commit` with the sealed segment. The node waits until
+   the bucket has the packs the segment names, merges what arrives
+   within its commit interval into one segment, publishes one head and
+   answers every builder with its name. A builder's drain has returned
+   only once its paths are published, as before.
 
 The node adds the paths it served since its last commit as used, so a
 path that is fetched but never rebuilt stays alive across GC. A commit
@@ -130,15 +131,17 @@ disk, up to `--pack-cache-size` (`src/backend/cached.rs`):
 
 - **Uploads.** A builder behind the node sends its packs to
   `PUT /hestia/pack/<key>`. The node checks the key is the hash of the
-  body, stores the pack in the bucket, keeps it, and then answers. A
-  builder needs no bucket credentials to upload, and a head never names
-  a pack the bucket lacks.
+  body, writes the pack to its disk and answers. The bucket gets the
+  pack afterwards, eight packs at a time. A builder needs no bucket
+  credentials to upload.
 - **Reads.** What a read is missing is fetched in 256 KiB blocks and
   kept. Blocks, not the ranges asked for, so a later read that overlaps
   an earlier one finds it. Whole packs are not fetched: a scattered
-  fetch touches a small part of many packs.
-- **Eviction.** The least recently used pack goes first. A pack GC
-  deletes is dropped by the node that ran the GC at once.
+  fetch touches a small part of many packs. Readers that miss the same
+  block at the same moment fetch it once.
+- **Eviction.** The least recently used pack goes first. A pack the
+  bucket does not have yet is never evicted. A pack GC deletes is
+  dropped by the node that ran the GC at once.
 - **Restart.** A clean exit records what is kept and the next start is
   warm. After a crash the disk cannot be trusted and the cache starts
   empty.
@@ -162,9 +165,48 @@ The block size was chosen on the scattered rows: 128 KiB downloads
 same number of requests. The paths here are 1 KiB each, which favours
 small blocks.
 
-Not done: two reads that miss the same block at the same moment both
-fetch it. The builder's upload returns only after the bucket has the
-pack, so it still waits for the uplink.
+With the disk empty and 20 builders asking one node at once, half of
+each builder's 200 paths the same on all of them:
+
+| | Wall time | Bucket requests | Downloaded |
+|---|---|---|---|
+| No pack cache | 4604 ms | 1782 | 343.9 MB |
+| Pack cache, every reader fetches what it misses | 4042 ms | 1616 | 422.1 MB |
+| Pack cache, one fetch per block | 3442 ms | 1274 | 331.6 MB |
+
+#### A head never names a pack the bucket lacks
+
+The node answers a pack upload before the bucket has the pack, so
+three rules keep a published segment whole:
+
+- A commit waits for the packs its segment names. Only then does it
+  join the group that is published.
+- A pack the bucket refused fails every commit that names it, until a
+  builder hands the pack in again. The builder's drain fails and its
+  paths stay buffered for the next one, as with any failed drain.
+- A node that died forgot which packs it still owed. The plan carries
+  a number that names the node process, the commit sends it back, and a
+  node refuses a commit planned with another process.
+
+Packs waiting for the bucket may fill half the cache. Past that an
+upload waits for room, and a pack larger than that half goes to the
+bucket before the node answers. Waiting packs are read from disk when
+their turn comes and cost no memory. A clean exit waits for all of
+them.
+
+20 builders hand in a 16 MiB pack each at once:
+
+| | Builders answered after | Bucket has all after |
+|---|---|---|
+| Bucket first | 2796 ms | 2796 ms |
+| Node's disk first | 105 ms | 2814 ms |
+
+The drain as a whole still ends with the commit, which waits for the
+bucket, so a builder that waits for its drain gains nothing from this
+yet. What it gains is that chunking and packing the rest of a large
+drain are no longer held up by the uplink. Not measured: a drain end
+to end through a node, and a commit that returns before the bucket has
+the packs.
 
 ### Which pack to evict
 

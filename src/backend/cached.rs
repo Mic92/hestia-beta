@@ -10,6 +10,11 @@
 //!
 //! Only reads are answered from disk. Whether a pack exists is still the
 //! bucket's word, so GC and the eviction check see what is really stored.
+//!
+//! A pack a builder hands in ([`Cached::put_behind`]) is answered once it
+//! is on this disk and goes to the bucket afterwards. Until it is there
+//! it cannot be evicted, and whoever publishes a segment naming it waits
+//! for it first ([`Cached::settled`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -29,6 +34,8 @@ const PACK_PREFIX: &str = "pack-";
 const INDEX: &str = "index";
 /// Missing parts of a pack are fetched in multiples of this.
 const BLOCK: u64 = 256 * 1024;
+/// Packs on their way to the bucket behind the builders' backs, at once.
+const BEHIND_UPLOADS: usize = 8;
 
 #[derive(Default)]
 struct Entry {
@@ -38,6 +45,9 @@ struct Entry {
     bytes: u64,
     /// The pack's length, once it was seen whole.
     len: Option<u64>,
+    /// The bucket does not have this pack yet: not in `State::order`, so
+    /// never evicted.
+    pinned: bool,
 }
 
 impl Entry {
@@ -111,7 +121,9 @@ impl State {
         if let Some(entry) = self.entries.get_mut(key) {
             self.order.remove(&entry.tick);
             entry.tick = tick;
-            self.order.insert(tick, key.to_owned());
+            if !entry.pinned {
+                self.order.insert(tick, key.to_owned());
+            }
         }
     }
 
@@ -338,6 +350,34 @@ impl PackCache {
         self.evict();
     }
 
+    /// Holds a pack that is kept whole until [`PackCache::unpin`].
+    fn pin(&self, key: &str) -> bool {
+        let mut state = self.state.lock().expect("pack cache lock poisoned");
+        let Some(entry) = state.entries.get_mut(key) else {
+            return false;
+        };
+        if !entry.len.is_some_and(|len| entry.covers(&(0..len))) {
+            return false;
+        }
+        entry.pinned = true;
+        let tick = entry.tick;
+        state.order.remove(&tick);
+        true
+    }
+
+    fn unpin(&self, key: &str) {
+        {
+            let mut state = self.state.lock().expect("pack cache lock poisoned");
+            let Some(entry) = state.entries.get_mut(key) else {
+                return;
+            };
+            entry.pinned = false;
+            let tick = entry.tick;
+            state.order.insert(tick, key.to_owned());
+        }
+        self.evict();
+    }
+
     fn remove(&self, key: &str) {
         let known = self
             .state
@@ -369,15 +409,217 @@ impl PackCache {
     }
 }
 
+/// Whether a pack handed in by a builder reached the bucket: `None`
+/// while it is on its way.
+type Landed = tokio::sync::watch::Receiver<Option<Result<(), String>>>;
+
+/// One lock per block of a pack that is being fetched, so that readers
+/// missing the same block fetch it once.
+#[derive(Default)]
+struct Flights(Mutex<HashMap<(String, u64), BlockLock>>);
+
+type BlockLock = Arc<tokio::sync::Mutex<()>>;
+
+struct Flight<'a> {
+    flights: &'a Flights,
+    key: &'a str,
+    held: Vec<(u64, tokio::sync::OwnedMutexGuard<()>)>,
+}
+
+impl Flights {
+    /// Blocks are taken in ascending order, so two readers never wait on
+    /// each other.
+    async fn hold<'a>(&'a self, key: &'a str, range: &Range<u64>) -> Flight<'a> {
+        let mut flight = Flight {
+            flights: self,
+            key,
+            held: Vec::new(),
+        };
+        for block in range.start / BLOCK..range.end.div_ceil(BLOCK) {
+            let lock = Arc::clone(
+                self.0
+                    .lock()
+                    .expect("flight lock poisoned")
+                    .entry((key.to_owned(), block))
+                    .or_default(),
+            );
+            flight.held.push((block, lock.lock_owned().await));
+        }
+        flight
+    }
+}
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        let mut flights = self.flights.0.lock().expect("flight lock poisoned");
+        for (block, guard) in self.held.drain(..) {
+            drop(guard);
+            let id = (self.key.to_owned(), block);
+            // Whoever waits for this block holds a reference of their own.
+            if flights.get(&id).is_some_and(|l| Arc::strong_count(l) == 1) {
+                flights.remove(&id);
+            }
+        }
+    }
+}
+
 /// `inner` with its packs read through and written through a [`PackCache`].
 pub struct Cached {
     pub inner: Backend,
     pub packs: Arc<PackCache>,
+    flights: Flights,
+    /// Packs builders were told are taken that the bucket may not have:
+    /// on their way, or failed and not handed in again since.
+    behind: Mutex<HashMap<String, Landed>>,
+    uploads: tokio::sync::Semaphore,
+    /// KiB of packs that may wait for the bucket at once.
+    waiting: Arc<tokio::sync::Semaphore>,
+    waiting_kib: u32,
 }
 
 impl Cached {
     pub fn new(inner: Backend, packs: Arc<PackCache>) -> Arc<Cached> {
-        Arc::new(Cached { inner, packs })
+        // Pinned packs must leave room for what is read.
+        let waiting_kib = u32::try_from(packs.capacity / 2 / 1024).unwrap_or(u32::MAX);
+        Arc::new(Cached {
+            inner,
+            packs,
+            flights: Flights::default(),
+            behind: Mutex::default(),
+            uploads: tokio::sync::Semaphore::new(BEHIND_UPLOADS),
+            waiting: Arc::new(tokio::sync::Semaphore::new(waiting_kib as usize)),
+            waiting_kib,
+        })
+    }
+
+    /// Takes a builder's pack and answers `None` once it is on this disk;
+    /// the bucket gets it afterwards. A pack too large to wait here goes
+    /// to the bucket first, as [`Cached::put`] does, and the answer says
+    /// whether the bucket lacked it.
+    pub async fn put_behind(
+        self: &Arc<Self>,
+        key: &str,
+        data: Bytes,
+    ) -> Result<Option<bool>, Error> {
+        let kib = (data.len() as u64).div_ceil(1024);
+        if kib > u64::from(self.waiting_kib) {
+            let created = self.put(key, data).await?;
+            if !created {
+                self.inner.touch(key).await?;
+            }
+            return Ok(Some(created));
+        }
+        let (landed, landing) = tokio::sync::watch::channel(None);
+        {
+            let mut behind = self.behind.lock().expect("behind lock poisoned");
+            if behind.get(key).is_some_and(|l| l.borrow().is_none()) {
+                // The same pack from another builder is on its way.
+                return Ok(None);
+            }
+            behind.insert(key.to_owned(), landing);
+        }
+        let (kept, on_disk) = tokio::sync::oneshot::channel();
+        let (this, key) = (Arc::clone(self), key.to_owned());
+        // A task of its own: the builder hanging up must not leave the
+        // pack recorded as on its way for ever.
+        tokio::spawn(async move {
+            let outcome = this.land(&key, data, kib as u32, kept).await;
+            match &outcome {
+                Ok(()) => {
+                    this.behind
+                        .lock()
+                        .expect("behind lock poisoned")
+                        .remove(&key);
+                }
+                Err(err) => {
+                    eprintln!("hestia: {key} did not reach the store: {err}");
+                    this.packs.remove(&key);
+                }
+            }
+            let _ = landed.send(Some(outcome));
+        });
+        // Dropped unsent when the pack could not be kept: then this waits
+        // for the bucket.
+        let _ = on_disk.await;
+        Ok(None)
+    }
+
+    async fn land(
+        &self,
+        key: &str,
+        data: Bytes,
+        kib: u32,
+        kept: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<(), String> {
+        let _room = Arc::clone(&self.waiting)
+            .acquire_many_owned(kib)
+            .await
+            .map_err(|err| err.to_string())?;
+        self.keep(key, 0, &data, true).await;
+        let pinned = self.packs.pin(key);
+        // From here the pack is read from disk again when its turn comes,
+        // so waiting packs cost no memory.
+        let data = if pinned {
+            let _ = kept.send(());
+            None
+        } else {
+            Some(data)
+        };
+        let sent = async {
+            let _turn = self.uploads.acquire().await.map_err(|e| e.to_string())?;
+            let data = match data {
+                Some(data) => data,
+                None => {
+                    let (packs, owned) = (Arc::clone(&self.packs), key.to_owned());
+                    tokio::task::spawn_blocking(move || packs.read(&owned, None))
+                        .await
+                        .ok()
+                        .flatten()
+                        .ok_or("the kept copy is gone")?
+                }
+            };
+            if !self.inner.put(key, data).await.map_err(|e| e.to_string())? {
+                self.inner.touch(key).await.map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+        .await;
+        if pinned {
+            self.packs.unpin(key);
+        }
+        sent
+    }
+
+    /// Waits until the bucket has every pack of `keys` that was handed in
+    /// through [`Cached::put_behind`]. A pack that did not get there
+    /// fails this until it is handed in again.
+    pub async fn settled(&self, keys: &[String]) -> Result<(), String> {
+        let waiting: Vec<(String, Landed)> = {
+            let behind = self.behind.lock().expect("behind lock poisoned");
+            keys.iter()
+                .filter_map(|key| Some((key.clone(), behind.get(key)?.clone())))
+                .collect()
+        };
+        for (key, mut landed) in waiting {
+            let outcome = landed
+                .wait_for(Option::is_some)
+                .await
+                .map_err(|_| format!("{key}: upload abandoned"))?
+                .clone();
+            if let Some(Err(err)) = outcome {
+                return Err(format!("{key} did not reach the store: {err}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Waits for every pack that is on its way to the bucket.
+    pub async fn settle_all(&self) {
+        let keys: Vec<String> = {
+            let behind = self.behind.lock().expect("behind lock poisoned");
+            behind.keys().cloned().collect()
+        };
+        let _ = self.settled(&keys).await;
     }
 
     pub async fn get(&self, key: &str, range: Option<Range<u64>>) -> Result<Option<Bytes>, Error> {
@@ -442,6 +684,9 @@ impl Cached {
         around: Range<u64>,
     ) -> Result<Option<Bytes>, Error> {
         let mut fetched = 0;
+        // Another reader may be fetching these blocks: then nothing is
+        // missing once it is done.
+        let flight = self.flights.hold(key, &around).await;
         for gap in self.packs.missing(key, &around) {
             let Some(data) = self.inner.get(key, Some(gap.clone())).await? else {
                 return Ok(None);
@@ -449,6 +694,7 @@ impl Cached {
             fetched += data.len() as u64;
             self.keep(key, gap.start, &data, false).await;
         }
+        drop(flight);
         self.packs.misses.fetch_add(1, Ordering::Relaxed);
         self.packs.miss_bytes.fetch_add(fetched, Ordering::Relaxed);
         let (packs, owned) = (Arc::clone(&self.packs), key.to_owned());
@@ -468,6 +714,11 @@ impl Cached {
         let created = self.inner.put(key, data.clone()).await?;
         if key.starts_with(PACK_PREFIX) {
             self.keep(key, 0, &data, true).await;
+            // The bucket has it now, whatever happened to an earlier try.
+            let mut behind = self.behind.lock().expect("behind lock poisoned");
+            if behind.get(key).is_some_and(|l| l.borrow().is_some()) {
+                behind.remove(key);
+            }
         }
         Ok(created)
     }
@@ -547,6 +798,28 @@ mod tests {
         assert!(!cache.path(&key(2)).exists());
         let stats = cache.stats();
         assert_eq!((stats.evicted, stats.used), (1, 200));
+    }
+
+    #[test]
+    fn a_pack_the_store_lacks_is_not_evicted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = PackCache::open(dir.path(), 250).unwrap();
+        cache.store(&key(1), 0, &[1; 100], false);
+        assert!(!cache.pin(&key(1)), "only a whole pack can be held");
+        cache.store(&key(1), 0, &[1; 100], true);
+        assert!(cache.pin(&key(1)));
+        for n in 2..=4 {
+            cache.store(&key(n), 0, &[n; 100], true);
+        }
+        assert!(cache.read(&key(1), None).is_some(), "oldest, but held");
+        assert!(cache.read(&key(2), None).is_none());
+        cache.unpin(&key(1));
+        cache.store(&key(5), 0, &[5; 100], true);
+        assert!(
+            cache.read(&key(3), None).is_none(),
+            "the read made 1 recent"
+        );
+        assert!(cache.read(&key(1), None).is_some());
     }
 
     #[test]

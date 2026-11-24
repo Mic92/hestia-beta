@@ -356,3 +356,103 @@ async fn gc_over_dav() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// A cache node's pack cache in front of the share.
+
+fn pack_key(n: u8) -> String {
+    format!("pack-{}", format!("{n:02x}").repeat(32))
+}
+
+fn requests_for(dav: &FakeDav, method: &str, key: &str) -> usize {
+    dav.take_requests()
+        .iter()
+        .filter(|r| r.starts_with(method) && r.ends_with(key))
+        .count()
+}
+
+#[tokio::test]
+async fn a_node_takes_a_pack_before_the_store_has_it() {
+    use hestia::backend::cached::{Cached, PackCache};
+    let dav = FakeDav::start().await;
+    let store = dav.backend();
+    let dir = tempfile::tempdir().unwrap();
+    let packs = Arc::new(PackCache::open(dir.path(), 1 << 20).unwrap());
+    let node = Cached::new(store.clone(), Arc::clone(&packs));
+    let (key, data) = (pack_key(1), Bytes::from(vec![7u8; 5000]));
+
+    dav.set_rtt(Duration::from_millis(300));
+    assert_eq!(node.put_behind(&key, data.clone()).await.unwrap(), None);
+    assert_eq!(requests_for(&dav, "PUT", &key), 0, "answered from disk");
+    // The same pack from a second builder rides on the first upload.
+    assert_eq!(node.put_behind(&key, data.clone()).await.unwrap(), None);
+    // Readers get it from the node meanwhile.
+    assert_eq!(
+        node.get(&key, Some(10..20)).await.unwrap().unwrap().len(),
+        10
+    );
+    assert_eq!(packs.stats().hits, 1);
+
+    node.settled(std::slice::from_ref(&key)).await.unwrap();
+    dav.set_rtt(Duration::ZERO);
+    assert_eq!(store.get(&key, None).await.unwrap(), Some(data));
+    assert_eq!(requests_for(&dav, "PUT", &key), 1);
+    // Packs nobody handed in are nobody's to wait for.
+    node.settled(&[pack_key(9)]).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pack_the_store_refused_fails_its_commit_until_handed_in_again() {
+    use hestia::backend::cached::{Cached, PackCache};
+    let dav = FakeDav::start().await;
+    let store = dav.backend();
+    let dir = tempfile::tempdir().unwrap();
+    let packs = Arc::new(PackCache::open(dir.path(), 1 << 20).unwrap());
+    let node = Cached::new(store.clone(), Arc::clone(&packs));
+    let (key, data) = (pack_key(2), Bytes::from(vec![3u8; 5000]));
+    let keys = std::slice::from_ref(&key);
+
+    dav.set_read_only(true);
+    assert_eq!(node.put_behind(&key, data.clone()).await.unwrap(), None);
+    assert!(node.settled(keys).await.is_err());
+    assert!(node.settled(keys).await.is_err(), "and stays failed");
+    assert_eq!(packs.stats().used, 0, "a pack the store lacks is not kept");
+
+    dav.set_read_only(false);
+    assert_eq!(node.put_behind(&key, data.clone()).await.unwrap(), None);
+    node.settled(keys).await.unwrap();
+    assert_eq!(store.get(&key, None).await.unwrap(), Some(data));
+}
+
+#[tokio::test]
+async fn readers_missing_the_same_block_fetch_it_once() {
+    use hestia::backend::cached::{Cached, PackCache};
+    let dav = FakeDav::start().await;
+    let store = dav.backend();
+    let dir = tempfile::tempdir().unwrap();
+    let packs = Arc::new(PackCache::open(dir.path(), 1 << 30).unwrap());
+    let node = Cached::new(store.clone(), packs);
+    let key = pack_key(3);
+    let len = 1_000_000u64;
+    let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    store.put(&key, Bytes::from(data.clone())).await.unwrap();
+    dav.take_requests();
+
+    dav.set_rtt(Duration::from_millis(100));
+    // Sixteen readers of one block, and one of the block after it.
+    let same = (0..16u64).map(|i| {
+        let range = 1000 * i..1000 * i + 500;
+        let (node, key) = (&node, &key);
+        async move { (range.clone(), node.get_pack(key, range, len).await) }
+    });
+    let (answers, other) = tokio::join!(
+        futures_util::future::join_all(same),
+        node.get_pack(&key, 300_000..300_100, len),
+    );
+    for (range, answer) in answers {
+        let want = &data[range.start as usize..range.end as usize];
+        assert_eq!(answer.unwrap().unwrap(), want);
+    }
+    assert_eq!(other.unwrap().unwrap(), &data[300_000..300_100]);
+    assert_eq!(requests_for(&dav, "GET", &key), 2, "one fetch per block");
+}

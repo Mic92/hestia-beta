@@ -91,6 +91,8 @@ struct DaemonState {
     /// As a cache node: what builders sealed and wait to see published.
     commits: Mutex<Vec<PendingCommit>>,
     commit_wake: tokio::sync::Notify,
+    /// Names this process to builders ([`Plan::boot`]).
+    boot: u64,
     /// Last time anything happened (for idle-exit).
     last_activity: Arc<Mutex<Instant>>,
     /// Number of operations currently in progress (drains, substituter
@@ -221,6 +223,7 @@ impl DaemonState {
             .map_err(|err| err.to_string())?;
         Ok(Plan {
             epoch: snapshot.view.epoch,
+            boot: self.boot,
             present,
             packs: packs.into_iter().collect(),
         })
@@ -350,6 +353,12 @@ impl Daemon {
                 drain_lock: tokio::sync::Mutex::new(()),
                 commits: Mutex::default(),
                 commit_wake: tokio::sync::Notify::new(),
+                boot: {
+                    use std::hash::{BuildHasher as _, Hasher as _};
+                    std::collections::hash_map::RandomState::new()
+                        .build_hasher()
+                        .finish()
+                },
                 last_activity: Arc::new(Mutex::new(Instant::now())),
                 in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -403,10 +412,25 @@ impl Daemon {
             if state.pipeline.read_only.load(Ordering::Relaxed) {
                 return (StatusCode::FORBIDDEN, b"this node is read-only".to_vec());
             }
-            let (epoch, sealed) = match crate::node::decode_commit(&body) {
+            let (epoch, boot, sealed) = match crate::node::decode_commit(&body) {
                 Ok(commit) => commit,
                 Err(err) => return (StatusCode::BAD_REQUEST, err.to_string().into_bytes()),
             };
+            if boot != state.boot {
+                // Packs the builder handed to the process before this one
+                // may never have reached the store.
+                let why = b"the node restarted since the plan".to_vec();
+                return (StatusCode::CONFLICT, why);
+            }
+            // Packs this node took and still owes the store: the segment
+            // must not be published before they are there.
+            let packs: Vec<String> = match crate::segment::Meta::open(&sealed.meta) {
+                Ok(meta) => meta.packs.iter().map(|p| pack_cache_key(&p.hash)).collect(),
+                Err(err) => return (StatusCode::BAD_REQUEST, err.to_string().into_bytes()),
+            };
+            if let Err(err) = state.pipeline.backend.settled(&packs).await {
+                return (StatusCode::CONFLICT, err.into_bytes());
+            }
             let (reply, published) = tokio::sync::oneshot::channel();
             state
                 .commits
@@ -439,15 +463,19 @@ impl Daemon {
             }
             let backend = &state.pipeline.backend;
             let stored = async {
+                if let Backend::Cached(cached) = backend {
+                    return cached.put_behind(&key, body).await;
+                }
                 let created = backend.put(&key, body).await?;
                 if !created {
                     backend.touch(&key).await?;
                 }
-                Ok::<_, crate::backend::Error>(created)
+                Ok::<_, crate::backend::Error>(Some(created))
             };
             match stored.await {
-                Ok(true) => (StatusCode::OK, "created"),
-                Ok(false) => (StatusCode::OK, "existed"),
+                Ok(None) => (StatusCode::OK, "accepted"),
+                Ok(Some(true)) => (StatusCode::OK, "created"),
+                Ok(Some(false)) => (StatusCode::OK, "existed"),
                 Err(err) => {
                     eprintln!("hestia serve: storing {key} for a builder failed: {err}");
                     (StatusCode::BAD_GATEWAY, "the store refused the pack")
@@ -591,6 +619,11 @@ impl Daemon {
             if more.head.is_some() {
                 stats.head = more.head;
             }
+        }
+
+        // Packs taken from builders that the store does not have yet.
+        if let Backend::Cached(cached) = &state.pipeline.backend {
+            cached.settle_all().await;
         }
 
         // Let connection tasks flush their responses (e.g. the drain

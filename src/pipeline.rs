@@ -647,7 +647,7 @@ impl PipelineContext {
         let commit_started = Instant::now();
         let sealed = writer.seal().map_err(store::Error::from)?;
         stats.head = Some(match (&self.node, plan, snapshot) {
-            (Some(node), Some(plan), _) => node.commit(plan.epoch, &sealed).await?,
+            (Some(node), Some(plan), _) => node.commit(&plan, &sealed).await?,
             (_, _, Some(snapshot)) => self.publish_sealed(&snapshot, &sealed).await?,
             _ => unreachable!(),
         });

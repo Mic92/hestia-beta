@@ -200,6 +200,15 @@ impl Backend {
         }
     }
 
+    /// Waits until the store has those of `keys` that were taken ahead
+    /// of it ([`cached::Cached::put_behind`]).
+    pub async fn settled(&self, keys: &[String]) -> Result<(), String> {
+        match self {
+            Backend::Cached(b) => b.settled(keys).await,
+            _ => Ok(()),
+        }
+    }
+
     /// Persist backend bookkeeping: the GHCR ledger, the S3 head index.
     pub async fn flush(&self) -> Result<(), Error> {
         match self {

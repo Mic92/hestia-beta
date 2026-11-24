@@ -930,6 +930,21 @@ async fn builders_drain_through_a_node() {
         .expect("third drain");
     assert_eq!((again.pushed, again.skipped_existing), (0, 1));
 
+    // A commit made from the plan of another node process is refused:
+    // that process may have taken packs the store never got.
+    let client = hestia::node::NodeClient::new(http.clone(), &url);
+    let mut plan = client.plan(Vec::new()).await.expect("plan");
+    plan.boot ^= 1;
+    let mut writer = hestia::segment::SegmentWriter::default();
+    writer.use_path(&path_hash_of(&seeded));
+    let refused = client.commit(&plan, &writer.seal().unwrap()).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("restarted")),
+        "{refused:?}"
+    );
+
     committer.abort();
     server.abort();
 }

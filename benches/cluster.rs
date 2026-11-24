@@ -20,6 +20,9 @@
 //!   follow        another daemon picking up the compaction
 //!   compact       the same again after four more drains
 //!   follow        another daemon picking that up
+//!
+//! With HISTORY set, that many small drains follow, a compaction for every
+//! four and no GC, and a drain and a refresh are measured again.
 
 #[path = "../tests/support/mod.rs"]
 mod support;
@@ -287,6 +290,54 @@ async fn main() {
     assert!(head.is_some(), "compaction did not run");
     row("compact, 4 drains later", t, &net);
     let t = Instant::now();
-    let _ = load(Some(other)).await;
+    let other = load(Some(other)).await;
     row("follow that compaction", t, &net);
+
+    // A day in the life of the root: many small drains, a compaction for
+    // every four, no GC in between. What do the heads cost by then?
+    let history = env("HESTIA_BENCH_HISTORY", 0);
+    if history == 0 {
+        return;
+    }
+    net.set_rtt(Duration::ZERO);
+    net.set_bandwidth(0);
+    let started = Instant::now();
+    let mut later = now + 7200;
+    for round in 0..history {
+        let i = paths + 1000 * new + round;
+        let built = [path(i, size)];
+        let sealed = sim
+            .drain(&snapshot, ROOT, &[&built[0]], &used[..10])
+            .await
+            .expect("published");
+        snapshot = Arc::new(snapshot.refresh_with(&sealed).await.unwrap());
+        if round % 4 == 3 {
+            later += 120;
+            snapshot.maybe_compact(ROOT, later, 0.0).await.unwrap();
+            snapshot = load(Some(snapshot)).await;
+        }
+    }
+    println!(
+        "\n{history} drains later ({:.0} s to set up), {} segments live",
+        started.elapsed().as_secs_f64(),
+        snapshot.view.roots[ROOT].len()
+    );
+    net.take();
+    net.take_bytes();
+    net.set_rtt(Duration::from_millis(rtt));
+    net.set_bandwidth(mbit * 1_000_000 / 8);
+    let t = Instant::now();
+    let _ = load(Some(other)).await;
+    row("follow", t, &net);
+    let built = [path(paths + 2000 * new, size)];
+    let t = Instant::now();
+    let sealed = sim
+        .drain(&snapshot, ROOT, &[&built[0]], &used[..10])
+        .await
+        .expect("published");
+    let snapshot = Arc::new(snapshot.refresh_with(&sealed).await.unwrap());
+    row("drain 1 new, 10 used", t, &net);
+    let t = Instant::now();
+    let _ = load(Some(snapshot)).await;
+    row("follow, nothing new", t, &net);
 }

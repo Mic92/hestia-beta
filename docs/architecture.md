@@ -88,7 +88,7 @@ replaced some), `g-<epoch>-<time>-<id>` (GC rewrote every root). A reader
 lists the heads, takes the newest GC record as the base and applies
 the drain and compaction heads published since. Between GC runs a busy
 root would pile up segments, so a drain that sees several pending folds
-them into one and says so with a `c-*` head. Drains elect themselves
+similar-sized ones into one and says so with a `c-*` head. Drains elect themselves
 for this at random, with odds scaled so that about one per minute wins
 however many run concurrently. `docs/spec/segments.qnt`
 is the model of these rules.
@@ -157,9 +157,11 @@ substituted. GC compacts each root to the union of what drains pushed
 or used since its previous run, taking the entries of used paths from
 the root's previous segment or any other live one, so matrix legs and
 re-runs accumulate while closures no job uses any more die. GC is the
-only deleter: it repacks mostly-dead packs, publishes the new GC head
-and only then deletes what neither the new view nor the previous one
-references (`src/gc.rs`).
+only deleter of content: it repacks mostly-dead packs, publishes the new
+GC head and only then deletes what neither the new view nor the previous
+one references (`src/gc.rs`). A compaction removes only the heads it
+replaced, so that a listing holds what is live and not the root's
+history.
 
 ### Crash safety
 

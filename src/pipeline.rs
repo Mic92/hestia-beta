@@ -633,7 +633,12 @@ impl PipelineContext {
             .maybe_compact(&self.root_key, now, f64::from(nanos) / 1e9)
             .await
         {
-            Ok(Some(name)) => eprintln!("hestia: compacted {} into {name}", self.root_key),
+            Ok(Some(name)) => {
+                eprintln!("hestia: compacted {} into {name}", self.root_key);
+                if let Err(err) = self.backend.flush().await {
+                    eprintln!("hestia: cannot update the head index: {err}");
+                }
+            }
             Ok(None) => {}
             Err(err) => eprintln!("hestia: compaction skipped: {err}"),
         }

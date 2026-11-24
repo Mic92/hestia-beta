@@ -1,7 +1,8 @@
 //! Garbage collection over the segmented store: compact every root to one
 //! segment, repack mostly-dead packs, publish `g-<epoch+1>`, then delete
 //! what neither the new view nor this run's inputs name. GC is the only
-//! deleter and the only clock (`docs/spec/segments.qnt`).
+//! deleter of content and the only clock (`docs/spec/segments.qnt`, which
+//! does not model a compaction removing the heads it replaced).
 
 use std::collections::{BTreeSet, HashMap};
 

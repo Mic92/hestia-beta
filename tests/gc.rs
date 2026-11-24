@@ -482,7 +482,12 @@ async fn drain_compaction_folds_pending_segments_and_gc_folds_it() {
         assert_eq!(after.view.roots[ROOT].len(), 1, "{:?}", after.view);
         assert_eq!(after.view.heads.len(), 1);
         sim.assert_readable(&refs).await;
-        assert_eq!(sim.stored_keys("seg-").await.len(), 6, "nothing deleted");
+        assert_eq!(sim.stored_keys("seg-").await.len(), 6, "no segment deleted");
+        assert_eq!(
+            sim.stored_keys("h-").await.len() + sim.stored_keys("c-").await.len(),
+            1,
+            "the heads it replaced are gone from the listing"
+        );
 
         fake.set_clock(T0 + 3 * HOUR);
         let stats = sim.run_gc(GcPolicy::default(), T0 + 3 * HOUR).await;

@@ -379,7 +379,8 @@ impl Snapshot {
     ///
     /// Only segments of similar size are folded (see [`compaction_set`]):
     /// folding all of them rewrote the whole root for every few drains,
-    /// and every reader then fetched it again.
+    /// and every reader then fetched it again. The heads replaced are
+    /// removed, so a listing holds what is live and not the root's history.
     pub async fn maybe_compact(
         &self,
         root: &str,
@@ -447,9 +448,22 @@ impl Snapshot {
             subsumes: pending.iter().map(|(n, _)| (*n).to_owned()).collect(),
             time: now,
         };
-        Ok(Some(
-            put_compaction(&self.backend, &self.trust, record, self.view.epoch).await?,
-        ))
+        let subsumed = record.subsumes.clone();
+        let name = put_compaction(&self.backend, &self.trust, record, self.view.epoch).await?;
+        // The heads just replaced say nothing the new one does not, and
+        // left in place every reader lists them, and fetches the record of
+        // each compaction among them, until the next GC. A reader that
+        // listed them a moment ago still finds their segments. Stores
+        // that refuse the delete keep them for GC.
+        let failed = join_all(subsumed.iter().map(|head| self.backend.delete(head)))
+            .await
+            .into_iter()
+            .filter(Result::is_err)
+            .count();
+        if failed > 0 {
+            eprintln!("hestia: {failed} replaced heads could not be removed, left for GC");
+        }
+        Ok(Some(name))
     }
 
     /// Copy a stored entry into `writer`. `false` if no served segment has it.

@@ -4,6 +4,7 @@
 //!
 //!   cargo run --release --example hybrid_sim
 //!   cargo run --release --example hybrid_sim -- --fine-machines 0 --coarse-machines 500
+//!   cargo run --release --example hybrid_sim -- --object-bytes 10000
 //!
 //! A design is a set of knobs (`Design`). `evaluate` turns it into dollars a
 //! day: builder time spent waiting on the cache, node hardware, bucket
@@ -31,6 +32,8 @@ mod common;
 use common::Rng;
 
 const DAY: f64 = 86400.0;
+/// `--object-bytes`: compressed size of a compiled object.
+static OBJECT_BYTES: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 const GB: f64 = 1e9;
 const KEY_ROW: f64 = 32.0;
 const PACK_BYTES: f64 = 64.0 * 1048576.0;
@@ -136,6 +139,7 @@ struct Class {
 
 /// A compiled object per step: scale_sim's `--fine`.
 fn fine(machines: f64) -> Class {
+    let object = *OBJECT_BYTES.get().unwrap_or(&17000.0);
     Class {
         name: "fine",
         steps_per_s: machines * 16.0 / 10.0,
@@ -143,9 +147,9 @@ fn fine(machines: f64) -> Class {
         slot: 1.0 / 16.0,
         lookups: 30.0,
         fetches: 2.0,
-        fetch_bytes: 17000.0,
+        fetch_bytes: object,
         outputs: 1.0,
-        out_bytes: 17000.0,
+        out_bytes: object,
         body_bytes: 93.0 + 120.0,
         sample_lookups: 1.0,
         sample_rows: 1.0,
@@ -1023,6 +1027,9 @@ fn main() {
         match flag.as_str() {
             "--fine-machines" => fine_machines = value,
             "--coarse-machines" => coarse_machines = value,
+            "--object-bytes" => {
+                OBJECT_BYTES.set(value).ok();
+            }
             other => {
                 eprintln!("unknown flag {other}");
                 std::process::exit(2);

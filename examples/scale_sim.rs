@@ -4,6 +4,11 @@
 //!
 //!   cargo run --release --example scale_sim
 //!   cargo run --release --example scale_sim -- --roots /nix/store/a-nixos-system-…,/nix/store/b-nixos-system-…
+//!   cargo run --release --example scale_sim -- --fine [--shards 65536] [--window-days 3]
+//!
+//! `--fine` prices a derivation per compiled object instead of one per
+//! package: short steps, sixteen at once on a machine, one small output.
+//! Its sizes are assumed, not traced.
 //!
 //! Two parts.
 //!
@@ -56,6 +61,7 @@
 mod common;
 use common::{MIB, Rng};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::OnceLock;
 
 use hestia::chunker::{PackBuilder, chunk_path};
 use hestia::manifest::{ChunkHash, PathHash};
@@ -67,17 +73,13 @@ use hestia::refnorm::RefTable;
 // measured: manifest_bench, oci_probe (as in compaction_sim)
 const META_BYTES_COMPACTED: f64 = 93.0;
 const META_BYTES_PENDING: f64 = 350.0;
-const TREE_BYTES: f64 = 600.0;
 const TAG_BYTES: f64 = 90.0;
 /// `PackIndex::ROW`
 const PACK_INDEX_ROW: f64 = 32.0;
 
 // proposed, by construction
-const SHARDS: f64 = 256.0;
 /// Key table row: 20 byte key, offset and length of the body, last-used day.
 const KEY_ROW: f64 = 32.0;
-/// A path's body: what `.meta` and `.tree` hold for it today.
-const BODY_BYTES: f64 = META_BYTES_COMPACTED + TREE_BYTES;
 /// A sampled chunk's body: the pack that holds it.
 const SAMPLE_BODY: f64 = 32.0;
 /// The sampling rate the model prices (see the trace for the others).
@@ -116,13 +118,65 @@ const NODE: Link = Link {
 };
 const PARALLEL: f64 = 32.0;
 
-// a build step
-const STEP_S: f64 = 240.0;
-const STEP_LOOKUPS: f64 = 60.0; // narinfo queries, hit or miss
-const STEP_FETCHES: f64 = 6.0; // inputs not on the builder's disk
-const STEP_PATHS: f64 = 1.3; // outputs
-/// Paths stay in the root this long after their last use.
-const WINDOW_DAYS: f64 = 14.0;
+/// The shape of a build step and of the cluster around it.
+#[derive(Clone, Copy)]
+struct Shape {
+    /// Seconds a step runs, and how many run on a machine at once.
+    step_s: f64,
+    jobs: f64,
+    /// Narinfo queries, hit or miss.
+    lookups: f64,
+    /// Inputs not on the builder's disk.
+    fetches: f64,
+    /// Outputs.
+    paths: f64,
+    /// Paths stay in the root this long after their last use.
+    window_days: f64,
+    /// Shards per root and kind.
+    shards: f64,
+    /// A path's `.tree` bytes.
+    tree_bytes: f64,
+}
+
+impl Shape {
+    /// A path's body: what `.meta` and `.tree` hold for it today.
+    fn body_bytes(&self) -> f64 {
+        META_BYTES_COMPACTED + self.tree_bytes
+    }
+}
+
+/// A package per step: one job a machine, four minutes, a 600 byte tree
+/// (manifest_bench, oci_probe).
+const COARSE: Shape = Shape {
+    step_s: 240.0,
+    jobs: 1.0,
+    lookups: 60.0,
+    fetches: 6.0,
+    paths: 1.3,
+    window_days: 14.0,
+    shards: 256.0,
+    tree_bytes: 600.0,
+};
+
+/// A compiled object per step. All assumed: ten seconds on one of sixteen
+/// cores, the sources and headers mostly on disk already, one output of a
+/// single file.
+const FINE: Shape = Shape {
+    step_s: 10.0,
+    jobs: 16.0,
+    lookups: 30.0,
+    fetches: 2.0,
+    paths: 1.0,
+    window_days: 14.0,
+    shards: 256.0,
+    tree_bytes: 120.0,
+};
+
+static SHAPE: OnceLock<Shape> = OnceLock::new();
+fn sh() -> &'static Shape {
+    SHAPE.get().expect("shape is set in main")
+}
+
 const DAY_S: f64 = 86400.0;
 
 // today's maintenance
@@ -391,6 +445,31 @@ const MEASURED: Measured = Measured {
     },
 };
 
+/// Not measured. A compiled object: 50 KiB, a third of that compressed,
+/// one chunk, in one pack. An object that changed shares nothing with its
+/// predecessor, so both finders upload it whole; the name hint still loads
+/// the predecessor's pack index, the sampled lookup of the first chunk
+/// misses.
+const FINE_MEASURED: Measured = Measured {
+    path_bytes: 17000.0,
+    names: Found {
+        upload_per_path: 17000.0,
+        loads_per_path: 1.0,
+        rows_per_load: 1.0,
+        lookups_per_path: 0.0,
+        new_samples_per_path: 0.0,
+        packs_per_path: 1.0,
+    },
+    sampled: Found {
+        upload_per_path: 17000.0,
+        loads_per_path: 0.0,
+        rows_per_load: 1.0,
+        lookups_per_path: 1.0,
+        new_samples_per_path: 1.0,
+        packs_per_path: 1.0,
+    },
+};
+
 fn found(t: &Tally) -> Found {
     Found {
         upload_per_path: t.upload_bytes / t.paths,
@@ -565,17 +644,17 @@ struct Cluster {
 
 impl Cluster {
     fn of(machines: f64) -> Self {
-        let steps_per_s = machines / STEP_S;
+        let steps_per_s = machines * sh().jobs / sh().step_s;
         Cluster {
             steps_per_s,
-            root_paths: steps_per_s * STEP_PATHS * WINDOW_DAYS * DAY_S,
+            root_paths: steps_per_s * sh().paths * sh().window_days * DAY_S,
         }
     }
 }
 
 /// Shards a batch of `keys` uniformly hashed keys lands in.
 fn shards_hit(keys: f64) -> f64 {
-    SHARDS * (1.0 - (1.0 - 1.0 / SHARDS).powf(keys))
+    sh().shards * (1.0 - (1.0 - 1.0 / sh().shards).powf(keys))
 }
 
 fn today(c: &Cluster, m: &Measured, kept: bool) -> Step {
@@ -583,12 +662,12 @@ fn today(c: &Cluster, m: &Measured, kept: bool) -> Step {
     // Heads::load: list, the GC and compaction heads, every segment's .meta.
     let heads = c.steps_per_s * GC_INTERVAL_S / 2.0;
     let pending = c.steps_per_s * COMPACT_COOLDOWN_S / 2.0;
-    let since_gc_paths = heads * STEP_PATHS;
+    let since_gc_paths = heads * sh().paths;
     // A reload reuses the segments it holds: only the pending ones are new.
     let mut reload = Cost::default();
     reload.list(link, heads);
     reload.get(link, 4.0, 0.0);
-    reload.get(link, pending, pending * STEP_PATHS * META_BYTES_PENDING);
+    reload.get(link, pending, pending * sh().paths * META_BYTES_PENDING);
     let mut load = reload;
     load.get(
         link,
@@ -597,16 +676,16 @@ fn today(c: &Cluster, m: &Measured, kept: bool) -> Step {
     );
     // The first resolve fetches the base segment's .tree whole.
     let mut tree = Cost::default();
-    tree.get(link, 1.0, c.root_paths * TREE_BYTES);
+    tree.get(link, 1.0, c.root_paths * sh().tree_bytes);
 
     let mut start = if kept { reload } else { load };
     let mut read_index = Cost::default();
     if kept {
         // The base .meta and .tree change when GC rewrites them: their
         // fetch is spread over the steps in between.
-        let steps = GC_INTERVAL_S / STEP_S;
+        let steps = GC_INTERVAL_S / sh().step_s;
         let mut base = Cost::default();
-        base.get(link, 2.0, c.root_paths * BODY_BYTES);
+        base.get(link, 2.0, c.root_paths * sh().body_bytes());
         start.requests += base.requests / steps;
         start.bytes += base.bytes / steps;
         start.secs += base.secs / steps;
@@ -615,19 +694,23 @@ fn today(c: &Cluster, m: &Measured, kept: bool) -> Step {
     }
     // Lookups are answered from memory. Each input needs its packs'
     // indexes for the offsets.
-    let packs = STEP_FETCHES * m.names.packs_per_path;
+    let packs = sh().fetches * m.names.packs_per_path;
     read_index.get(link, packs, packs * m.names.rows_per_load * PACK_INDEX_ROW);
     let mut read_data = Cost::default();
-    read_data.get(link, packs, STEP_FETCHES * m.path_bytes);
+    read_data.get(link, packs, sh().fetches * m.path_bytes);
 
     // The drain reloads, loads the name hints' pack indexes, and writes the
     // pack, .meta, .tree and head.
     let mut write_index = reload;
-    let hints = STEP_PATHS * m.names.loads_per_path;
+    let hints = sh().paths * m.names.loads_per_path;
     write_index.get(link, hints, hints * m.names.rows_per_load * PACK_INDEX_ROW);
-    write_index.put(link, 3.0, STEP_PATHS * (META_BYTES_PENDING + TREE_BYTES));
+    write_index.put(
+        link,
+        3.0,
+        sh().paths * (META_BYTES_PENDING + sh().tree_bytes),
+    );
     let mut write_data = Cost::default();
-    write_data.put(link, 1.0, STEP_PATHS * m.names.upload_per_path);
+    write_data.put(link, 1.0, sh().paths * m.names.upload_per_path);
 
     Step {
         start,
@@ -636,7 +719,7 @@ fn today(c: &Cluster, m: &Measured, kept: bool) -> Step {
         write_index,
         write_data,
         // GC folds everything into a new base .meta and .tree.
-        upkeep_bytes_per_day: DAY_S / GC_INTERVAL_S * c.root_paths * BODY_BYTES,
+        upkeep_bytes_per_day: DAY_S / GC_INTERVAL_S * c.root_paths * sh().body_bytes(),
     }
 }
 
@@ -654,21 +737,21 @@ impl Index {
         }
     }
     fn bytes(&self) -> f64 {
-        self.path_rows * (KEY_ROW + BODY_BYTES) + self.sample_rows * (KEY_ROW + SAMPLE_BODY)
+        self.path_rows * (KEY_ROW + sh().body_bytes()) + self.sample_rows * (KEY_ROW + SAMPLE_BODY)
     }
     /// All levels' key tables of one path shard.
     fn path_keys(&self) -> f64 {
-        self.path_rows / SHARDS * KEY_ROW
+        self.path_rows / sh().shards * KEY_ROW
     }
     /// All levels of one sample shard, keys and bodies.
     fn sample_shard(&self) -> f64 {
-        self.sample_rows / SHARDS * (KEY_ROW + SAMPLE_BODY)
+        self.sample_rows / sh().shards * (KEY_ROW + SAMPLE_BODY)
     }
     /// Bytes merges write per day. A level holds the rows younger than
     /// the next level's period, half of them on average, and is rewritten
     /// every period of its own; the last holds everything.
     fn upkeep(&self, periods: &[f64]) -> f64 {
-        let per_s = self.bytes() / (WINDOW_DAYS * DAY_S);
+        let per_s = self.bytes() / (sh().window_days * DAY_S);
         periods
             .iter()
             .enumerate()
@@ -698,22 +781,22 @@ fn shards(c: &Cluster, m: &Measured) -> Step {
     // Every level's key table of every shard a lookup lands in, then one
     // body per input. Bodies carry pack offsets.
     let mut read_index = Cost::default();
-    let hit = shards_hit(STEP_LOOKUPS);
+    let hit = shards_hit(sh().lookups);
     read_index.get(link, LEVELS * hit, hit * index.path_keys());
-    read_index.get(link, STEP_FETCHES, STEP_FETCHES * BODY_BYTES);
+    read_index.get(link, sh().fetches, sh().fetches * sh().body_bytes());
     let mut read_data = Cost::default();
     read_data.get(
         link,
-        STEP_FETCHES * m.sampled.packs_per_path,
-        STEP_FETCHES * m.path_bytes,
+        sh().fetches * m.sampled.packs_per_path,
+        sh().fetches * m.path_bytes,
     );
 
     // Sampled chunks are looked up in their shards, hits load pack indexes,
     // then one run goes up beside the pack.
     let mut write_index = Cost::default();
-    let hit = shards_hit(STEP_PATHS * m.sampled.lookups_per_path);
+    let hit = shards_hit(sh().paths * m.sampled.lookups_per_path);
     write_index.get(link, LEVELS * hit, hit * index.sample_shard());
-    let loads = STEP_PATHS * m.sampled.loads_per_path;
+    let loads = sh().paths * m.sampled.loads_per_path;
     write_index.get(
         link,
         loads,
@@ -721,7 +804,7 @@ fn shards(c: &Cluster, m: &Measured) -> Step {
     );
     write_index.put(link, 1.0, run_bytes);
     let mut write_data = Cost::default();
-    write_data.put(link, 1.0, STEP_PATHS * m.sampled.upload_per_path);
+    write_data.put(link, 1.0, sh().paths * m.sampled.upload_per_path);
 
     Step {
         start,
@@ -738,27 +821,27 @@ fn cache_node(c: &Cluster, m: &Measured) -> Step {
     // The node answers a batch of keys from memory and returns the bodies
     // asked for; new rows reach it directly, so there are no runs to read.
     let mut read_index = Cost::default();
-    read_index.get(NODE, 1.0, STEP_FETCHES * BODY_BYTES);
+    read_index.get(NODE, 1.0, sh().fetches * sh().body_bytes());
     let mut read_data = Cost::default();
-    let ranges = STEP_FETCHES * m.sampled.packs_per_path;
-    read_data.get(NODE, ranges, NODE_HIT * STEP_FETCHES * m.path_bytes);
+    let ranges = sh().fetches * m.sampled.packs_per_path;
+    read_data.get(NODE, ranges, NODE_HIT * sh().fetches * m.path_bytes);
     // What the node lacks it fetches from the bucket while the step waits.
     read_data.secs += (1.0 - NODE_HIT)
         * ((ranges / PARALLEL).ceil() * BUCKET.get_s
-            + STEP_FETCHES * m.path_bytes / BUCKET.down_bps);
-    read_data.bytes += (1.0 - NODE_HIT) * STEP_FETCHES * m.path_bytes;
+            + sh().fetches * m.path_bytes / BUCKET.down_bps);
+    read_data.bytes += (1.0 - NODE_HIT) * sh().fetches * m.path_bytes;
 
     let mut write_index = Cost::default();
     write_index.get(NODE, 1.0, 0.0);
-    let loads = STEP_PATHS * m.sampled.loads_per_path;
+    let loads = sh().paths * m.sampled.loads_per_path;
     write_index.get(
         NODE,
         loads,
         loads * m.sampled.rows_per_load * PACK_INDEX_ROW,
     );
-    write_index.put(NODE, 1.0, STEP_PATHS * (KEY_ROW + BODY_BYTES));
+    write_index.put(NODE, 1.0, sh().paths * (KEY_ROW + sh().body_bytes()));
     let mut write_data = Cost::default();
-    write_data.put(NODE, 1.0, STEP_PATHS * m.sampled.upload_per_path);
+    write_data.put(NODE, 1.0, sh().paths * m.sampled.upload_per_path);
 
     Step {
         start: Cost::default(),
@@ -772,7 +855,8 @@ fn cache_node(c: &Cluster, m: &Measured) -> Step {
 
 /// Bytes of the rows one step publishes.
 fn run_bytes(m: &Measured) -> f64 {
-    STEP_PATHS * (KEY_ROW + BODY_BYTES + m.sampled.new_samples_per_path * (KEY_ROW + SAMPLE_BODY))
+    sh().paths
+        * (KEY_ROW + sh().body_bytes() + m.sampled.new_samples_per_path * (KEY_ROW + SAMPLE_BODY))
 }
 
 /// A coordinator's group commit: steps arrive at random, one flush runs at
@@ -823,16 +907,17 @@ fn coordinator(c: &Cluster, m: &Measured, serves: bool) -> Step {
     if serves {
         // One batch of keys, the bodies of the inputs back.
         step.read_index = Cost::default();
-        step.read_index.get(NODE, 1.0, STEP_FETCHES * BODY_BYTES);
+        step.read_index
+            .get(NODE, 1.0, sh().fetches * sh().body_bytes());
         write_index.get(NODE, 1.0, 0.0);
     } else {
         // The rows no level holds yet, in one answer.
         step.start.get(NODE, 1.0, pending);
         let index = Index::of(c, m);
-        let hit = shards_hit(STEP_PATHS * m.sampled.lookups_per_path);
+        let hit = shards_hit(sh().paths * m.sampled.lookups_per_path);
         write_index.get(BUCKET, LEVELS * hit, hit * index.sample_shard());
     }
-    let loads = STEP_PATHS * m.sampled.loads_per_path;
+    let loads = sh().paths * m.sampled.loads_per_path;
     write_index.get(
         BUCKET,
         loads,
@@ -851,15 +936,15 @@ fn coordinator_load(c: &Cluster, m: &Measured) {
     let commit = group_commit(c.steps_per_s, run_bytes(m));
     let keys = index.path_rows * KEY_ROW + index.sample_rows * (KEY_ROW + SAMPLE_BODY);
     let mut restart = Cost::default();
-    restart.list(BUCKET, LEVELS * 2.0 * SHARDS);
-    restart.get(BUCKET, LEVELS * 2.0 * SHARDS, keys);
+    restart.list(BUCKET, LEVELS * 2.0 * sh().shards);
+    restart.get(BUCKET, LEVELS * 2.0 * sh().shards, keys);
     // A flush is one PUT however many steps it carries: the ceiling is the
     // uplink.
     let ceiling = BUCKET.up_bps / run_bytes(m);
     println!(
         "  coordinator: {:.1} steps/s in, {:.0} lookups/s if it serves; commit {:.0} ms mean, {:.0} ms p99 (own run: {:.0} ms); {:.0} index objects/day instead of {:.0} runs",
         c.steps_per_s,
-        c.steps_per_s * (STEP_LOOKUPS + STEP_PATHS * m.sampled.lookups_per_path),
+        c.steps_per_s * (sh().lookups + sh().paths * m.sampled.lookups_per_path),
         commit.mean_s * 1e3,
         commit.p99_s * 1e3,
         BUCKET.put_s * 1e3,
@@ -871,14 +956,19 @@ fn coordinator_load(c: &Cluster, m: &Measured) {
         keys / 1e9,
         restart.secs,
         ceiling,
-        ceiling * STEP_S / 1e6,
+        ceiling * sh().step_s / sh().jobs / 1e6,
     );
 }
 
 fn model(m: &Measured) {
     println!(
-        "model: a step is {STEP_LOOKUPS} lookups, {STEP_FETCHES} substituted inputs of {:.2} MiB, {STEP_PATHS} outputs, every {STEP_S} s per machine",
-        m.path_bytes / MIB
+        "model: a step is {} lookups, {} substituted inputs of {:.2} MiB, {} outputs, takes {} s, {} at once per machine",
+        sh().lookups,
+        sh().fetches,
+        m.path_bytes / MIB,
+        sh().paths,
+        sh().step_s,
+        sh().jobs
     );
     println!(
         "       bucket {:.0} ms a GET, {:.0} ms a PUT, {:.0}/{:.0} MB/s; cache node {:.0} ms, {:.0} MB/s, holds {:.0}% of substituted bytes",
@@ -891,8 +981,10 @@ fn model(m: &Measured) {
         NODE_HIT * 100.0
     );
     println!(
-        "       paths kept {WINDOW_DAYS} days; today: GC every {:.0} min, compaction cooldown {COMPACT_COOLDOWN_S} s; shards: runs merged every {MERGE_PERIOD_S} s, dedup sampled 1/{MODEL_SAMPLE_RATE}\n",
-        GC_INTERVAL_S / 60.0
+        "       paths kept {} days; today: GC every {:.0} min, compaction cooldown {COMPACT_COOLDOWN_S} s; shards: {} per kind, runs merged every {MERGE_PERIOD_S} s, dedup sampled 1/{MODEL_SAMPLE_RATE}\n",
+        sh().window_days,
+        GC_INTERVAL_S / 60.0,
+        sh().shards
     );
 
     for machines in [10.0, 100.0, 500.0] {
@@ -961,8 +1053,14 @@ fn model(m: &Measured) {
 async fn main() {
     let mut roots: Vec<String> = Vec::new();
     let mut per_job = 1usize;
-    let mut args = std::env::args().skip(1);
+    let mut shape = COARSE;
+    let mut fine = false;
+    let mut args = std::env::args().skip(1).peekable();
     while let Some(flag) = args.next() {
+        if flag == "--fine" {
+            (shape, fine) = (FINE, true);
+            continue;
+        }
         let value = args.next().unwrap_or_else(|| {
             eprintln!("missing value for {flag}");
             std::process::exit(2);
@@ -970,6 +1068,10 @@ async fn main() {
         match flag.as_str() {
             "--roots" => roots = value.split(',').map(|s| s.trim().to_string()).collect(),
             "--paths-per-job" => per_job = value.parse().expect("--paths-per-job takes a number"),
+            "--shards" => shape.shards = value.parse().expect("--shards takes a number"),
+            "--window-days" => {
+                shape.window_days = value.parse().expect("--window-days takes a number")
+            }
             other => {
                 eprintln!("unknown flag {other}");
                 std::process::exit(2);
@@ -977,7 +1079,11 @@ async fn main() {
         }
     }
 
-    let measured = if roots.is_empty() {
+    SHAPE.set(shape).ok();
+    let measured = if fine {
+        println!("--fine: a compiled object per step, its sizes assumed (FINE_MEASURED)\n");
+        FINE_MEASURED
+    } else if roots.is_empty() {
         println!("no --roots: the model runs on the figures of the trace recorded in MEASURED\n");
         MEASURED
     } else {

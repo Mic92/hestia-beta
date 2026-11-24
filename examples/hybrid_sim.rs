@@ -39,6 +39,15 @@ static OBJECT_BYTES: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 /// `--step-s`, `--lookups`: seconds a compile takes and inputs it looks up.
 static FINE_STEP_S: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 static FINE_LOOKUPS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+/// `--delta-share`: what is left of a recompiled object stored as a delta
+/// to the object the same source file produced before. `object_delta`
+/// measured 17% to 52% between git releases.
+static DELTA_SHARE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+/// A node packs a delta at this rate and unpacks at that (bytes of the raw
+/// object, which is three times the compressed one): `object_delta`.
+const DELTA_PACK_BPS: f64 = 180e6;
+const DELTA_UNPACK_BPS: f64 = 600e6;
+const RAW_PER_STORED: f64 = 3.0;
 const GB: f64 = 1e9;
 const KEY_ROW: f64 = 32.0;
 const PACK_BYTES: f64 = 64.0 * 1048576.0;
@@ -284,6 +293,12 @@ struct Design {
     embedded: bool,
     /// A cache node is a process on a builder machine, not a machine.
     hosted: bool,
+    /// A compiled object's index entry is one fixed row holding where the
+    /// object is, with no separate body.
+    compact_fine: bool,
+    /// Nodes store a compiled object as a delta to the one the same source
+    /// file produced before, and hand out whole objects.
+    delta_fine: bool,
 }
 
 /// The hybrid design as first written down.
@@ -310,6 +325,8 @@ fn first_draft() -> Design {
         write_behind: false,
         embedded: false,
         hosted: false,
+        compact_fine: false,
+        delta_fine: false,
     }
 }
 
@@ -568,9 +585,18 @@ fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
         let saved = if d.sampled[i] { c.sample_saves } else { 0.0 };
         let outputs_per_s = c.steps_per_s * c.outputs;
         let samples = if d.sampled[i] { c.sample_rows } else { 0.0 };
-        let row_bytes = KEY_ROW + c.body_bytes + inline_bytes + samples * 2.0 * KEY_ROW;
+        // A compact row needs the output to be one blob in one place.
+        let compact = i == 0 && d.compact_fine && !d.sampled[i];
+        let body = if compact { 0.0 } else { c.body_bytes };
+        let row_bytes = KEY_ROW + body + inline_bytes + samples * 2.0 * KEY_ROW;
         let live = outputs_per_s * c.window_days * DAY;
-        let blob_bps = outputs_per_s * (c.out_bytes * (1.0 - saved) - inline_bytes);
+        let delta = i == 0 && d.delta_fine && !d.sampled[i];
+        let kept = if delta {
+            *DELTA_SHARE.get().unwrap_or(&0.5)
+        } else {
+            1.0
+        };
+        let blob_bps = outputs_per_s * (c.out_bytes * (1.0 - saved) - inline_bytes) * kept;
         rows += live * (1.0 + samples);
         body_bytes += live * (row_bytes - KEY_ROW * (1.0 + samples));
 
@@ -639,7 +665,16 @@ fn evaluate(d: &Design, classes: &[Class; 2], w: &World, rpc: &Rpc) -> Report {
         } + fetch_bytes / NODE_BPS
             + (1.0 - hit.powf(fetched)) * BUCKET_GET_S
             + (1.0 - hit) * fetch_bytes / BUCKET_DOWN_BPS;
-        miss_bps += c.steps_per_s * (1.0 - hit) * fetch_bytes;
+        // A delta read back from the bucket needs its base as well.
+        let from_bucket = if delta { kept + 1.0 } else { 1.0 };
+        if delta {
+            wait += (1.0 - hit.powf(fetched)) * BUCKET_GET_S
+                + (1.0 - hit) * fetch_bytes * kept / BUCKET_DOWN_BPS
+                + fetch_bytes * RAW_PER_STORED / DELTA_UNPACK_BPS;
+            cpu += c.steps_per_s * fetch_bytes * RAW_PER_STORED / DELTA_UNPACK_BPS
+                + outputs_per_s * c.out_bytes * RAW_PER_STORED / DELTA_PACK_BPS;
+        }
+        miss_bps += c.steps_per_s * (1.0 - hit) * fetch_bytes * from_bucket;
         if d.sampled[i] {
             wait += rpc.slowest_of(fan(c.outputs * c.sample_lookups)) + disk;
             if c.sample_load_bytes > 0.0 {
@@ -835,6 +870,10 @@ fn mutations() -> Vec<Mutation> {
         ("cache nodes", |d, _| d.embedded = false),
         ("nodes run on builder machines", |d, _| d.hosted = true),
         ("nodes are machines of their own", |d, _| d.hosted = false),
+        ("fine: one compact index row", |d, _| d.compact_fine = true),
+        ("fine: index row and body", |d, _| d.compact_fine = false),
+        ("fine: stored as deltas", |d, _| d.delta_fine = true),
+        ("fine: stored whole", |d, _| d.delta_fine = false),
         ("inputs come with the lookup", |d, _| {
             d.fetch_with_lookup = true
         }),
@@ -1047,7 +1086,17 @@ fn describe(d: &Design, r: &Report, classes: &[Class; 2]) {
             d.replicas[i],
             d.cache_days[i],
             c.window_days,
-            on(d.sampled[i], "sampled", "whole blob"),
+            if d.sampled[i] {
+                "sampled"
+            } else if i == 0 && d.delta_fine && d.compact_fine {
+                "delta to the last object, one index row"
+            } else if i == 0 && d.delta_fine {
+                "delta to the last object"
+            } else if i == 0 && d.compact_fine {
+                "whole blob, one index row"
+            } else {
+                "whole blob"
+            },
             on(d.batched[i], "batched", "one pack each"),
             r.wait_s[i] * 1e3,
             r.wait_s[i] / c.step_s * 100.0,
@@ -1111,6 +1160,9 @@ fn main() {
             }
             "--lookups" => {
                 FINE_LOOKUPS.set(value).ok();
+            }
+            "--delta-share" => {
+                DELTA_SHARE.set(value).ok();
             }
             other => {
                 eprintln!("unknown flag {other}");

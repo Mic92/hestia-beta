@@ -47,7 +47,10 @@ use tokio::net::{UnixListener, UnixStream};
 const MAX_PACK_VERIFY_ENTRIES: u64 = 1000;
 
 use crate::backend::Backend;
+use crate::backend::cached::{Cached, PackCache};
+use crate::chunker::pack_cache_key;
 use crate::cli::ServeArgs;
+use crate::manifest::PackHash;
 use crate::manifest::PathHash;
 use crate::node::{Plan, PlanRequest};
 use crate::pathinfo::StoreDatabase;
@@ -418,6 +421,40 @@ impl Daemon {
             }
         }
 
+        async fn pack(
+            State(state): Shared,
+            axum::extract::Path(key): axum::extract::Path<String>,
+            body: bytes::Bytes,
+        ) -> (StatusCode, &'static str) {
+            if state.pipeline.read_only.load(Ordering::Relaxed) {
+                return (StatusCode::FORBIDDEN, "this node is read-only");
+            }
+            // The key decides where the pack is found again: it has to be
+            // the hash of what was sent.
+            if key != pack_cache_key(&PackHash::digest(&body)) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "the key is not the hash of the body",
+                );
+            }
+            let backend = &state.pipeline.backend;
+            let stored = async {
+                let created = backend.put(&key, body).await?;
+                if !created {
+                    backend.touch(&key).await?;
+                }
+                Ok::<_, crate::backend::Error>(created)
+            };
+            match stored.await {
+                Ok(true) => (StatusCode::OK, "created"),
+                Ok(false) => (StatusCode::OK, "existed"),
+                Err(err) => {
+                    eprintln!("hestia serve: storing {key} for a builder failed: {err}");
+                    (StatusCode::BAD_GATEWAY, "the store refused the pack")
+                }
+            }
+        }
+
         let state = Arc::clone(&self.state);
         let committer = tokio::spawn({
             let state = Arc::clone(&state);
@@ -433,6 +470,7 @@ impl Daemon {
         let router = axum::Router::new()
             .route("/hestia/plan", axum::routing::post(plan))
             .route("/hestia/commit", axum::routing::post(commit))
+            .route("/hestia/pack/{key}", axum::routing::put(pack))
             .layer(axum::extract::DefaultBodyLimit::max(MAX_COMMIT_BYTES))
             .with_state(state);
         (router, committer)
@@ -707,6 +745,20 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let pack_cache = match &args.pack_cache {
+        Some(dir) => match PackCache::open(dir, args.pack_cache_size) {
+            Ok(cache) => Some(Arc::new(cache)),
+            Err(err) => {
+                eprintln!("hestia serve: pack cache {}: {err}", dir.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let backend = match &pack_cache {
+        Some(cache) => Backend::Cached(Cached::new(backend, Arc::clone(cache))),
+        None => backend,
+    };
     let trust = match Trust::from_env() {
         Ok(t) => t,
         Err(err) => {
@@ -942,6 +994,20 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
 
     let result = daemon.run(shutdown).await;
     load_task.abort();
+    if let Some(cache) = &pack_cache {
+        let stats = cache.stats();
+        eprintln!(
+            "hestia serve: pack cache served {} MiB from disk and fetched {} MiB, {} MiB kept, \
+             {} packs evicted",
+            stats.hit_bytes >> 20,
+            stats.miss_bytes >> 20,
+            stats.used >> 20,
+            stats.evicted
+        );
+        if let Err(err) = cache.save() {
+            eprintln!("hestia serve: the pack cache will start empty next time: {err}");
+        }
+    }
     if let Some(task) = commit_task {
         task.abort();
     }

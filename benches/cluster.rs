@@ -14,6 +14,8 @@
 //!   nar url       finding the path a `nar/<hash>.nar.zst` URL names
 //!   fetch         FETCH paths through the substituter, 25 at a time:
 //!                 neighbours in one pack, then paths from all over
+//!                 the scattered ones again through a node's pack cache,
+//!                 its disk empty and then filled
 //!   builders      BUILDERS machines fetching FETCH paths each at once, half
 //!                 of them common: a daemon each, then one shared daemon
 //!   drain         NEW paths built, CLOSURE stored paths used
@@ -35,6 +37,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{StreamExt, stream};
+use hestia::backend::Backend;
+use hestia::backend::cached::{Cached, PackCache};
 use hestia::manifest::PathHash;
 use hestia::pipeline::AccessLog;
 use hestia::store::Snapshot;
@@ -84,16 +88,14 @@ fn row(name: &str, started: Instant, net: &Net) {
 }
 
 /// A daemon serving `snapshot` to Nix. Returns its URL.
-async fn serve(snapshot: &Arc<Snapshot>, sim: &SimCache) -> (String, tokio::task::JoinHandle<()>) {
+async fn serve(
+    snapshot: &Arc<Snapshot>,
+    backend: &Backend,
+) -> (String, tokio::task::JoinHandle<()>) {
     let store = ManifestStore::new();
     store.set_snapshot(snapshot.clone());
-    let router = Substituter::new(
-        Default::default(),
-        store,
-        AccessLog::new(),
-        sim.backend.clone(),
-    )
-    .into_router();
+    let router = Substituter::new(Default::default(), store, AccessLog::new(), backend.clone())
+        .into_router();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -131,11 +133,11 @@ async fn substitute(base: &str, wanted: &[u64]) {
 async fn fetch_paths(
     name: &str,
     snapshot: &Arc<Snapshot>,
-    sim: &SimCache,
+    backend: &Backend,
     net: &Net,
     wanted: &[u64],
 ) {
-    let (base, server) = serve(snapshot, sim).await;
+    let (base, server) = serve(snapshot, backend).await;
     let t = Instant::now();
     substitute(&base, wanted).await;
     row(&format!("{name} ({} paths)", wanted.len()), t, net);
@@ -246,8 +248,23 @@ async fn main() {
     // One build's outputs, as they lie in a pack, then paths from all over.
     let first = paths / 2;
     let adjacent: Vec<u64> = (first..(first + fetch).min(paths)).collect();
-    fetch_paths("fetch, adjacent", &cold, &sim, &net, &adjacent).await;
-    fetch_paths("fetch, scattered", &cold, &sim, &net, &sample(fetch, paths)).await;
+    fetch_paths("fetch, adjacent", &cold, &sim.backend, &net, &adjacent).await;
+    let scattered = sample(fetch, paths);
+    fetch_paths("fetch, scattered", &cold, &sim.backend, &net, &scattered).await;
+    // The same through a node's pack cache: a daemon that never read these
+    // packs, then a new daemon over the disk the first one filled.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let packs = Arc::new(PackCache::open(dir.path(), 1 << 40).unwrap());
+        let node = Backend::Cached(Cached::new(sim.backend.clone(), Arc::clone(&packs)));
+        fetch_paths("  node, disk empty", &cold, &node, &net, &scattered).await;
+        fetch_paths("  node, disk filled", &cold, &node, &net, &scattered).await;
+        println!(
+            "{:<34} {:.1} MB kept on the node's disk",
+            "",
+            packs.stats().used as f64 / 1e6
+        );
+    }
 
     // BUILDERS machines start a build at once. Each needs FETCH paths,
     // half of them the same on every machine. With a daemon each, as
@@ -268,7 +285,7 @@ async fn main() {
         let sim = &sim;
         async move {
             let snapshot = load(None).await;
-            let (base, server) = serve(&snapshot, sim).await;
+            let (base, server) = serve(&snapshot, &sim.backend).await;
             substitute(&base, wanted).await;
             server.abort();
         }
@@ -276,7 +293,7 @@ async fn main() {
     .await;
     row(&format!("{builders} builders, a daemon each"), t, &net);
     let node = load(None).await;
-    let (base, server) = serve(&node, &sim).await;
+    let (base, server) = serve(&node, &sim.backend).await;
     net.take();
     net.take_bytes();
     let t = Instant::now();

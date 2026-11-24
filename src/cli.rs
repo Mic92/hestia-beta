@@ -62,6 +62,16 @@ pub struct ServeArgs {
     #[arg(long, value_name = "MILLISECONDS")]
     pub commit_interval: Option<u64>,
 
+    /// Keep the packs written and read through this daemon in this
+    /// directory, so later reads do not go to the store. For a cache node.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub pack_cache: Option<PathBuf>,
+
+    /// Disk the pack cache may use: bytes, or a number with K, M, G or T
+    /// (powers of 1024). The least recently used packs go first.
+    #[arg(long, value_name = "SIZE", default_value = "100G", value_parser = parse_size)]
+    pub pack_cache_size: u64,
+
     /// Branch name for the manifest root key
     /// [default: $GITHUB_REF_NAME, or "local"].
     #[arg(long)]
@@ -196,6 +206,24 @@ pub struct GcArgs {
     /// Packs not accessed for this many days get an LRU touch.
     #[arg(long, value_name = "DAYS", default_value_t = 4)]
     pub touch_age: u64,
+}
+
+/// `512`, `64M`, `2T`: bytes, with K, M, G and T as powers of 1024.
+fn parse_size(text: &str) -> Result<u64, String> {
+    let (digits, shift) = match text.chars().last().map(|c| c.to_ascii_uppercase()) {
+        Some('K') => (&text[..text.len() - 1], 10),
+        Some('M') => (&text[..text.len() - 1], 20),
+        Some('G') => (&text[..text.len() - 1], 30),
+        Some('T') => (&text[..text.len() - 1], 40),
+        _ => (text, 0),
+    };
+    let number: u64 = digits
+        .parse()
+        .map_err(|_| format!("`{text}` is not a size: use bytes or a number with K, M, G or T"))?;
+    number
+        .checked_shl(shift)
+        .filter(|bytes| bytes >> shift == number)
+        .ok_or_else(|| format!("`{text}` is too large"))
 }
 
 #[cfg(test)]

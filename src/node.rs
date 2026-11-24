@@ -193,6 +193,26 @@ impl NodeClient {
         Plan::decode(&self.post("plan", body).await?)
     }
 
+    /// Uploads a pack through the node, which keeps it for the builders
+    /// that read it next. `false` when the bucket already had it.
+    pub async fn put_pack(&self, key: &str, data: bytes::Bytes) -> Result<bool, Error> {
+        let response = self
+            .http
+            .put(format!("{}/hestia/pack/{key}", self.base))
+            .body(data)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            return Err(Error::Refused(format!(
+                "{status}: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        Ok(body.as_ref() == b"created")
+    }
+
     /// Returns the head the node published for this and other drains.
     pub async fn commit(&self, epoch: u64, sealed: &Sealed) -> Result<String, Error> {
         let body = self.post("commit", encode_commit(epoch, sealed)).await?;

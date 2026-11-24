@@ -8,6 +8,7 @@ use bytes::Bytes;
 pub use crate::gha::Error;
 
 pub mod blobdir;
+pub mod cached;
 pub mod gha;
 pub mod ghcr;
 pub mod oci;
@@ -26,6 +27,8 @@ pub enum Backend {
     Oci(oci::Oci),
     /// S3, WebDAV, or the same tree read-only over plain HTTP.
     Dir(blobdir::BlobDir),
+    /// Another backend with its packs kept on local disk (a cache node).
+    Cached(std::sync::Arc<cached::Cached>),
 }
 
 pub const ENV_OCI: &str = "HESTIA_OCI";
@@ -56,6 +59,7 @@ impl Backend {
             Backend::Gha(b) => b.put(key, data).await,
             Backend::Oci(b) => b.put(key, data).await,
             Backend::Dir(b) => b.put(key, data).await,
+            Backend::Cached(b) => Box::pin(b.put(key, data)).await,
         }
     }
 
@@ -65,6 +69,7 @@ impl Backend {
             Backend::Gha(b) => b.get(key, range).await,
             Backend::Oci(b) => b.get(key, range).await,
             Backend::Dir(b) => b.get(key, range).await,
+            Backend::Cached(b) => Box::pin(b.get(key, range)).await,
         }
     }
 
@@ -74,6 +79,7 @@ impl Backend {
             Backend::Gha(b) => b.touch(key).await,
             Backend::Oci(b) => b.exists(key).await,
             Backend::Dir(b) => b.exists(key).await,
+            Backend::Cached(b) => Box::pin(b.inner.touch(key)).await,
         }
     }
 
@@ -88,11 +94,15 @@ impl Backend {
             Backend::Gha(b) => b.list(prefix, limit).await,
             Backend::Oci(b) => b.list(prefix, limit).await,
             Backend::Dir(b) => b.list(prefix, limit).await,
+            Backend::Cached(b) => Box::pin(b.inner.list(prefix, limit)).await,
         }
     }
 
     /// Every `g-`/`h-`/`c-` key. One request where the backend can.
     pub async fn list_heads(&self) -> Result<Vec<Listed>, Error> {
+        if let Backend::Cached(b) = self {
+            return Box::pin(b.inner.list_heads()).await;
+        }
         if let Backend::Gha(b) = self {
             let (g, h, c) = futures_util::future::try_join3(
                 b.list("g-", None),
@@ -107,6 +117,9 @@ impl Backend {
 
     /// GC only: all `pack-`/`seg-`/`tree-`/`use-` objects with creation times.
     pub async fn list_objects(&self) -> Result<Vec<Listed>, Error> {
+        if let Backend::Cached(b) = self {
+            return Box::pin(b.inner.list_objects()).await;
+        }
         if let Backend::Oci(b) = self {
             return b.list_objects().await;
         }
@@ -126,6 +139,7 @@ impl Backend {
             Backend::Gha(b) => b.delete(key).await,
             Backend::Oci(b) => b.delete(key).await,
             Backend::Dir(b) => b.delete(key).await,
+            Backend::Cached(b) => Box::pin(b.delete(key)).await,
         }
     }
 
@@ -139,6 +153,7 @@ impl Backend {
             Backend::Gha(_) => 8,
             Backend::Oci(_) => 16,
             Backend::Dir(_) => 64,
+            Backend::Cached(b) => b.inner.read_concurrency(),
         }
     }
 
@@ -152,6 +167,7 @@ impl Backend {
             Backend::Oci(_) => "the registry credentials are missing or grant no push access",
             Backend::Dir(b) if !b.writable() => "an http(s):// store can only be read",
             Backend::Dir(_) => "the store credentials are missing or grant no write access",
+            Backend::Cached(b) => b.inner.read_only_hint(),
         }
     }
 
@@ -160,6 +176,7 @@ impl Backend {
             Backend::Gha(b) => b.probe_writable().await,
             Backend::Oci(b) => b.probe_writable().await,
             Backend::Dir(b) => b.probe_writable().await,
+            Backend::Cached(b) => Box::pin(b.inner.probe_writable()).await,
         }
     }
 
@@ -168,6 +185,7 @@ impl Backend {
         match self {
             Backend::Gha(_) => Ok(()),
             Backend::Dir(b) => b.flush().await,
+            Backend::Cached(b) => Box::pin(b.inner.flush()).await,
             Backend::Oci(b) => b.flush().await,
         }
     }

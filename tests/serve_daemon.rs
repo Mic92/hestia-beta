@@ -7,7 +7,11 @@
 mod support;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+
+use hestia::backend::Backend;
+use hestia::backend::cached::{Cached, PackCache};
 
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -857,10 +861,18 @@ async fn builders_drain_through_a_node() {
 
     let manifest_store = ManifestStore::new();
     manifest_store.set_snapshot(load_snapshot(&fake, &http).await);
+    // The node keeps the packs that pass through it.
+    let cache_dir = tempfile::tempdir().unwrap();
+    let pack_cache = Arc::new(PackCache::open(cache_dir.path(), 1 << 30).unwrap());
+    let mut node_context = pipeline_context(&fake, &http, store.database());
+    let bucket = node_context.backend.clone();
+    node_context.backend = Backend::Cached(Cached::new(bucket.clone(), Arc::clone(&pack_cache)));
+    let through_node = node_context.backend.clone();
+    let packs_before = bucket.list("pack-", None).await.unwrap().unwrap();
     let daemon = Daemon::bind(
         &store_socket_path(&store),
         None,
-        pipeline_context(&fake, &http, store.database()),
+        node_context,
         AccessLog::new(),
         manifest_store.clone(),
     )
@@ -893,6 +905,24 @@ async fn builders_drain_through_a_node() {
     let published = load_snapshot(&fake, &http).await;
     assert_eq!(published.view.heads.len(), heads_before + 1);
     assert_eq!(published.path_count(), 3);
+
+    // The builders' packs went through the node: it reads them back from
+    // its own disk, and the bucket has them too.
+    let uploaded: Vec<_> = bucket
+        .list("pack-", None)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .filter(|pack| !packs_before.contains(pack))
+        .collect();
+    assert_eq!(uploaded.len(), 2, "a pack from each builder");
+    for pack in &uploaded {
+        let kept = through_node.get(&pack.key, None).await.unwrap();
+        assert_eq!(kept, bucket.get(&pack.key, None).await.unwrap());
+    }
+    let stats = pack_cache.stats();
+    assert_eq!((stats.hits, stats.misses), (2, 0));
 
     let again = builder()
         .run(only(&first), Default::default())

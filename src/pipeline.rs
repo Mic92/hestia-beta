@@ -588,7 +588,10 @@ impl PipelineContext {
             });
             pack_stream
                 .map(|mut pack| async move {
-                    let uploaded = upload_pack(&self.backend, &pack).await?;
+                    let uploaded = match &self.node {
+                        Some(node) => node.put_pack(&pack.cache_key(), pack.data.clone()).await?,
+                        None => upload_pack(&self.backend, &pack).await?,
+                    };
                     // Only metadata is read after upload; dropping the blob
                     // here keeps peak memory bounded by the in-flight packs
                     // instead of growing with the drain's total compressed

@@ -658,7 +658,7 @@ impl PipelineContext {
     /// List the root's heads again. A GC since the last drain may have
     /// retired segments the served snapshot still names; the bodies of
     /// those still live are reused.
-    pub async fn relist(&self) -> Result<Arc<Snapshot>, Error> {
+    async fn relist(&self) -> Result<Arc<Snapshot>, Error> {
         let previous = self.publish.as_ref().and_then(ManifestStore::snapshot);
         let roots = previous
             .as_ref()

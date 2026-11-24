@@ -949,10 +949,10 @@ async fn builders_drain_through_a_node() {
     server.abort();
 }
 
-/// A path one node published is served by its peer when the builder's
-/// drain returns, and a miss the peer answered before that is counted.
+/// A path one node published is a miss on another until that one loads
+/// the store again, and the miss it answered before that is counted.
 #[tokio::test]
-async fn a_peer_serves_what_another_node_published() {
+async fn a_node_counts_the_miss_before_it_saw_the_path() {
     let Some(store) = ScratchStore::create() else {
         return;
     };
@@ -994,9 +994,8 @@ async fn a_peer_serves_what_another_node_published() {
         nodes.push((daemon, served, url, committer, server));
     }
     let (a, b) = (&nodes[0], &nodes[1]);
-    a.0.set_peers(vec![hestia::node::NodeClient::new(http.clone(), &b.2)]);
 
-    // Someone asks the peer for the path before it is built.
+    // Someone asks the other node for the path before it is built.
     let narinfo = format!("{}/{}.narinfo", b.2, path_hash_of(&built));
     assert_eq!(http.get(&narinfo).send().await.unwrap().status(), 404);
 
@@ -1010,7 +1009,10 @@ async fn a_peer_serves_what_another_node_published() {
         .expect("drain through a");
     assert_eq!(stats.pushed, 1);
 
-    // No waiting: the drain returned, so the peer serves it.
+    let on_a = format!("{}/{}.narinfo", a.2, path_hash_of(&built));
+    assert_eq!(http.get(&on_a).send().await.unwrap().status(), 200);
+    assert_eq!(http.get(&narinfo).send().await.unwrap().status(), 404);
+    assert_eq!(b.1.set_followed(load_snapshot(&fake, &http).await), 1);
     assert_eq!(http.get(&narinfo).send().await.unwrap().status(), 200);
     assert_eq!(b.1.early_misses(), 1, "the miss before is on record");
     assert_eq!(a.1.early_misses(), 0, "a published it itself");

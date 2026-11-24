@@ -16,7 +16,6 @@ setups, or hacking on hestia).
 | `--commit-interval <MILLISECONDS>` | — | Be a cache node for the drains of daemons started with `--node`: publish what they hand in as one segment, at most once per interval. |
 | `--pack-cache <DIRECTORY>` | — | Keep the packs written and read through this daemon in this directory, so later reads do not go to the store. For a cache node. Kept across a clean exit; after a crash it starts empty. |
 | `--pack-cache-size <SIZE>` | `100G` | Disk the pack cache may use: bytes, or a number with `K`, `M`, `G` or `T`. The least recently used packs are dropped first. |
-| `--peer <URL>` | unset | As a cache node: another node serving the same root. It is told of every head published here and serves the new paths at once. Repeat for each peer. |
 | `--branch <NAME>` | `$GITHUB_REF_NAME`, else `local` | Branch part of the root key. |
 | `--system <SYSTEM>` | detected | Nix system part of the root key (e.g. `x86_64-linux`). |
 | `--serve-branch <BRANCH>` | `main` | Also serve what these branches' roots hold (repeatable). |

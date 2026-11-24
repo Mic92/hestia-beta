@@ -14,6 +14,8 @@
 //!   nar url       finding the path a `nar/<hash>.nar.zst` URL names
 //!   fetch         FETCH paths through the substituter, 25 at a time:
 //!                 neighbours in one pack, then paths from all over
+//!   builders      BUILDERS machines fetching FETCH paths each at once, half
+//!                 of them common: a daemon each, then one shared daemon
 //!   drain         NEW paths built, CLOSURE stored paths used
 //!   follow        another daemon picking up that drain
 //!   compact       folding the pending segments into one
@@ -81,14 +83,8 @@ fn row(name: &str, started: Instant, net: &Net) {
     );
 }
 
-/// A fresh daemon serving `wanted` to Nix: every narinfo, then every NAR.
-async fn fetch_paths(
-    name: &str,
-    snapshot: &Arc<Snapshot>,
-    sim: &SimCache,
-    net: &Net,
-    wanted: &[u64],
-) {
+/// A daemon serving `snapshot` to Nix. Returns its URL.
+async fn serve(snapshot: &Arc<Snapshot>, sim: &SimCache) -> (String, tokio::task::JoinHandle<()>) {
     let store = ManifestStore::new();
     store.set_snapshot(snapshot.clone());
     let router = Substituter::new(
@@ -101,6 +97,11 @@ async fn fetch_paths(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (base, server)
+}
+
+/// What Nix asks a substituter for `wanted`: every narinfo, then every NAR.
+async fn substitute(base: &str, wanted: &[u64]) {
     let http = reqwest::Client::new();
     let get = |url: String| {
         let http = &http;
@@ -110,7 +111,6 @@ async fn fetch_paths(
             r.bytes().await.unwrap()
         }
     };
-    let t = Instant::now();
     let narinfos: Vec<String> = stream::iter(wanted)
         .map(|i| get(format!("{base}/{}.narinfo", hash_of(*i))))
         .buffered(PARALLEL)
@@ -125,6 +125,19 @@ async fn fetch_paths(
         .buffer_unordered(PARALLEL)
         .for_each(|_| async {})
         .await;
+}
+
+/// A fresh daemon serving `wanted` to Nix.
+async fn fetch_paths(
+    name: &str,
+    snapshot: &Arc<Snapshot>,
+    sim: &SimCache,
+    net: &Net,
+    wanted: &[u64],
+) {
+    let (base, server) = serve(snapshot, sim).await;
+    let t = Instant::now();
+    substitute(&base, wanted).await;
     row(&format!("{name} ({} paths)", wanted.len()), t, net);
     server.abort();
 }
@@ -235,6 +248,41 @@ async fn main() {
     let adjacent: Vec<u64> = (first..(first + fetch).min(paths)).collect();
     fetch_paths("fetch, adjacent", &cold, &sim, &net, &adjacent).await;
     fetch_paths("fetch, scattered", &cold, &sim, &net, &sample(fetch, paths)).await;
+
+    // BUILDERS machines start a build at once. Each needs FETCH paths,
+    // half of them the same on every machine. With a daemon each, as
+    // today, and with one daemon they all ask, as a cache node would be.
+    let builders = env("HESTIA_BENCH_BUILDERS", 20);
+    let needs: Vec<Vec<u64>> = (0..builders)
+        .map(|b| {
+            let common = (paths / 3..).take(fetch as usize / 2);
+            let own = sample(fetch / 2, paths)
+                .into_iter()
+                .map(|i| (i + 7919 * (b + 1)) % paths);
+            common.chain(own).collect()
+        })
+        .collect();
+    let t = Instant::now();
+    futures_util::future::join_all(needs.iter().map(|wanted| {
+        let load = &load;
+        let sim = &sim;
+        async move {
+            let snapshot = load(None).await;
+            let (base, server) = serve(&snapshot, sim).await;
+            substitute(&base, wanted).await;
+            server.abort();
+        }
+    }))
+    .await;
+    row(&format!("{builders} builders, a daemon each"), t, &net);
+    let node = load(None).await;
+    let (base, server) = serve(&node, &sim).await;
+    net.take();
+    net.take_bytes();
+    let t = Instant::now();
+    futures_util::future::join_all(needs.iter().map(|wanted| substitute(&base, wanted))).await;
+    row(&format!("{builders} builders, one shared daemon"), t, &net);
+    server.abort();
 
     // A second daemon that loaded before the drain below.
     let other = load(None).await;

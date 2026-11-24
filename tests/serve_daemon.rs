@@ -767,6 +767,71 @@ async fn substituter_serves_paths_pushed_by_daemon_drains() {
         .expect("test timed out: deadlock or hung server");
 }
 
+/// A daemon builders share picks up what another writer published,
+/// without draining anything itself.
+#[tokio::test]
+async fn following_daemon_serves_what_another_writer_published() {
+    let test = async {
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        let fixture = store.add_fixture("followed", 137);
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+
+        let manifest_store = ManifestStore::new();
+        let daemon = Daemon::bind(
+            &store_socket_path(&store),
+            None,
+            pipeline_context(&fake, &http, store.database()),
+            AccessLog::new(),
+            manifest_store.clone(),
+        )
+        .expect("binding daemon failed");
+        let follower = daemon.follow(Duration::from_millis(50), {
+            let (fake_backend, manifest_store) = (fake.backend(&http), manifest_store.clone());
+            move || {
+                let (backend, manifest_store) = (fake_backend.clone(), manifest_store.clone());
+                async move {
+                    let previous = manifest_store.snapshot();
+                    let snapshot = hestia::store::Snapshot::load(
+                        backend,
+                        hestia::trust::Trust::open(),
+                        &[support::common::TEST_ROOT_KEY.to_owned()],
+                        previous.as_deref(),
+                    )
+                    .await
+                    .unwrap();
+                    manifest_store.set_snapshot(std::sync::Arc::new(snapshot));
+                }
+            }
+        });
+        let (shutdown, shutdown_rx) = oneshot::channel::<()>();
+        let running = tokio::spawn(daemon.run(async {
+            let _ = shutdown_rx.await;
+        }));
+
+        let hash = path_hash_of(&fixture);
+        assert!(!manifest_store.available(&hash).await);
+        let writer = pipeline_context(&fake, &http, store.database());
+        let pushed = std::collections::BTreeSet::from([fixture.to_string_lossy().into_owned()]);
+        writer
+            .run(pushed, Default::default())
+            .await
+            .expect("the other writer's drain");
+        while !manifest_store.available(&hash).await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        follower.abort();
+        let _ = shutdown.send(());
+        running.await.unwrap().expect("final drain failed");
+    };
+    tokio::time::timeout(Duration::from_secs(60), test)
+        .await
+        .expect("the daemon never saw the other writer's paths");
+}
+
 #[tokio::test]
 async fn serve_becomes_ready_while_cache_api_stalls() {
     // A stalled GHA cache API at startup must not block the daemon's

@@ -46,6 +46,12 @@ pub struct ServeArgs {
     #[arg(long, value_name = "SECONDS")]
     pub idle_exit: Option<u64>,
 
+    /// Reload the served roots this often, to pick up what other writers
+    /// publish. For a daemon that many builders share as their cache;
+    /// a per-job daemon sees its own drains without it.
+    #[arg(long, value_name = "SECONDS")]
+    pub follow: Option<u64>,
+
     /// Branch name for the manifest root key
     /// [default: $GITHUB_REF_NAME, or "local"].
     #[arg(long)]

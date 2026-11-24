@@ -283,6 +283,27 @@ impl Daemon {
         })
     }
 
+    /// Call `reload` every `every`, never while a drain runs: a reload
+    /// that listed the heads before a drain published would otherwise
+    /// replace what the drain just made servable.
+    pub fn follow<Fut>(
+        &self,
+        every: Duration,
+        reload: impl Fn() -> Fut + Send + 'static,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        Fut: Future<Output = ()> + Send,
+    {
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let _guard = state.drain_lock.lock().await;
+                reload().await;
+            }
+        })
+    }
+
     /// The daemon's access log (shared with the substituter).
     pub fn access_log(&self) -> AccessLog {
         self.state.access_log.clone()
@@ -686,6 +707,19 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     // stalled cache API cannot delay the action's readiness probe (which
     // gives up after 30s and fails the job). Nothing yet (first run) or a
     // load failure both mean "serve nothing until the first drain".
+    let follow_task = args.follow.map(|seconds| {
+        let backend = backend.clone();
+        let trust = trust.clone();
+        let manifest_store = manifest_store.clone();
+        let serve_roots = serve_roots.clone();
+        daemon.follow(Duration::from_secs(seconds.max(1)), move || {
+            let backend = backend.clone();
+            let trust = trust.clone();
+            let manifest_store = manifest_store.clone();
+            let serve_roots = serve_roots.clone();
+            async move { load_published(&backend, &trust, &manifest_store, &serve_roots).await }
+        })
+    });
     let load_task = {
         let backend = backend.clone();
         let trust = trust.clone();
@@ -759,6 +793,9 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
 
     let result = daemon.run(shutdown).await;
     load_task.abort();
+    if let Some(task) = follow_task {
+        task.abort();
+    }
     substituter_task.abort();
     // Remove the socket file: a leftover socket at the fixed default path
     // makes later hook invocations connect to a dead endpoint and makes

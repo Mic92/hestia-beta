@@ -23,10 +23,13 @@ do, not a measurement of one.
 | Daemon start (heads, every `.meta`) | 470 ms, 46 MB | 226 ms |
 | Fetch 200 neighbouring paths | 165 ms, 5 requests | 56 ms |
 | Fetch 200 scattered paths | 1313 ms, 231 requests | 493 ms |
-| Drain 20 new paths, 2000 used | 1369 ms, 32 requests | 354 ms |
-| Follow another writer's drain | 102 ms | 12 ms |
-| Compact four small drains | 80 ms | 19 ms |
-| Follow that compaction | 106 ms | 18 ms |
+| Drain 20 new paths, 2000 used | 344 ms, 7 requests | not rerun |
+| Follow another writer's drain | 99 ms | 12 ms |
+| Compact four small drains | 172 ms | not rerun |
+| Follow that compaction | 100 ms | 18 ms |
+
+The local column was measured before drains stopped copying the entries
+of used paths; the two rows that change were not rerun.
 
 What is left in the right column is CPU in the builder's own daemon
 (opening segments, decoding pack indexes), which a blob cache cannot
@@ -59,11 +62,29 @@ URL at the node. No new client protocol.
 ## Stage 2: the node answers Nix
 
 The node runs the substituter for the root, and builders use it as an
-ordinary binary cache. A builder then loads no index at all: no 46 MB
-at start (more with real metadata), no following of other drains. The
-pack reader's shared reads and read-ahead then work across builders
-instead of per builder. Drains still chunk on the builder and upload
-packs through stage 1; the node publishes the segment.
+ordinary binary cache. A builder then loads no index at all, and the
+pack reader's shared reads and read-ahead work across builders instead
+of per builder.
+
+The read half exists: `hestia serve --read-only --follow <SECONDS>
+--listen <address>` serves a root to anyone and reloads it at that
+interval. The bench plays 20 builders that start at once and each
+fetch 200 paths, half of them common to all, from the same store as
+above (30 ms, 1 Gbit/s):
+
+| | Wall time | Requests | Downloaded |
+|---|---|---|---|
+| A daemon on every builder | 19.4 s | 3854 | 2384 MB |
+| One shared daemon | 5.0 s | 1744 | 355 MB |
+
+The shared daemon's index was loaded beforehand, as a running node's
+is. Most of what the per-builder daemons download is the index, 46 MB
+each. The link between builders and the shared daemon is not modelled.
+
+Not built: drains through the node. A builder still needs its own
+daemon and index to push. The plan is that it chunks, asks the node
+which chunks and paths are new, uploads packs through stage 1, and the
+node publishes one segment for many builders' drains.
 
 ## Stage 3: compiled objects
 

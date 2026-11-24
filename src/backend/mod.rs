@@ -129,6 +129,19 @@ impl Backend {
         }
     }
 
+    /// How many pack reads may be in flight across all NAR requests. A
+    /// pack read on the Actions cache is a Twirp URL lookup plus Azure
+    /// Range requests against a rate-limited API, so few. A bucket or a
+    /// share takes far more, and a daemon many builders share is held up
+    /// by nothing else (`benches/cluster.rs`).
+    pub fn read_concurrency(&self) -> usize {
+        match self {
+            Backend::Gha(_) => 8,
+            Backend::Oci(_) => 16,
+            Backend::Dir(_) => 64,
+        }
+    }
+
     /// Why writes are refused, for the message a read-only serve prints.
     pub fn read_only_hint(&self) -> &'static str {
         match self {

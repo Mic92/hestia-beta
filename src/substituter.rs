@@ -83,12 +83,6 @@ const PACK_READ_AHEAD_BYTES: u64 = 4 * 1024 * 1024;
 const PACK_READ_AHEAD_MIN: u64 = PACK_FETCH_GAP_BYTES;
 const PACK_READ_AHEAD_START: u64 = 1024 * 1024;
 
-/// Maximum number of pack reads in flight across all NAR requests. A pack
-/// read is the unit of GHA cache API traffic (one Twirp URL lookup plus
-/// Azure Range requests), so this bounds the total API concurrency no
-/// matter how the packs distribute over paths.
-const MAX_CONCURRENT_PACK_FETCHES: usize = 8;
-
 /// What the substituter serves from.
 #[derive(Default)]
 struct ManifestView {
@@ -333,10 +327,10 @@ struct ChunkFetcher {
 impl ChunkFetcher {
     fn new(backend: Backend) -> Self {
         Self {
+            fetch_semaphore: Semaphore::new(backend.read_concurrency()),
             backend,
             chunk_cache: Mutex::new(ChunkCache::default()),
             path_locks: Mutex::new(HashMap::new()),
-            fetch_semaphore: Semaphore::new(MAX_CONCURRENT_PACK_FETCHES),
             pack_reads: Mutex::new(HashMap::new()),
             next_read_id: Default::default(),
         }

@@ -11,6 +11,7 @@ setups, or hacking on hestia).
 | `--socket <PATH>` | `/tmp/hestia/hook.sock` | Unix socket for the post-build-hook listener. |
 | `--listen <ADDR>` | `127.0.0.1:37515` | Substituter HTTP address. |
 | `--idle-exit <SECONDS>` | — | Drain and exit after this much inactivity (fallback for setups without post steps). |
+| `--follow <SECONDS>` | — | Reload the served roots this often, to pick up what other writers publish. For a daemon many builders share as their cache. |
 | `--branch <NAME>` | `$GITHUB_REF_NAME`, else `local` | Branch part of the root key. |
 | `--system <SYSTEM>` | detected | Nix system part of the root key (e.g. `x86_64-linux`). |
 | `--serve-branch <BRANCH>` | `main` | Also serve what these branches' roots hold (repeatable). |

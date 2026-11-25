@@ -289,6 +289,11 @@ impl FakeS3 {
         format!("s3://{BUCKET}/{PREFIX}")
     }
 
+    /// Where the fake listens, for a process told by `HESTIA_S3_ENDPOINT`.
+    pub fn endpoint(&self) -> &str {
+        &self.base_url
+    }
+
     fn s3(&self, credentials: Option<Credentials>) -> Backend {
         Backend::Dir(
             BlobDir::s3(

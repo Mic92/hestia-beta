@@ -7,20 +7,24 @@
       pkgs.stdenv;
 })
   {
-    nativeBuildInputs = with pkgs; [
-      rustc
-      cargo
-      cargo-watch
-      cargo-nextest
-      nix-eval-jobs
-      cosign
-      rustfs
-      distribution
-      # WebDAV real-server tests; stock nginx lacks dav_ext (PROPFIND)
-      (nginx.override { modules = [ nginxModules.dav ]; })
-      apacheHttpd
-      rclone
-    ];
+    nativeBuildInputs =
+      with pkgs;
+      [
+        rustc
+        cargo
+        cargo-watch
+        cargo-nextest
+        nix-eval-jobs
+        cosign
+        rustfs
+        distribution
+        # WebDAV real-server tests; stock nginx lacks dav_ext (PROPFIND)
+        (nginx.override { modules = [ nginxModules.dav ]; })
+        apacheHttpd
+        rclone
+      ]
+      # The proxy in front of cache nodes (tests/envoy.rs).
+      ++ lib.optional (lib.meta.availableOn stdenv.hostPlatform envoy-bin) envoy-bin;
 
     buildInputs = with pkgs; [
       rust-analyzer

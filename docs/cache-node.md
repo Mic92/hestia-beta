@@ -143,8 +143,9 @@ shard is in plain sight on every request:
 | `GET /nar/<narhash>.nar.zst?hash=<hash>` | first character of `hash` |
 | `POST /hestia/plan`, `PUT /hestia/pack/<key>`, `POST /hestia/commit` | the `x-hestia-shard` header |
 
-No proxy configuration has been tested with this; the tests put two
-nodes side by side and ask each directly.
+`tests/fixtures/envoy.yaml` is an Envoy configuration that does this,
+and `tests/envoy.rs` runs it: real `hestia serve --sharded` processes
+behind a real Envoy (see "Envoy in front of the nodes" below).
 
 - **A builder's drain** is split by shard. Each part asks for its plan,
   hands in its packs and commits with the shard's header, so all three
@@ -159,7 +160,13 @@ nodes side by side and ask each directly.
   commit it answered is in the bucket.
 - **Two nodes holding one shard** do no harm. Each publishes its own
   heads; a path one of them published is a miss on the other until its
-  next reload.
+  next reload. A node reloads every shard it holds when it publishes a
+  commit round, and every `--follow` seconds.
+- **A node told to stop (SIGTERM)** answers `GET /hestia/health` with
+  503 and refuses new plans with 503, so the proxy sends new drains to
+  the next node. Drains it has planned still upload and commit. It
+  exits once builders sent nothing for 300 ms, after 30 s at the
+  latest, and uploads the packs it still holds first.
 
 20 builders finishing at once (`cargo bench --bench cluster`, 100 000
 paths stored, 30 ms a request):
@@ -177,6 +184,82 @@ worse, because a builder makes a pack per shard: 20 builders with 20
 paths each hand in about 280 packs where they handed in 20. A node
 taking over a shard it never held: 100 ms, as long as following one
 new head.
+
+#### Envoy in front of the nodes
+
+`tests/fixtures/envoy.yaml` routes by shard with a ring hash over the
+nodes that pass their health check. The node list is a file Envoy
+reloads when it is replaced, so nodes are added and removed without a
+restart. Four settings in it are not Envoy's defaults, and the stress
+test below fails or slows down without each of them:
+
+| Setting | Why |
+|---|---|
+| `circuit_breakers` raised | The defaults allow 1024 requests and 3 retries at a time for the whole cluster. Above that Envoy answers 503 itself. |
+| `update_merge_window: 0s` | By default Envoy collects health changes for up to a second and keeps sending to a node that failed its check. |
+| `retry_on` with `retriable_status_codes: [503]`, on another node | A stopping node refuses a plan with 503; the retry gives it to the next node, and the builder sees nothing. |
+| `host_selection_retry_max_attempts: 16` | The next entries on the ring are often the same node. With 3 attempts the retry went back to the stopping node now and then. |
+
+Every answer carries the node it came from as `x-hestia-node`.
+
+Retrying on another node is safe for every request: a commit that
+arrives at another node than its plan is refused there ("the node
+restarted since the plan"), and the builder drains again.
+
+`cargo test --test envoy` needs `envoy` on PATH (`nix develop` brings
+it, as `envoy-bin`) and skips otherwise. It checks that
+
+- every plan, pack, commit, narinfo and NAR of a shard reaches the same
+  node, and that a path is found only because of that;
+- shards move when a node is added, killed, restarted or taken out of
+  the list, and drains go on;
+- no plan fails while a node stops, and the node gets none afterwards.
+
+The stress test runs builders and readers through Envoy while nodes are
+killed, stopped, restarted, added and taken out of the list at random:
+
+```
+cargo test --release --test envoy stress -- --ignored --nocapture
+```
+
+`HESTIA_STRESS_SECONDS`, `_NODES`, `_BUILDERS`, `_READERS`, `_PATHS`,
+`_SIZE` and `_SEED` set its scale, `HESTIA_STRESS_QUIET=1` leaves the
+nodes alone, and `HESTIA_STRESS_TIMELINE=1` prints every node event and
+failed drain in order. It fails when an acknowledged path is not served
+with the right bytes within 15 s of being asked for, when a node told
+to stop does not exit cleanly, or when the bucket alone does not have
+every acknowledged path with every chunk in a pack.
+
+One run of 30 s on 4 cores: 4 to 6 nodes, 8 builders, 8 readers, 2 KiB
+paths, a fake bucket without latency, 33 node events of which 3 kills
+and 6 stops (seed 4). No run broke a rule above, with seeds 1 to 6.
+
+| | Drains | Failed attempts | Reads | Answered late |
+|---|---|---|---|---|
+| Nodes left alone | 928 | 0 | 48 842 | 0 |
+| As first written | 621 | 119 | 22 282 | 68 |
+| With the settings above and the changes below | 754 | 17 | 22 026 | 5 |
+
+A failed attempt is a drain the builder had to make again. The 17 that
+remain are drains cut off by a kill (5) and drains planned at one node
+and committed at another after their shard moved (12). A read answered
+late got a miss or an error first; the slowest took 177 ms.
+
+What the stress test changed in hestia:
+
+- A stopping node used to take plans until it exited and then dropped
+  them: every stop failed the drains in flight. Now see "A node told
+  to stop" above. Stops no longer fail a drain.
+- A drain without a node listed the heads once per shard, one shard
+  after the other. A node's final drain, which publishes what it
+  served, took 0.5 to 2 s for that. It now lists once and publishes
+  all shards in one round: a stop of an idle node takes 120 to 190 ms.
+
+Seen and left alone: every node rewrites the one head index of the
+store when it publishes, and loses that race to another node a few
+times in a run ("head index changed under us"). The index is rebuilt
+from a listing, so nothing is lost; with many nodes it will be
+rewritten constantly.
 
 Not built, and what follows from it:
 

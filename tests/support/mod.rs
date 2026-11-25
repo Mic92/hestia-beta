@@ -5,6 +5,7 @@
 //! meaningless here.
 #![allow(dead_code)]
 
+pub mod cluster;
 pub mod common;
 pub mod fake_dav;
 pub mod fake_gha;

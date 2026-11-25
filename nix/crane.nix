@@ -137,7 +137,9 @@ in
         (pkgs.nginx.override { modules = [ pkgs.nginxModules.dav ]; })
         pkgs.apacheHttpd
         pkgs.rclone
-      ];
+      ]
+      # The proxy in front of cache nodes (tests/envoy.rs).
+      ++ lib.optional (lib.meta.availableOn pkgs.stdenv.hostPlatform pkgs.envoy-bin) pkgs.envoy-bin;
       # nix needs a writable HOME.
       preBuild = ''
         export HOME="$(mktemp -d)"

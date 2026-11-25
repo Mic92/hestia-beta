@@ -156,6 +156,29 @@ impl ScratchStore {
         PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
     }
 
+    /// Add many trees with one `nix-store --add`. The paths come back
+    /// in the order of `sources`.
+    pub fn add_paths(&self, sources: &[PathBuf]) -> Vec<PathBuf> {
+        let output = self
+            .nix_store_cmd()
+            .arg("--add")
+            .args(sources)
+            .output()
+            .expect("running nix-store --add failed");
+        assert!(
+            output.status.success(),
+            "nix-store --add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let paths: Vec<PathBuf> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(paths.len(), sources.len());
+        paths
+    }
+
     /// Create a deterministic fixture tree (multi-chunk blob, executable,
     /// symlink, empty file) and add it to the store.
     ///

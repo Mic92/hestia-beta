@@ -1,0 +1,122 @@
+# Envoy in front of the cache nodes of a sharded store (`hestia serve
+# --sharded`): every request of a shard goes to the same node, picked on
+# a hash ring over the nodes that answer their health check.
+#
+# The tests fill in @PORT@ and @DIR@; `tests/envoy.rs` runs this file.
+# The node list is `@DIR@/eds.yaml`. Envoy reloads it when it is replaced
+# by a rename, which is how nodes are added and removed.
+
+node:
+  id: hestia-proxy
+  cluster: hestia-proxy
+
+static_resources:
+  listeners:
+    - address:
+        socket_address: { address: 127.0.0.1, port_value: @PORT@ }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: hestia
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  virtual_hosts:
+                    - name: hestia
+                      domains: ["*"]
+                      # Which node answered, for whoever debugs a miss.
+                      response_headers_to_add:
+                        - header: { key: x-hestia-node, value: "%UPSTREAM_REMOTE_ADDRESS%" }
+                      # A request that never reached its node, or that the
+                      # node refused because it is stopping, goes to the
+                      # next one on the ring. A commit that ends up at
+                      # another node than its plan is refused there, and
+                      # the builder drains again.
+                      retry_policy:
+                        retry_on: connect-failure,refused-stream,retriable-status-codes
+                        # A node that is stopping refuses new drains.
+                        retriable_status_codes: [503]
+                        num_retries: 2
+                        # The next entries on the ring are often the same
+                        # node again: look further for another one.
+                        host_selection_retry_max_attempts: 16
+                        retry_host_predicate:
+                          - name: envoy.retry_host_predicates.previous_hosts
+                            typed_config:
+                              "@type": type.googleapis.com/envoy.extensions.retry.host.previous_hosts.v3.PreviousHostsPredicate
+                      routes:
+                        # Plan, pack and commit of a drain name their shard.
+                        - match:
+                            prefix: /hestia/
+                            headers:
+                              - name: x-hestia-shard
+                                present_match: true
+                          route:
+                            cluster: hestia
+                            timeout: 0s
+                            hash_policy:
+                              - header: { header_name: x-hestia-shard }
+                        # /nar/<nar hash>.nar.zst?hash=<path hash>
+                        - match:
+                            prefix: /nar/
+                            query_parameters:
+                              - name: hash
+                                present_match: true
+                          route:
+                            cluster: hestia
+                            timeout: 0s
+                            hash_policy:
+                              - header:
+                                  header_name: ":path"
+                                  regex_rewrite:
+                                    pattern: { regex: "^.*[?&]hash=(.).*$" }
+                                    substitution: "\\1"
+                        # /<path hash>.narinfo and /<path hash>.ls
+                        - match:
+                            safe_regex: { regex: "^/[0-9a-z]{32}\\.(narinfo|ls)$" }
+                          route:
+                            cluster: hestia
+                            hash_policy:
+                              - header:
+                                  header_name: ":path"
+                                  regex_rewrite:
+                                    pattern: { regex: "^/(.).*$" }
+                                    substitution: "\\1"
+                        # Anything else is answered by any node.
+                        - match: { prefix: / }
+                          route: { cluster: hestia, timeout: 0s }
+
+  clusters:
+    - name: hestia
+      type: EDS
+      eds_cluster_config:
+        eds_config:
+          path_config_source: { path: @DIR@/eds.yaml }
+      connect_timeout: 1s
+      lb_policy: RING_HASH
+      # Envoy's defaults allow 1024 requests and 3 retries at a time for
+      # the whole cluster, far less than a few hundred builders make.
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 100000
+            max_pending_requests: 100000
+            max_requests: 100000
+            max_retries: 10000
+      common_lb_config:
+        # Never send to a node that fails its check, however few are left.
+        healthy_panic_threshold: { value: 0 }
+        # Act on a failed check at once. By default Envoy collects such
+        # changes for up to a second and keeps sending to the node.
+        update_merge_window: 0s
+      health_checks:
+        - timeout: 1s
+          interval: 0.2s
+          no_traffic_interval: 0.2s
+          unhealthy_threshold: 1
+          healthy_threshold: 1
+          http_health_check: { path: /hestia/health }

@@ -346,19 +346,43 @@ impl PipelineContext {
         // One budget for all parts: together they hold no more of the
         // NARs in memory than a drain under one root does.
         let inflight = Arc::new(Semaphore::new(CHUNK_INFLIGHT_NAR_BYTES as usize));
-        let done: Vec<Result<DrainStats, Error>> = stream::iter(parts.into_values())
-            .map(|part| self.drain_part(part, inflight.clone()))
+        // Without a node this drain makes the next snapshot itself: the
+        // heads are listed once and every part is published in one round.
+        let _updating = match (&self.node, &self.publish) {
+            (None, Some(publish)) => Some(publish.updating().await),
+            _ => None,
+        };
+        let snapshot = match &self.node {
+            Some(_) => None,
+            None => {
+                let roots: Vec<String> = parts.keys().map(|s| self.root_of(*s)).collect();
+                let listed = self.relist(&roots).await?;
+                stats.load_ms += load_started.elapsed().as_millis() as u64 - query_ms;
+                Some(listed)
+            }
+        };
+        let done: Vec<Result<_, Error>> = stream::iter(parts.into_values())
+            .map(|part| self.drain_part(part, inflight.clone(), snapshot.clone()))
             .buffer_unordered(PART_CONCURRENCY)
             .collect()
             .await;
         // A part that failed fails the drain. Its paths are handed in
         // again, and what the other parts published is then stored.
         let mut failed = None;
+        let mut sealed = Vec::new();
         for part in done {
             match part {
-                Ok(part) => absorb(&mut stats, part),
+                Ok((part, segment)) => {
+                    absorb(&mut stats, part);
+                    sealed.extend(segment);
+                }
                 Err(err) => failed = Some(err),
             }
+        }
+        if let (Some(snapshot), false) = (&snapshot, sealed.is_empty()) {
+            let commit_started = Instant::now();
+            stats.head = self.publish_parts(snapshot, sealed).await?.pop();
+            stats.commit_ms = commit_started.elapsed().as_millis() as u64;
         }
         stats.load_ms += query_ms;
         match failed {
@@ -374,7 +398,16 @@ impl PipelineContext {
 
     /// The part of a drain that goes under one root: all of it, or in a
     /// sharded store the paths of one shard.
-    async fn drain_part(&self, part: Part, inflight: Arc<Semaphore>) -> Result<DrainStats, Error> {
+    ///
+    /// Through a node the part is committed there. Without one it is
+    /// made against `snapshot`, and its segment comes back to be
+    /// published with those of the other parts.
+    async fn drain_part(
+        &self,
+        part: Part,
+        inflight: Arc<Semaphore>,
+        snapshot: Option<Arc<Snapshot>>,
+    ) -> Result<(DrainStats, Option<(String, Sealed)>), Error> {
         let Part {
             shard,
             candidates,
@@ -385,15 +418,6 @@ impl PipelineContext {
         let root = self.root_of(shard);
         let node = self.node.as_ref().map(|n| n.for_shard(shard));
         let node = node.as_ref();
-        // Without a node this drain makes the next snapshot itself.
-        let _updating = match (node, &self.publish) {
-            (None, Some(publish)) => Some(publish.updating().await),
-            _ => None,
-        };
-        let snapshot = match node {
-            Some(_) => None,
-            None => Some(self.relist(std::slice::from_ref(&root)).await?),
-        };
 
         // What is stored already, and where chunks worth reusing lie: a
         // rebuild mostly repeats the chunks of the previous build under
@@ -707,20 +731,16 @@ impl PipelineContext {
             }
         }
         if writer.is_empty() {
-            return Ok(stats);
+            return Ok((stats, None));
         }
-        let commit_started = Instant::now();
         let sealed = writer.seal().map_err(store::Error::from)?;
-        stats.head = Some(match (node, plan, snapshot) {
-            (Some(node), Some(plan), _) => node.commit(&plan, &sealed).await?,
-            (_, _, Some(snapshot)) => self
-                .publish_parts(&snapshot, vec![(root, sealed)])
-                .await?
-                .remove(0),
-            _ => unreachable!(),
-        });
+        let (Some(node), Some(plan)) = (node, plan) else {
+            return Ok((stats, Some((root, sealed))));
+        };
+        let commit_started = Instant::now();
+        stats.head = Some(node.commit(&plan, &sealed).await?);
         stats.commit_ms = commit_started.elapsed().as_millis() as u64;
-        Ok(stats)
+        Ok((stats, None))
     }
 
     /// List the heads again and serve `roots` on top of what is served.

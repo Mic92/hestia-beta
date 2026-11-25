@@ -64,6 +64,12 @@ use crate::trust::Trust;
 use crate::upstream::UpstreamFilter;
 
 /// How often the idle-exit timer checks for inactivity.
+/// A cache node told to stop lets the drains it planned finish: it
+/// exits once builders sent nothing for this long, and no later than
+/// [`NODE_EXIT_LIMIT`] after it was told.
+const NODE_EXIT_QUIET: Duration = Duration::from_millis(300);
+const NODE_EXIT_LIMIT: Duration = Duration::from_secs(30);
+
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Upper bound for one request line on the hook socket.
@@ -110,6 +116,10 @@ struct DaemonState {
     /// waits for this to reach zero so a response in flight (e.g. the
     /// drain client's stats) is flushed before the process exits.
     connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// As a cache node: plan, pack and commit requests being answered,
+    /// and when the last of them came or went. `None` before the first.
+    node_requests: std::sync::atomic::AtomicUsize,
+    node_last: Mutex<Option<Instant>>,
 }
 
 /// A builder's sealed segment, the GC epoch it was planned in, its shard, and where
@@ -383,6 +393,8 @@ impl Daemon {
                 in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                node_requests: std::sync::atomic::AtomicUsize::new(0),
+                node_last: Mutex::new(None),
             }),
             listener,
             idle_exit,
@@ -423,9 +435,17 @@ impl Daemon {
                 Ok(request) => request,
                 Err(err) => return (StatusCode::BAD_REQUEST, err.to_string().into_bytes()),
             };
+            // A drain not begun is begun elsewhere: the proxy sends the
+            // plan to the next node.
+            if state.shutting_down.load(Ordering::SeqCst) {
+                return (StatusCode::SERVICE_UNAVAILABLE, b"node is exiting".to_vec());
+            }
             match state.plan(request).await {
                 Ok(plan) => (StatusCode::OK, plan.encode()),
-                Err(err) => (StatusCode::SERVICE_UNAVAILABLE, err.into_bytes()),
+                Err(err) => {
+                    eprintln!("hestia serve: cannot plan a builder's drain: {err}");
+                    (StatusCode::SERVICE_UNAVAILABLE, err.into_bytes())
+                }
             }
         }
         async fn commit(State(state): Shared, body: bytes::Bytes) -> (StatusCode, Vec<u8>) {
@@ -522,10 +542,38 @@ impl Daemon {
                 }
             }
         });
+        /// What a proxy asks to learn whether to send here: no longer
+        /// once the node was told to stop.
+        async fn health(State(state): Shared) -> (StatusCode, &'static str) {
+            match state.shutting_down.load(Ordering::SeqCst) {
+                false => (StatusCode::OK, "ok"),
+                true => (StatusCode::SERVICE_UNAVAILABLE, "exiting"),
+            }
+        }
+        async fn counted(
+            State(state): Shared,
+            request: axum::extract::Request,
+            next: axum::middleware::Next,
+        ) -> axum::response::Response {
+            let stamp = |state: &DaemonState| {
+                *state.node_last.lock().expect("node lock poisoned") = Some(Instant::now());
+            };
+            state.node_requests.fetch_add(1, Ordering::SeqCst);
+            stamp(&state);
+            let response = next.run(request).await;
+            stamp(&state);
+            state.node_requests.fetch_sub(1, Ordering::SeqCst);
+            response
+        }
         let router = axum::Router::new()
             .route("/hestia/plan", axum::routing::post(plan))
             .route("/hestia/commit", axum::routing::post(commit))
             .route("/hestia/pack/{key}", axum::routing::put(pack))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                counted,
+            ))
+            .route("/hestia/health", axum::routing::get(health))
             .layer(axum::extract::DefaultBodyLimit::max(MAX_COMMIT_BYTES))
             .with_state(state);
         (router, committer)
@@ -631,6 +679,27 @@ impl Daemon {
         state
             .shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // As a cache node: the health check fails from here on and plans
+        // are refused, so the proxy sends new drains elsewhere. Those
+        // already planned here still upload and commit.
+        let told = Instant::now();
+        while told.elapsed() < NODE_EXIT_LIMIT {
+            let last = *state.node_last.lock().expect("node lock poisoned");
+            let Some(last) = last else {
+                break;
+            };
+            let busy = state.node_requests.load(Ordering::SeqCst) > 0
+                || !state
+                    .commits
+                    .lock()
+                    .expect("commit lock poisoned")
+                    .is_empty();
+            if !busy && last.elapsed() >= NODE_EXIT_QUIET {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         // Final drain: whatever is still buffered must be uploaded before
         // the runner disappears. Adds that raced in before the flag

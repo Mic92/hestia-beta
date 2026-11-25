@@ -22,7 +22,10 @@ use hestia::protocol::{self, DrainStats, Request};
 use hestia::serve::Daemon;
 use hestia::substituter::{ManifestStore, Substituter};
 
-use support::common::{load_snapshot, nar_body, path_hash_of, pipeline_context};
+use hestia::store::Snapshot;
+use support::common::{
+    TEST_ROOT_KEY, load_snapshot, nar_body, path_hash_of, pipeline_context, to_path_set,
+};
 use support::fake_gha::FakeGha;
 use support::store::ScratchStore;
 
@@ -1098,4 +1101,167 @@ async fn serve_becomes_ready_while_cache_api_stalls() {
 /// Socket path inside the scratch store's tempdir (cleaned up with it).
 fn store_socket_path(store: &ScratchStore) -> PathBuf {
     store.db_path().parent().unwrap().join("hestia-hook.sock")
+}
+
+/// A node of a sharded store: it serves nothing until asked.
+async fn sharded_node(
+    fake: &FakeGha,
+    http: &reqwest::Client,
+    store: &ScratchStore,
+    socket: &Path,
+) -> (ManifestStore, String, [tokio::task::AbortHandle; 2]) {
+    let served = ManifestStore::sharded(
+        &[TEST_ROOT_KEY.to_string()],
+        fake.backend(http),
+        hestia::trust::Trust::open(),
+    );
+    let daemon = Daemon::bind(
+        socket,
+        None,
+        PipelineContext {
+            sharded: true,
+            ..pipeline_context(fake, http, store.database())
+        },
+        AccessLog::new(),
+        served.clone(),
+    )
+    .expect("binding daemon failed");
+    let (router, committer) = daemon.node_router(Duration::from_millis(50));
+    let nix = Substituter::new(
+        Default::default(),
+        served.clone(),
+        daemon.access_log(),
+        fake.backend(http),
+    );
+    let router = router.merge(nix.into_router());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    (
+        served,
+        url,
+        [committer.abort_handle(), server.abort_handle()],
+    )
+}
+
+/// In a sharded store a drain publishes one head per shard it has paths
+/// of, and a node that was never asked for a shard serves what another
+/// node published there from the first request: it stands in for that
+/// node without having followed the store.
+#[tokio::test]
+async fn a_node_serves_a_shard_another_node_published() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let built: Vec<_> = (0..6)
+        .map(|i| store.add_fixture(&format!("shard-{i}"), 300 + i))
+        .collect();
+    let shards: std::collections::BTreeSet<_> = built
+        .iter()
+        .map(|p| hestia::shard::Shard::of(&path_hash_of(p)))
+        .collect();
+    assert!(shards.len() > 1, "the fixtures lie in one shard");
+
+    let sockets = tempfile::tempdir().unwrap();
+    let a = sharded_node(&fake, &http, &store, &sockets.path().join("a")).await;
+    let b = sharded_node(&fake, &http, &store, &sockets.path().join("b")).await;
+
+    let builder = PipelineContext {
+        sharded: true,
+        expand_closure: false,
+        node: Some(hestia::node::NodeClient::new(http.clone(), &a.1)),
+        ..pipeline_context(&fake, &http, store.database())
+    };
+    let paths: Vec<&Path> = built.iter().map(|p| p.as_path()).collect();
+    let stats = builder
+        .run(to_path_set(&paths), Default::default())
+        .await
+        .expect("drain through a");
+    assert_eq!(stats.pushed, built.len());
+
+    // One root per shard, each named by its shard.
+    let all = Snapshot::load(fake.backend(&http), hestia::trust::Trust::open(), &[], None)
+        .await
+        .unwrap();
+    let roots: Vec<&String> = all.view.roots.keys().collect();
+    let expected: Vec<String> = shards.iter().map(|s| s.root(TEST_ROOT_KEY)).collect();
+    assert_eq!(roots, expected.iter().collect::<Vec<_>>());
+
+    for path in &built {
+        let narinfo = format!("{}.narinfo", path_hash_of(path));
+        for node in [&a, &b] {
+            let answer = http.get(format!("{}/{narinfo}", node.1)).send().await;
+            assert_eq!(answer.unwrap().status(), 200, "{narinfo} at {}", node.1);
+        }
+    }
+    assert_eq!(
+        b.0.early_misses(),
+        0,
+        "b loaded each shard before it answered"
+    );
+    // b holds what it was asked for and nothing else.
+    let held = b.0.snapshot().unwrap().roots.clone();
+    assert_eq!(held.len(), shards.len());
+
+    // A builder is told when it hands a node paths of two shards at once.
+    let mixed = hestia::node::NodeClient::new(http.clone(), &a.1)
+        .plan(
+            built
+                .iter()
+                .map(|p| (path_hash_of(p), "x".to_owned()))
+                .collect(),
+        )
+        .await;
+    assert!(
+        matches!(&mixed, Err(err) if err.to_string().contains("more than one shard")),
+        "{:?}",
+        mixed.err().map(|e| e.to_string())
+    );
+
+    for task in a.2.iter().chain(&b.2) {
+        task.abort();
+    }
+}
+
+/// Without a node a sharded drain publishes its shards itself, and a
+/// second drain finds every path stored.
+#[tokio::test]
+async fn a_sharded_drain_without_a_node_publishes_each_shard() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let built: Vec<_> = (0..6)
+        .map(|i| store.add_fixture(&format!("direct-{i}"), 400 + i))
+        .collect();
+    let paths: Vec<&Path> = built.iter().map(|p| p.as_path()).collect();
+    let builder = PipelineContext {
+        sharded: true,
+        expand_closure: false,
+        ..pipeline_context(&fake, &http, store.database())
+    };
+    let first = builder
+        .run(to_path_set(&paths), Default::default())
+        .await
+        .expect("first drain");
+    assert_eq!(first.pushed, built.len());
+    let again = builder
+        .run(to_path_set(&paths), Default::default())
+        .await
+        .expect("second drain");
+    assert_eq!((again.pushed, again.skipped_existing), (0, built.len()));
+
+    let served = ManifestStore::sharded(
+        &[TEST_ROOT_KEY.to_string()],
+        fake.backend(&http),
+        hestia::trust::Trust::open(),
+    );
+    for path in &built {
+        let hash = path_hash_of(path);
+        served.hold(&hash).await.expect("loading the shard");
+        assert!(served.available(&hash).await, "{hash}");
+    }
 }

@@ -23,6 +23,7 @@ pub mod protocol;
 pub mod refnorm;
 pub mod segment;
 pub mod serve;
+pub mod shard;
 pub mod store;
 pub mod substituter;
 pub mod trust;

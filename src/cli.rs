@@ -52,6 +52,13 @@ pub struct ServeArgs {
     #[arg(long, value_name = "SECONDS")]
     pub follow: Option<u64>,
 
+    /// The store keeps each root in 32 shards, by the first character of
+    /// the store path hash, so that a proxy can send each shard to one
+    /// of several cache nodes. Every daemon and node of a store agrees
+    /// on this.
+    #[arg(long)]
+    pub sharded: bool,
+
     /// Drain through the cache node at this URL: it says what is stored
     /// and publishes for this daemon, which then loads no index to drain.
     #[arg(long, value_name = "URL")]

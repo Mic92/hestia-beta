@@ -49,6 +49,7 @@ pub fn pipeline_context_with(backend: Backend, store: StoreDatabase) -> Pipeline
         expand_closure: true,
         filter_drv_closures: false,
         root_key: TEST_ROOT_KEY.to_string(),
+        sharded: false,
         pack_target_size: PACK_TARGET_SIZE,
         read_only: Arc::new(AtomicBool::new(false)),
         publish: None,

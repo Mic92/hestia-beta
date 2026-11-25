@@ -15,6 +15,10 @@
 //!    waits until the store has the packs the segment names, merges what arrives within its commit interval into one segment,
 //!    publishes one head for it and answers every builder with its name.
 //!
+//! In a sharded store ([`crate::shard`]) the three steps are made once
+//! per shard, each request naming the shard to the proxy in front of
+//! the nodes, and the node publishes a head per shard.
+//!
 //! The node trusts the builders it serves as the store trusts anyone who
 //! can write to it: a segment naming packs that do not exist is published
 //! as it is and its paths fail when fetched.
@@ -23,6 +27,7 @@ use std::sync::Arc;
 
 use crate::manifest::{PackHash, PathHash};
 use crate::segment::{self, PackIndex, Sealed};
+use crate::shard::Shard;
 use crate::store::KnownChunks;
 
 const MAGIC_PLAN: &[u8; 4] = b"HNP1";
@@ -166,6 +171,8 @@ pub fn decode_commit(bytes: &[u8]) -> Result<(u64, u64, Sealed), Error> {
 pub struct NodeClient {
     http: reqwest::Client,
     base: String,
+    /// Named to the proxy in front of the nodes with every request.
+    shard: Option<Shard>,
 }
 
 impl NodeClient {
@@ -173,13 +180,32 @@ impl NodeClient {
         NodeClient {
             http,
             base: base.trim_end_matches('/').to_owned(),
+            shard: None,
+        }
+    }
+
+    /// The same node, or in a sharded store whichever node the proxy
+    /// in front has for `shard`.
+    pub fn for_shard(&self, shard: Option<Shard>) -> NodeClient {
+        NodeClient {
+            shard,
+            ..self.clone()
+        }
+    }
+
+    fn request(&self, method: reqwest::Method, what: &str) -> reqwest::RequestBuilder {
+        let request = self
+            .http
+            .request(method, format!("{}/hestia/{what}", self.base));
+        match self.shard {
+            Some(shard) => request.header(crate::shard::HEADER, shard.to_string()),
+            None => request,
         }
     }
 
     async fn post(&self, what: &str, body: Vec<u8>) -> Result<bytes::Bytes, Error> {
         let response = self
-            .http
-            .post(format!("{}/hestia/{what}", self.base))
+            .request(reqwest::Method::POST, what)
             .body(body)
             .send()
             .await?;
@@ -210,8 +236,7 @@ impl NodeClient {
     /// pack; the commit waits for it. `false` when the store had it.
     pub async fn put_pack(&self, key: &str, data: bytes::Bytes) -> Result<bool, Error> {
         let response = self
-            .http
-            .put(format!("{}/hestia/pack/{key}", self.base))
+            .request(reqwest::Method::PUT, &format!("pack/{key}"))
             .body(data)
             .send()
             .await?;

@@ -57,6 +57,7 @@ use crate::pathinfo::StoreDatabase;
 use crate::pipeline::{self, AccessLog, PipelineContext};
 use crate::protocol::{DrainStats, Request, Response, encode_line};
 use crate::segment::Sealed;
+use crate::shard::Shard;
 use crate::store::Snapshot;
 use crate::substituter::{ManifestStore, Substituter, verify_packs};
 use crate::trust::Trust;
@@ -111,10 +112,11 @@ struct DaemonState {
     connections: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// A builder's sealed segment, the GC epoch it was planned in, and where
+/// A builder's sealed segment, the GC epoch it was planned in, its shard, and where
 /// the head it ends up under (or why it did not) is reported.
 type PendingCommit = (
     u64,
+    Option<Shard>,
     Sealed,
     tokio::sync::oneshot::Sender<Result<String, String>>,
 );
@@ -204,13 +206,23 @@ impl DaemonState {
     /// Answer a builder's plan request from what this daemon serves.
     async fn plan(&self, request: PlanRequest) -> Result<Plan, String> {
         let served = self.pipeline.publish.as_ref().expect("set by bind");
+        let mut asked = Vec::new();
+        for (hash, name) in &request.paths {
+            let hash: PathHash = hash.parse().map_err(|_| format!("bad path hash {hash}"))?;
+            asked.push((hash, name));
+        }
+        if self.pipeline.sharded {
+            one_shard(asked.iter().map(|(hash, _)| *hash))?;
+            if let Some((hash, _)) = asked.first() {
+                served.hold(hash).await.map_err(|err| err.to_string())?;
+            }
+        }
         let Some(snapshot) = served.snapshot() else {
             return Err("the root is not loaded yet".to_owned());
         };
         let mut present = Vec::new();
         let mut names = BTreeSet::new();
-        for (hash, name) in &request.paths {
-            let hash: PathHash = hash.parse().map_err(|_| format!("bad path hash {hash}"))?;
+        for (hash, name) in asked {
             if served.available(&hash).await {
                 present.push(hash);
             } else {
@@ -238,11 +250,18 @@ impl DaemonState {
         }
         let _work = self.begin_work();
         let guard = self.drain_lock.lock().await;
-        let accessed = self.access_log.take();
         let (parts, waiting): (Vec<_>, Vec<_>) = pending
             .into_iter()
-            .map(|(epoch, sealed, reply)| ((epoch, sealed), reply))
+            .map(|(epoch, shard, sealed, reply)| ((epoch, shard, sealed), (shard, reply)))
             .unzip();
+        // What was served of a shard goes into that shard's segment,
+        // so the rest waits for a round that publishes its shard.
+        let (accessed, later): (BTreeSet<PathHash>, BTreeSet<PathHash>) =
+            self.access_log.take().into_iter().partition(|hash| {
+                let shard = self.pipeline.sharded.then(|| Shard::of(hash));
+                parts.iter().any(|(_, s, _)| *s == shard)
+            });
+        self.access_log.extend(later);
         let outcome = self
             .pipeline
             .commit_group(&parts, &accessed)
@@ -252,8 +271,8 @@ impl DaemonState {
             self.access_log.extend(accessed);
         }
         drop(guard);
-        for reply in waiting {
-            let _ = reply.send(outcome.clone());
+        for (shard, reply) in waiting {
+            let _ = reply.send(outcome.clone().map(|heads| heads[&shard].clone()));
         }
     }
 
@@ -432,12 +451,19 @@ impl Daemon {
             if let Err(err) = state.pipeline.backend.settled(&packs).await {
                 return (StatusCode::CONFLICT, err.into_bytes());
             }
+            let shard = match state.pipeline.sharded {
+                true => match shard_of(&sealed) {
+                    Ok(shard) => Some(shard),
+                    Err(err) => return (StatusCode::BAD_REQUEST, err.into_bytes()),
+                },
+                false => None,
+            };
             let (reply, published) = tokio::sync::oneshot::channel();
             state
                 .commits
                 .lock()
                 .expect("commit lock poisoned")
-                .push((epoch, sealed, reply));
+                .push((epoch, shard, sealed, reply));
             state.commit_wake.notify_one();
             match published.await {
                 Ok(Ok(head)) => (StatusCode::OK, head.into_bytes()),
@@ -650,11 +676,41 @@ async fn load_published(
     manifest_store: &ManifestStore,
     roots: &[String],
 ) {
+    let _updating = manifest_store.updating().await;
     let previous = manifest_store.snapshot();
-    match Snapshot::load(backend.clone(), trust.clone(), roots, previous.as_deref()).await {
+    // And the shards held since the last load.
+    let mut roots = roots.to_vec();
+    for held in previous.iter().flat_map(|p| &p.roots) {
+        if !roots.contains(held) {
+            roots.push(held.clone());
+        }
+    }
+    match Snapshot::load(backend.clone(), trust.clone(), &roots, previous.as_deref()).await {
         Ok(snapshot) => report_early(manifest_store.set_followed(Arc::new(snapshot))),
         Err(err) => eprintln!("hestia serve: cannot list heads, substituting nothing: {err}"),
     }
+}
+
+/// The shard all of `hashes` lie in. A request for a sharded store is
+/// for one shard, as the proxy in front sent it to one node.
+fn one_shard(hashes: impl IntoIterator<Item = PathHash>) -> Result<Option<Shard>, String> {
+    let mut shards = hashes.into_iter().map(|hash| Shard::of(&hash));
+    let first = shards.next();
+    match shards.all(|shard| Some(shard) == first) {
+        true => Ok(first),
+        false => Err("the paths lie in more than one shard".to_owned()),
+    }
+}
+
+/// The shard of everything `sealed` names.
+fn shard_of(sealed: &crate::segment::Sealed) -> Result<Shard, String> {
+    let meta = crate::segment::Meta::open(&sealed.meta).map_err(|err| err.to_string())?;
+    let uses = match &sealed.uses {
+        Some(bytes) => crate::segment::decode_uses(bytes).map_err(|err| err.to_string())?,
+        None => Vec::new(),
+    };
+    let hashes = (0..meta.len()).map(|i| meta.hash(i)).chain(uses);
+    one_shard(hashes)?.ok_or_else(|| "the segment names no path".to_owned())
 }
 
 /// `early` paths that just became servable were asked for here before.
@@ -856,6 +912,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         expand_closure: !args.no_closure,
         filter_drv_closures: args.filter_drv_closures,
         root_key: root_key.clone(),
+        sharded: args.sharded,
         pack_target_size: pipeline::PACK_TARGET_SIZE,
         read_only: read_only.clone(),
         // Replaced by Daemon::bind with the daemon's shared ManifestStore.
@@ -867,7 +924,15 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
             .map(|url| crate::node::NodeClient::new(http.clone(), url)),
     };
 
-    let manifest_store = ManifestStore::new();
+    // A sharded store is loaded shard by shard, as requests ask for them.
+    let manifest_store = match args.sharded {
+        true => ManifestStore::sharded(&serve_roots, backend.clone(), trust.clone()),
+        false => ManifestStore::new(),
+    };
+    let serve_roots = match args.sharded {
+        true => Vec::new(),
+        false => serve_roots,
+    };
 
     // Bind the substituter port before touching the hook socket: if the
     // port is taken (most likely by another hestia serve with default

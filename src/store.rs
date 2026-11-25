@@ -271,7 +271,7 @@ impl Snapshot {
         roots: &[String],
         previous: Option<&Snapshot>,
     ) -> Result<Snapshot, Error> {
-        Self::load_with(backend, trust, roots, previous, None).await
+        Self::load_with(backend, trust, roots, previous, Vec::new()).await
     }
 
     async fn load_with(
@@ -279,7 +279,7 @@ impl Snapshot {
         trust: Trust,
         roots: &[String],
         previous: Option<&Snapshot>,
-        fresh: Option<(u64, Arc<Segment>)>,
+        fresh: Vec<(u64, Arc<Segment>)>,
     ) -> Result<Snapshot, Error> {
         let Heads { listed, view, .. } = Heads::load(&backend, &trust).await?;
         let published: Vec<(u64, Arc<Segment>)> = fresh
@@ -354,19 +354,25 @@ impl Snapshot {
         })
     }
 
-    /// Reload after publishing `sealed` under the first root.
-    pub async fn refresh_with(&self, sealed: &Sealed) -> Result<Snapshot, Error> {
-        let fresh = Arc::new(Segment::new(
-            sealed.digest(),
-            Meta::open(&sealed.meta)?,
-            Some(Tree::open(&sealed.tree)?),
-        ));
+    /// Reload after publishing `sealed` under roots this serves.
+    pub async fn refresh_with(&self, sealed: &[&Sealed]) -> Result<Snapshot, Error> {
+        let mut fresh = Vec::with_capacity(sealed.len());
+        for sealed in sealed {
+            fresh.push((
+                self.view.epoch,
+                Arc::new(Segment::new(
+                    sealed.digest(),
+                    Meta::open(&sealed.meta)?,
+                    Some(Tree::open(&sealed.tree)?),
+                )),
+            ));
+        }
         Snapshot::load_with(
             self.backend.clone(),
             self.trust.clone(),
             &self.roots,
             Some(self),
-            Some((self.view.epoch, fresh)),
+            fresh,
         )
         .await
     }

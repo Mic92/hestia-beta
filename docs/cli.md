@@ -12,6 +12,7 @@ setups, or hacking on hestia).
 | `--listen <ADDR>` | `127.0.0.1:37515` | Substituter HTTP address. |
 | `--idle-exit <SECONDS>` | — | Drain and exit after this much inactivity (fallback for setups without post steps). |
 | `--follow <SECONDS>` | — | Reload the served roots this often, to pick up what other writers publish. For a daemon many builders share as their cache. |
+| `--sharded` | off | Keep each root in 32 shards, by the first character of the store path hash, so a proxy can send each shard to one of several cache nodes ([cache-node.md](cache-node.md)). Every daemon and node of a store must agree. |
 | `--node <URL>` | — | Drain through the cache node at this URL: it says what is stored and publishes for this daemon, which then loads no index at all and substitutes nothing itself; point Nix at the node. |
 | `--commit-interval <MILLISECONDS>` | — | Be a cache node for the drains of daemons started with `--node`: publish what they hand in as one segment, at most once per interval. |
 | `--pack-cache <DIRECTORY>` | — | Keep the packs written and read through this daemon in this directory, so later reads do not go to the store. For a cache node. Kept across a clean exit; after a crash it starts empty. |

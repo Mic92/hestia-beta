@@ -140,6 +140,18 @@ impl ManifestView {
 pub struct ManifestStore {
     inner: Arc<RwLock<Arc<ManifestView>>>,
     asked: Arc<Mutex<Asked>>,
+    /// Held by whoever builds the next snapshot from the served one, so
+    /// that no two of them replace each other's work.
+    updates: Arc<tokio::sync::Mutex<()>>,
+    shards: Option<Arc<Shards>>,
+}
+
+/// What a store in shards ([`crate::shard`]) is loaded with.
+struct Shards {
+    /// The roots whose shards are served, the one published into first.
+    roots: Vec<String>,
+    backend: Backend,
+    trust: crate::trust::Trust,
 }
 
 /// Paths that were asked for and not served, to tell how often a path
@@ -158,6 +170,64 @@ const ASKED_MAX: usize = 100_000;
 impl ManifestStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Serves the shards of `roots` that requests ask for
+    /// ([`ManifestStore::hold`]), and nothing before the first request.
+    pub fn sharded(roots: &[String], backend: Backend, trust: crate::trust::Trust) -> Self {
+        ManifestStore {
+            shards: Some(Arc::new(Shards {
+                roots: roots.to_vec(),
+                backend,
+                trust,
+            })),
+            ..Self::default()
+        }
+    }
+
+    /// Whoever replaces the snapshot by one made from it holds this.
+    pub async fn updating(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.updates.clone().lock_owned().await
+    }
+
+    /// Serve the shard of `hash`: the first request for a shard loads
+    /// it from the store, so a node that stands in for another serves
+    /// what that one published. Nothing to do in a store without shards.
+    pub async fn hold(&self, hash: &PathHash) -> Result<(), crate::store::Error> {
+        let Some(shards) = &self.shards else {
+            return Ok(());
+        };
+        let shard = crate::shard::Shard::of(hash);
+        let wanted: Vec<String> = shards.roots.iter().map(|r| shard.root(r)).collect();
+        let held = || {
+            self.snapshot()
+                .is_some_and(|s| wanted.iter().all(|r| s.roots.contains(r)))
+        };
+        if held() {
+            return Ok(());
+        }
+        let _updating = self.updating().await;
+        if held() {
+            return Ok(());
+        }
+        let previous = self.snapshot();
+        let mut roots = previous.as_ref().map_or_else(Vec::new, |p| p.roots.clone());
+        roots.extend(
+            wanted
+                .iter()
+                .filter(|r| !roots.contains(r))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let snapshot = Snapshot::load(
+            shards.backend.clone(),
+            shards.trust.clone(),
+            &roots,
+            previous.as_deref(),
+        )
+        .await?;
+        self.set_followed(Arc::new(snapshot));
+        Ok(())
     }
 
     /// Serve `snapshot`, which this daemon published into.
@@ -757,6 +827,14 @@ impl Substituter {
 
     /// Block until the startup manifest load finished (no-op without a
     /// gate, or once it fired).
+    /// Serve the shard of `hash` before looking it up. A shard that
+    /// cannot be loaded is a miss for its paths.
+    async fn hold(&self, hash: &PathHash) {
+        if let Err(err) = self.manifest.hold(hash).await {
+            eprintln!("hestia substituter: cannot load the shard of {hash}: {err}");
+        }
+    }
+
     async fn manifest_ready(&self) {
         if let Some(ready) = &self.manifest_ready {
             // Only fails if the sender is dropped without sending; serve
@@ -858,6 +936,7 @@ async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>
         return StatusCode::NOT_FOUND.into_response();
     };
 
+    state.hold(&path_hash).await;
     let view = state.manifest.view();
     let Some(entry) = view.lookup(&path_hash) else {
         state.manifest.note_miss(path_hash);
@@ -884,6 +963,7 @@ async fn listing(state: &Substituter, hash_str: &str) -> Response {
     let Ok(path_hash) = hash_str.parse::<PathHash>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    state.hold(&path_hash).await;
     let Ok(Some(r)) = state.manifest.view().resolve(&path_hash).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -946,14 +1026,16 @@ async fn nar(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let view = state.manifest.view();
-
     // Resolve the path entry: by ?hash= if present, otherwise via the
     // NAR-hash index.
     let query = match query {
         Ok(Query(query)) => query,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
+    if let Some(Ok(path_hash)) = query.hash.as_ref().map(|h| h.parse::<PathHash>()) {
+        state.hold(&path_hash).await;
+    }
+    let view = state.manifest.view();
     let path_hash = match &query.hash {
         Some(hash) => match hash.parse::<PathHash>() {
             Ok(path_hash) => path_hash,

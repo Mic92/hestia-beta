@@ -31,7 +31,7 @@
 #[path = "../tests/support/mod.rs"]
 mod support;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -41,6 +41,7 @@ use hestia::backend::Backend;
 use hestia::backend::cached::{Cached, PackCache};
 use hestia::manifest::PathHash;
 use hestia::pipeline::AccessLog;
+use hestia::shard::Shard;
 use hestia::store::Snapshot;
 use hestia::substituter::{ManifestStore, Substituter};
 use hestia::trust::Trust;
@@ -381,7 +382,7 @@ async fn main() {
         .drain(&cold, ROOT, &built_refs, &used)
         .await
         .expect("published");
-    let drained = Arc::new(cold.refresh_with(&sealed).await.unwrap());
+    let drained = Arc::new(cold.refresh_with(&[&sealed]).await.unwrap());
     row(&format!("drain {new} new, {} used", used.len()), t, &net);
 
     let t = Instant::now();
@@ -409,7 +410,7 @@ async fn main() {
             .drain(&snapshot, ROOT, &built_refs, &used)
             .await
             .expect("published");
-        snapshot = Arc::new(snapshot.refresh_with(&sealed).await.unwrap());
+        snapshot = Arc::new(snapshot.refresh_with(&[&sealed]).await.unwrap());
     }
     let other = load(Some(other)).await;
     net.take();
@@ -473,6 +474,71 @@ async fn main() {
     row("follow them", t, &net);
     println!("{:<34} {} segments live", "", other.view.roots[ROOT].len());
 
+    // The same wave in a sharded store: each builder seals a segment per
+    // shard it has paths of, and the node publishes a head per shard.
+    let wave = outputs(2);
+    let t = Instant::now();
+    let sealed = futures_util::future::join_all(wave.iter().flat_map(|built| {
+        let mut shards: BTreeMap<Shard, Vec<&SimPath>> = BTreeMap::new();
+        for path in built {
+            let shard = Shard::of(&path.path_hash());
+            shards.entry(shard).or_default().push(path);
+        }
+        shards.into_iter().map(|(shard, refs)| {
+            let (sim, snapshot) = (&sim, &snapshot);
+            let used: Vec<PathHash> = used
+                .iter()
+                .filter(|h| Shard::of(h) == shard)
+                .copied()
+                .collect();
+            async move {
+                (
+                    shard,
+                    sim.prepare(snapshot, &refs, &used).await.expect("sealed"),
+                )
+            }
+        })
+    }))
+    .await;
+    let mut shards: BTreeMap<Shard, Vec<hestia::segment::Sealed>> = BTreeMap::new();
+    for (shard, part) in sealed {
+        shards.entry(shard).or_default().push(part);
+    }
+    futures_util::future::join_all(shards.iter().map(|(shard, parts)| {
+        let (sim, snapshot) = (&sim, &snapshot);
+        async move {
+            let merged = hestia::store::merge_sealed(parts, &BTreeSet::new()).unwrap();
+            sim.publish(snapshot, &shard.root(ROOT), &merged).await;
+        }
+    }))
+    .await;
+    row(
+        &format!("{builders} builders drain, {} shards", shards.len()),
+        t,
+        &net,
+    );
+    let follow = |roots: Vec<String>, previous: Option<Arc<Snapshot>>| {
+        let backend = sim.backend.clone();
+        async move {
+            Snapshot::load(backend, Trust::open(), &roots, previous.as_deref())
+                .await
+                .unwrap()
+        }
+    };
+    let every: Vec<String> = shards.keys().map(|s| s.root(ROOT)).collect();
+    let t = Instant::now();
+    let all = follow(every.clone(), None).await;
+    row("a node takes over all of them", t, &net);
+    let t = Instant::now();
+    let one = follow(every[..1].to_vec(), None).await;
+    row("a node takes over one of them", t, &net);
+    println!(
+        "{:<34} {} and {} paths held",
+        "",
+        all.path_count(),
+        one.path_count()
+    );
+
     // A day in the life of the root: many small drains, a compaction for
     // every four, no GC in between. What do the heads cost by then?
     let history = env("HESTIA_BENCH_HISTORY", 0);
@@ -490,7 +556,7 @@ async fn main() {
             .drain(&snapshot, ROOT, &[&built[0]], &used[..10])
             .await
             .expect("published");
-        snapshot = Arc::new(snapshot.refresh_with(&sealed).await.unwrap());
+        snapshot = Arc::new(snapshot.refresh_with(&[&sealed]).await.unwrap());
         if round % 4 == 3 {
             later += 120;
             snapshot.maybe_compact(ROOT, later, 0.0).await.unwrap();
@@ -515,7 +581,7 @@ async fn main() {
         .drain(&snapshot, ROOT, &[&built[0]], &used[..10])
         .await
         .expect("published");
-    let snapshot = Arc::new(snapshot.refresh_with(&sealed).await.unwrap());
+    let snapshot = Arc::new(snapshot.refresh_with(&[&sealed]).await.unwrap());
     row("drain 1 new, 10 used", t, &net);
     let t = Instant::now();
     let _ = load(Some(snapshot)).await;

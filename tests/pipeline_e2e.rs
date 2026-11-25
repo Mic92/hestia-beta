@@ -464,6 +464,7 @@ async fn small_pack_target_splits_a_drain_into_multiple_packs() {
     let http = reqwest::Client::new();
     let ctx = PipelineContext {
         // Every chunk exceeds the target, so every chunk seals its own pack.
+        sharded: false,
         pack_target_size: 1,
         ..context(&fake, &http, store.database())
     };

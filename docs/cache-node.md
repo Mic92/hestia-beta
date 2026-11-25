@@ -126,12 +126,79 @@ for the next drain.
 
 ### More than one node
 
-Nodes agree only through the bucket. A node serves a path once it has
-loaded the head that names it: at once on the node that published it,
-on any other when it next follows the bucket (`--follow`). A path asked
-for in between is a miss, and whoever asked may build it a second time.
-That is allowed; the rule is only that a node never answers for a path
-it cannot deliver.
+Nodes agree only through the bucket and never talk to each other. What
+makes a lookup arrive where the commit went is the proxy in front of
+them, and for that the store is kept in shards (`--sharded` on every
+daemon and node, `src/shard.rs`).
+
+A sharded store keeps a root in 32 roots, one per first character of
+the store path hash: `main-x86_64-linux.7` holds the paths whose hash
+starts with `7`. The proxy sends everything for one shard to one node,
+by consistent hashing, and to the next node when that one is down. The
+shard is in plain sight on every request:
+
+| Request | Where the proxy reads the shard |
+|---|---|
+| `GET /<hash>.narinfo`, `GET /<hash>.ls` | first character of the path |
+| `GET /nar/<narhash>.nar.zst?hash=<hash>` | first character of `hash` |
+| `POST /hestia/plan`, `PUT /hestia/pack/<key>`, `POST /hestia/commit` | the `x-hestia-shard` header |
+
+No proxy configuration has been tested with this; the tests put two
+nodes side by side and ask each directly.
+
+- **A builder's drain** is split by shard. Each part asks for its plan,
+  hands in its packs and commits with the shard's header, so all three
+  reach one node. Eight parts run at once.
+- **A node's commit round** publishes one head per shard that builders
+  committed to within the interval, all at the same time. A request
+  whose paths lie in two shards is refused.
+- **A node loads a shard at the first request for it** and follows it
+  from then on. It starts with nothing loaded. The node that stands in
+  for a dead one therefore serves what that one published, without
+  having followed it before, and a lost node loses nothing: every
+  commit it answered is in the bucket.
+- **Two nodes holding one shard** do no harm. Each publishes its own
+  heads; a path one of them published is a miss on the other until its
+  next reload.
+
+20 builders finishing at once (`cargo bench --bench cluster`, 100 000
+paths stored, 30 ms a request):
+
+| Each builder built | Store | Time | Requests |
+|---|---|---|---|
+| 1 path | one root | 247 ms | 34 |
+| 1 path | 16 shards touched | 238 ms | 94 |
+| 20 paths | one root | 243 ms | 24 |
+| 20 paths | 32 shards touched | 1904 ms | 498 |
+
+With one path per build the round takes as long as before and costs
+four requests per shard touched. With many paths per build it is much
+worse, because a builder makes a pack per shard: 20 builders with 20
+paths each hand in about 280 packs where they handed in 20. A node
+taking over a shard it never held: 100 ms, as long as following one
+new head.
+
+Not built, and what follows from it:
+
+- A node keeps every shard it was ever asked for. Dropping the ones no
+  request names any more would bound its memory after a failover.
+- A builder that cannot reach any node fails its drain and tries again
+  at the next one. It does not fall back to writing the bucket itself,
+  although a sharded drain without a node works.
+- A plan finds chunks to reuse in the shards the node holds, not in
+  the others. A rebuild of a path under the same name lands in another
+  shard, so with several nodes less of it is found. How much less is
+  not measured.
+- The head listing is one for the whole store. A node that holds one
+  shard still lists the heads of all 32.
+- `/closure` and the build trace answer from the shards the node
+  holds.
+- Packs are per shard only because a commit must reach the node that
+  took its packs. Lifting that would bring the 20-path row back down.
+
+A path asked for before the node that holds its shard has it is a miss,
+and whoever asked may build it a second time. That is allowed; the rule
+is only that a node never answers for a path it cannot deliver.
 
 Each node counts the misses that were early: paths it answered 404 for
 in the last ten minutes that a later load from the bucket brought. It

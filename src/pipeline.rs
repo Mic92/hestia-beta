@@ -166,13 +166,13 @@ pub fn now_unix() -> u64 {
 
 /// Upload one pack. `false` when the backend already had it. Pack keys
 /// are content-addressed, so an existing entry holds identical content.
-/// That case touches the existing pack so its LRU clock and GC's age
+/// That case refreshes the existing pack so its LRU clock and GC's age
 /// guard see this writer's dependency before the head lands.
 pub async fn upload_pack(backend: &Backend, pack: &Pack) -> Result<bool, GhaError> {
     let key = pack.cache_key();
     let created = backend.put(&key, pack.data.clone()).await?;
     if !created {
-        backend.touch(&key).await?;
+        backend.refresh(&key, pack.data.clone()).await?;
     }
     Ok(created)
 }

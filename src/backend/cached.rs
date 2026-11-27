@@ -505,9 +505,9 @@ impl Cached {
     ) -> Result<Option<bool>, Error> {
         let kib = (data.len() as u64).div_ceil(1024);
         if kib > u64::from(self.waiting_kib) {
-            let created = self.put(key, data).await?;
+            let created = self.put(key, data.clone()).await?;
             if !created {
-                self.inner.touch(key).await?;
+                self.inner.refresh(key, data).await?;
             }
             return Ok(Some(created));
         }
@@ -586,8 +586,11 @@ impl Cached {
                     .map_err(|err| err.to_string())??
                 }
             };
-            if !self.inner.put(key, data).await.map_err(|e| e.to_string())? {
-                self.inner.touch(key).await.map_err(|e| e.to_string())?;
+            let created = self.inner.put(key, data.clone()).await;
+            if !created.map_err(|e| e.to_string())? {
+                // Stored by someone who may never have published it.
+                let refreshed = self.inner.refresh(key, data).await;
+                refreshed.map_err(|e| e.to_string())?;
             }
             Ok(())
         }

@@ -103,6 +103,23 @@ impl Backend {
         }
     }
 
+    /// A writer found `key` stored and is about to publish a segment
+    /// that names it: make it count as new to a GC, which deletes what
+    /// no segment names once it is old. A bucket has no clock to reset,
+    /// so the object is written again.
+    pub async fn refresh(&self, key: &str, data: bytes::Bytes) -> Result<(), Error> {
+        match self {
+            Backend::Dir(b) => b.overwrite(key, data).await,
+            Backend::Cached(b) => Box::pin(b.inner.refresh(key, data)).await,
+            Backend::Gha(_) | Backend::Oci(_) => {
+                if !self.touch(key).await? {
+                    self.put(key, data).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// `Ok(None)` if there are more than `limit` entries: a partial listing
     /// proves presence but never absence.
     pub async fn list(

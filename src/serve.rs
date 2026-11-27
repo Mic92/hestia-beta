@@ -513,9 +513,9 @@ impl Daemon {
                 if let Backend::Cached(cached) = backend {
                     return cached.put_behind(&key, body).await;
                 }
-                let created = backend.put(&key, body).await?;
+                let created = backend.put(&key, body.clone()).await?;
                 if !created {
-                    backend.touch(&key).await?;
+                    backend.refresh(&key, body).await?;
                 }
                 Ok::<_, crate::backend::Error>(Some(created))
             };

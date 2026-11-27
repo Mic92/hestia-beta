@@ -432,15 +432,34 @@ impl Gc {
                 sweep.extend(object_keys(d, &Meta::open(&body)?));
             }
         }
-        for l in &objects {
-            if l.created
+        // Where the store keeps a clock a writer can reset, that counts.
+        let old = |l: &Listed| {
+            l.created
+                .max(l.last_accessed)
                 .is_some_and(|c| now.saturating_sub(c) > self.policy.min_age)
-            {
-                sweep.insert(l.key.clone());
+        };
+        // Swept for their age alone: nothing this run looked at names
+        // them. A drain may have found one stored since the listing and
+        // published a segment that names it. It wrote the object again
+        // before that, so these are listed once more and go first, while
+        // that listing is fresh.
+        let mut aged: BTreeSet<String> = BTreeSet::new();
+        for l in objects.iter().filter(|l| old(l)) {
+            if !sweep.contains(&l.key) && !keep.contains(&l.key) {
+                aged.insert(l.key.clone());
             }
         }
+        if !aged.is_empty() {
+            let again = self.backend.list_objects().await?;
+            let still: BTreeSet<&str> = again
+                .iter()
+                .filter(|l| old(l))
+                .map(|l| l.key.as_str())
+                .collect();
+            aged.retain(|key| still.contains(key.as_str()));
+        }
         sweep.extend(record.folded.iter().cloned());
-        for key in sweep.difference(&keep) {
+        for key in aged.iter().chain(sweep.difference(&keep)) {
             if self.delete(key).await? {
                 stats.deleted += 1;
             }

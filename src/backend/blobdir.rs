@@ -319,6 +319,13 @@ impl BlobDir {
         Ok(r.status() != StatusCode::PRECONDITION_FAILED)
     }
 
+    /// Write `key` whether or not it is there, which makes it as young
+    /// as a new object to whoever lists it.
+    pub async fn overwrite(&self, key: &str, data: Bytes) -> Result<(), Error> {
+        self.put_object(key, data, &[]).await?;
+        Ok(())
+    }
+
     async fn put_object(
         &self,
         key: &str,

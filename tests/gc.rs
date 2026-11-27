@@ -540,3 +540,72 @@ async fn a_path_stored_with_two_nar_hashes_serves_both() {
     })
     .await;
 }
+
+/// A drain dies after its upload and leaves a pack no segment names.
+/// Hours later the same path is pushed again, while a GC is at work:
+/// the drain finds the pack stored and does not send it again, and its
+/// head lands after the GC has decided what is live. The GC must not
+/// delete the pack over its age then.
+async fn reuse_a_leftover_pack_while_a_gc_runs(
+    sim: SimCache,
+    set_clock: impl Fn(u64),
+    net: &support::net::Net,
+) {
+    set_clock(T0);
+    // Two segments, so the GC has some to read before it sweeps.
+    let seen = SimPath::new("seen", 1, 100_000);
+    let other = SimPath::new("other", 5, 100_000);
+    sim.push(ROOT, &[&seen], &[&seen]).await;
+    sim.push(ROOT, &[&other], &[&seen, &other]).await;
+    let again = SimPath::new("again", 2, 100_000);
+    let before = sim.snapshot().await;
+    sim.prepare(&before, &[&again], &[]).await.unwrap();
+    let packs = sim.stored_keys("pack-").await;
+    assert_eq!(packs.len(), 3);
+
+    set_clock(T0 + 2 * HOUR);
+    // Slow enough to stop the GC between two requests.
+    net.set_rtt(Duration::from_millis(20));
+    let gc = sim.gc(GcPolicy::default());
+    let run = gc.run(T0 + 2 * HOUR);
+    tokio::pin!(run);
+    // Until its record is out: it has decided what is live, and has
+    // not yet looked at the ages again.
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut run => panic!("the GC was to be stopped half way"),
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+        net.set_rtt(Duration::ZERO);
+        let published = !sim.stored_keys("g-").await.is_empty();
+        net.set_rtt(Duration::from_millis(20));
+        if published {
+            break;
+        }
+    }
+    sim.push(ROOT, &[&again], &[&seen, &again]).await;
+    assert_eq!(sim.stored_keys("pack-").await, packs, "the pack was reused");
+    run.await.unwrap();
+    net.set_rtt(Duration::ZERO);
+    sim.assert_readable(&[&seen, &again]).await;
+}
+
+#[tokio::test]
+async fn a_leftover_pack_reused_while_a_gc_runs_is_kept_in_a_bucket() {
+    timed(async {
+        let s3 = support::fake_s3::FakeS3::start().await;
+        let sim = SimCache::with(s3.backend(), s3.clock());
+        reuse_a_leftover_pack_while_a_gc_runs(sim, |t| s3.set_clock(t), &s3.net).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_leftover_pack_reused_while_a_gc_runs_is_kept_in_the_actions_cache() {
+    timed(async {
+        let (fake, sim) = setup().await;
+        reuse_a_leftover_pack_while_a_gc_runs(sim, |t| fake.set_clock(t), &fake.net).await;
+    })
+    .await;
+}

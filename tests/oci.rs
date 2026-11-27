@@ -378,3 +378,61 @@ async fn gc_over_plain_registry_survives_refused_deletes() {
     })
     .await;
 }
+
+/// A substituter that outlives the job pushing to it (one shared by a
+/// fleet, say) sees a later push only if it relists the heads.
+#[tokio::test]
+async fn serve_reload_interval_picks_up_later_pushes() {
+    timed(async {
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        let (top, dep) = store.add_paths_with_reference("reload");
+        let fake = FakeOci::start().await;
+
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        let socket_dir = tempfile::tempdir().unwrap();
+        let (branch, system) = TEST_ROOT_KEY.split_once('-').unwrap();
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_hestia"))
+            .args(["serve", "--read-only", "--reload-interval", "1"])
+            .args(["--listen", &listen, "--branch", branch, "--system", system])
+            .arg("--socket")
+            .arg(socket_dir.path().join("hook.sock"))
+            .arg("--db-path")
+            .arg(store.db_path())
+            .env("HESTIA_OCI", fake.repo())
+            .env_remove("GITHUB_TOKEN")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let http = reqwest::Client::new();
+        let hash = top.file_name().unwrap().to_str().unwrap()[..32].to_owned();
+        let narinfo = format!("http://{listen}/{hash}.narinfo");
+        let status = || async { http.get(&narinfo).send().await.map(|r| r.status().as_u16()) };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while status().await.is_err() {
+            assert!(std::time::Instant::now() < deadline, "serve never came up");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(status().await.unwrap(), 404);
+
+        // A registry that tags content, so the anonymous reader can list it.
+        pipeline_context_with(fake.plain(&http), store.database())
+            .run(to_path_set(&[&top, &dep]), BTreeSet::new())
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while status().await.unwrap() != 200 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the push never became visible"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        child.kill().await.unwrap();
+    })
+    .await;
+}

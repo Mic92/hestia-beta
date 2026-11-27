@@ -55,6 +55,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub system: Option<String>,
 
+    /// Relist the published heads this often, for a daemon that outlives
+    /// the pushes it serves (a shared substituter rather than a CI job's).
+    #[arg(long, value_name = "SECONDS")]
+    pub reload_interval: Option<u64>,
+
     /// Also serve paths pushed under these branches' roots (same system).
     #[arg(long = "serve-branch", value_name = "BRANCH", default_value = "main")]
     pub serve_branches: Vec<String>,

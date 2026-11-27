@@ -14,6 +14,7 @@ setups, or hacking on hestia).
 | `--branch <NAME>` | `$GITHUB_REF_NAME`, else `local` | Branch part of the root key. |
 | `--system <SYSTEM>` | detected | Nix system part of the root key (e.g. `x86_64-linux`). |
 | `--serve-branch <BRANCH>` | `main` | Also serve what these branches' roots hold (repeatable). |
+| `--reload-interval <SECONDS>` | — | Relist the published heads this often, for a daemon that outlives the pushes it serves (a substituter shared beyond one job). Without it heads are listed at startup only. |
 | `--wait-head <NAME>` | — | Wait up to 60s at startup until this head is listed (matrix build jobs pass the eval job's `head` output). |
 | `--upstream-cache-filter` | off | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
 | `--upstream-cache-key-name <KEY_NAME>` | `cache.nixos.org-1` | Key names treated as upstream caches by the filter. Repeatable. |

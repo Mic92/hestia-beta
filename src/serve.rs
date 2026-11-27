@@ -691,11 +691,20 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         let trust = trust.clone();
         let manifest_store = manifest_store.clone();
         let wait_head = args.wait_head.clone();
+        let reload_interval = args.reload_interval.map(Duration::from_secs);
         tokio::spawn(async move {
             let reload = || load_published(&backend, &trust, &manifest_store, &serve_roots);
             wait_for_head(&manifest_store, wait_head.as_deref(), reload).await;
             let _ = manifest_ready_tx.send(true);
             verify_packs(&backend, &manifest_store, MAX_PACK_VERIFY_ENTRIES).await;
+            let Some(interval) = reload_interval else {
+                return;
+            };
+            loop {
+                tokio::time::sleep(interval).await;
+                reload().await;
+                verify_packs(&backend, &manifest_store, MAX_PACK_VERIFY_ENTRIES).await;
+            }
         })
     };
 

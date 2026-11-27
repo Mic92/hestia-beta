@@ -466,7 +466,7 @@ async fn main() {
         async move { sim.prepare(snapshot, &refs, used).await.expect("sealed") }
     }))
     .await;
-    let merged = hestia::store::merge_sealed(&parts, &BTreeSet::new()).unwrap();
+    let merged = hestia::store::merge_sealed(&parts, &BTreeSet::new(), &BTreeSet::new()).unwrap();
     sim.publish(&snapshot, ROOT, &merged).await;
     row(&format!("{builders} builders drain, one head"), t, &net);
     let t = Instant::now();
@@ -507,7 +507,8 @@ async fn main() {
     futures_util::future::join_all(shards.iter().map(|(shard, parts)| {
         let (sim, snapshot) = (&sim, &snapshot);
         async move {
-            let merged = hestia::store::merge_sealed(parts, &BTreeSet::new()).unwrap();
+            let merged =
+                hestia::store::merge_sealed(parts, &BTreeSet::new(), &BTreeSet::new()).unwrap();
             sim.publish(snapshot, &shard.root(ROOT), &merged).await;
         }
     }))

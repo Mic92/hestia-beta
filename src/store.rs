@@ -630,9 +630,37 @@ impl Snapshot {
     }
 
     pub async fn resolve(&self, hash: &PathHash) -> Result<Option<Resolved>, Error> {
-        let Some((seg, i)) = self.find(hash) else {
-            return Ok(None);
-        };
+        match self.find(hash) {
+            Some((seg, i)) => self.resolve_at(seg, i).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The NAR hash of `hash` as [`Self::lookup`] and so a narinfo name it.
+    pub fn nar_hash_of(&self, hash: &PathHash) -> Option<Hash32> {
+        self.find(hash).map(|(seg, i)| seg.meta.body(i).nar_hash)
+    }
+
+    /// `hash` as stored with `nar_hash`. A derivation that is not
+    /// reproducible, built twice, leaves one path with two NARs in two
+    /// segments. A narinfo named one of them, and nix asks for that one
+    /// for as long as it keeps the narinfo.
+    pub async fn resolve_nar(
+        &self,
+        hash: &PathHash,
+        nar_hash: &Hash32,
+    ) -> Result<Option<Resolved>, Error> {
+        let stored = self.segments.iter().find_map(|s| {
+            let i = s.meta.find(hash)?;
+            (s.meta.body(i).nar_hash == *nar_hash).then_some((&**s, i))
+        });
+        match stored {
+            Some((seg, i)) => self.resolve_at(seg, i).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn resolve_at(&self, seg: &Segment, i: usize) -> Result<Resolved, Error> {
         let node = self.tree(seg).await?.node(i)?;
 
         let mut rows = BTreeSet::new();
@@ -662,10 +690,10 @@ impl Snapshot {
         let tree = to_file_tree(&node, &mut |c| {
             indexes[&c.pack].1.entries[c.chunk as usize].hash
         });
-        Ok(Some(Resolved {
+        Ok(Resolved {
             entry: path_entry(seg.meta.entry(i, node), tree),
             map,
-        }))
+        })
     }
 }
 
@@ -847,10 +875,15 @@ async fn put_compaction(
 
 /// One segment for what several drains sealed, so that a node publishing
 /// for many builders adds one head where they would add one each. `used`
-/// are named as used on top of what the parts name.
-pub fn merge_sealed(parts: &[Sealed], used: &BTreeSet<PathHash>) -> Result<Sealed, Error> {
+/// are named as used on top of what the parts name, and so are
+/// `stored`, whose entries in the parts are left out.
+pub fn merge_sealed(
+    parts: &[Sealed],
+    used: &BTreeSet<PathHash>,
+    stored: &BTreeSet<PathHash>,
+) -> Result<Sealed, Error> {
     let mut opened = Vec::with_capacity(parts.len());
-    let mut uses = used.clone();
+    let mut uses: BTreeSet<PathHash> = used.union(stored).copied().collect();
     for part in parts {
         opened.push((Meta::open(&part.meta)?, Tree::open(&part.tree)?));
         if let Some(bytes) = &part.uses {
@@ -859,7 +892,8 @@ pub fn merge_sealed(parts: &[Sealed], used: &BTreeSet<PathHash>) -> Result<Seale
     }
     let inputs: Vec<(&Meta, &Tree)> = opened.iter().map(|(m, t)| (m, t)).collect();
     let uses: Vec<PathHash> = uses.into_iter().collect();
-    let (sealed, _) = segment::merge(&inputs, &uses, |_, _| true, segment::in_place)?;
+    let keep = |_, hash: &PathHash| !stored.contains(hash);
+    let (sealed, _) = segment::merge(&inputs, &uses, keep, segment::in_place)?;
     Ok(sealed)
 }
 

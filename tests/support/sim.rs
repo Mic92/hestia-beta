@@ -71,6 +71,16 @@ impl SimPath {
             .expect("sim path names are valid store path names")
     }
 
+    /// NAR hash and size, as a drain computes them.
+    pub async fn nar_hash(&self) -> (Hash32, u64) {
+        let (tree, chunks) = self.chunked();
+        let chunks: BTreeMap<ChunkHash, Bytes> =
+            chunks.iter().map(|c| (c.hash, c.data.clone())).collect();
+        nar_hash_from_chunks(&tree, &chunks, &RefTable::new(&[]))
+            .await
+            .expect("nar hash from chunks")
+    }
+
     pub fn chunked(&self) -> (FileTree<ChunkList>, Vec<Chunk>) {
         let mut entries: BTreeMap<String, Box<FileTree<ChunkList>>> = BTreeMap::new();
         let mut chunks: Vec<Chunk> = Vec::new();
@@ -375,7 +385,7 @@ impl SimCache {
         }
     }
 
-    async fn start_substituter(&self, snapshot: Arc<Snapshot>) -> RunningSubstituter {
+    pub async fn start_substituter(&self, snapshot: Arc<Snapshot>) -> RunningSubstituter {
         let manifest_store = ManifestStore::new();
         manifest_store.set_snapshot(snapshot);
         let substituter = Substituter::new(

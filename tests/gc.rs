@@ -5,6 +5,7 @@
 mod support;
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use hestia::gc::{Error as GcError, GcPolicy, SECS_PER_DAY, SECS_PER_HOUR};
@@ -497,6 +498,45 @@ async fn drain_compaction_folds_pending_segments_and_gc_folds_it() {
         assert_eq!(after.view.roots[ROOT].len(), 1);
         sim.assert_readable(&refs).await;
         assert_eq!(sim.stored_keys("seg-").await.len(), 1, "inputs swept");
+    })
+    .await;
+}
+
+/// One path stored with two NAR hashes, as two builders leave it that
+/// built a derivation that is not reproducible and both drained before
+/// they saw the other's push: the NAR of either is served, whichever of
+/// them the narinfo names now.
+#[tokio::test]
+async fn a_path_stored_with_two_nar_hashes_serves_both() {
+    timed(async {
+        let (_fake, sim) = setup().await;
+        let first = SimPath::new("twice", 1, 100_000);
+        let second = SimPath::new("twice", 2, 100_000);
+        assert_eq!(first.path_hash(), second.path_hash());
+        let empty = sim.snapshot().await;
+        for path in [&first, &second] {
+            let sealed = sim.prepare(&empty, &[path], &[]).await.unwrap();
+            sim.publish(&empty, ROOT, &sealed).await;
+        }
+        let snapshot = Arc::new(sim.snapshot().await);
+        let substituter = sim.start_substituter(snapshot.clone()).await;
+        let hash = first.path_hash();
+        let mut served = Vec::new();
+        for path in [&first, &second] {
+            let (nar_hash, _) = path.nar_hash().await;
+            let url = format!(
+                "{}/nar/{}.nar.zst?hash={hash}",
+                substituter.base_url,
+                nar_hash.to_hex()
+            );
+            let answer = sim.http.get(url).send().await.unwrap();
+            assert_eq!(answer.status(), 200);
+            let nar = support::common::nar_body(answer).await;
+            assert_eq!(hestia::manifest::Hash32::digest(&nar), nar_hash);
+            served.push(nar_hash);
+        }
+        assert_ne!(served[0], served[1]);
+        assert!(served.contains(&snapshot.nar_hash_of(&hash).unwrap()));
     })
     .await;
 }

@@ -35,7 +35,7 @@ use crate::node::NodeClient;
 use crate::pathinfo::{Error as PathInfoError, Lookup, PathInfo, StoreDatabase};
 use crate::protocol::DrainStats;
 use crate::refnorm::RefTable;
-use crate::segment::{Sealed, SegmentWriter};
+use crate::segment::{Meta, Sealed, SegmentWriter};
 use crate::shard::Shard;
 use crate::store::{self, Snapshot};
 use crate::substituter::ManifestStore;
@@ -793,16 +793,48 @@ impl PipelineContext {
         }
         let mut merged = Vec::new();
         for (shard, sealed) in &shards {
-            let stored = accessed
+            let used = accessed
                 .iter()
                 .filter(|h| self.sharded.then(|| Shard::of(h)) == *shard)
                 .filter(|h| snapshot.contains(h))
                 .copied()
                 .collect();
-            merged.push((self.root_of(*shard), store::merge_sealed(sealed, &stored)?));
+            let stored = self.stored_differently(&snapshot, sealed).await?;
+            let sealed = store::merge_sealed(sealed, &used, &stored)?;
+            merged.push((self.root_of(*shard), sealed));
         }
         let heads = self.publish_parts(&snapshot, merged).await?;
         Ok(shards.into_keys().zip(heads).collect())
+    }
+
+    /// Paths of `parts` that the store serves with another NAR hash: a
+    /// derivation that is not reproducible, built by two builders that
+    /// both planned before either committed. The first stays, because
+    /// narinfos naming it are out, and nix keeps them for weeks.
+    async fn stored_differently(
+        &self,
+        snapshot: &Snapshot,
+        parts: &[Sealed],
+    ) -> Result<BTreeSet<PathHash>, Error> {
+        let mut stored = BTreeSet::new();
+        for part in parts {
+            let meta = Meta::open(&part.meta).map_err(store::Error::from)?;
+            for i in 0..meta.len() {
+                let hash = meta.hash(i);
+                let differs = snapshot
+                    .nar_hash_of(&hash)
+                    .is_some_and(|nar| nar != meta.body(i).nar_hash);
+                // A path whose pack is gone is pushed again to replace it.
+                let lost = match &self.publish {
+                    Some(publish) => publish.lost(&hash).await,
+                    None => false,
+                };
+                if differs && !lost {
+                    stored.insert(hash);
+                }
+            }
+        }
+        Ok(stored)
     }
 
     /// Publish each of `parts` under its root, serve them, and compact

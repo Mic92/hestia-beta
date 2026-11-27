@@ -132,6 +132,17 @@ impl ManifestView {
         };
         Ok(s.resolve(hash).await?)
     }
+
+    async fn resolve_nar(
+        &self,
+        hash: &PathHash,
+        nar_hash: &Hash32,
+    ) -> Result<Option<Resolved>, FetchError> {
+        let Some(s) = &self.snapshot else {
+            return Ok(None);
+        };
+        Ok(s.resolve_nar(hash, nar_hash).await?)
+    }
 }
 
 /// Shared, replaceable view: the substituter reads it on every request,
@@ -289,6 +300,11 @@ impl ManifestStore {
     pub async fn available(&self, hash: &PathHash) -> bool {
         let view = self.view();
         view.contains(hash) && view.available(hash).await
+    }
+
+    /// Whether a pack `hash` needs is known to be gone.
+    pub async fn lost(&self, hash: &PathHash) -> bool {
+        !self.view().available(hash).await
     }
 
     /// Number of paths currently servable.
@@ -1068,11 +1084,7 @@ async fn nar(
     let mut reloaded = false;
     let (resolved, chunks) = loop {
         let attempt = async {
-            let Some(resolved) = manifest_view
-                .resolve(&path_hash)
-                .await?
-                .filter(|r| r.entry.nar_hash == nar_hash)
-            else {
+            let Some(resolved) = manifest_view.resolve_nar(&path_hash, &nar_hash).await? else {
                 return Ok(None);
             };
             let chunks = state

@@ -67,6 +67,10 @@ pub struct Oci {
     auth: Arc<Mutex<Option<Auth>>>,
     empty_pushed: Arc<OnceCell<bool>>,
     ghcr: Option<Packages>,
+    /// Content manifests carry no tag, so packs cannot be listed by tag.
+    /// True on GHCR whether or not this client holds the token `ghcr` needs:
+    /// anonymous readers of a public package see the same layout.
+    untagged_content: bool,
     /// Loaded and synced on first use, written back by [`Oci::flush`].
     ledger: Arc<OnceCell<tokio::sync::Mutex<Ledger>>>,
 }
@@ -180,8 +184,11 @@ impl Oci {
             return Err(invalid("want <registry>/<repository>"));
         }
         let name = name.trim_end_matches('/');
+        let ghcr =
+            github_api.and_then(|(api, token)| Packages::new(http.clone(), api, name, token));
         Ok(Oci {
-            ghcr: github_api.and_then(|(api, token)| Packages::new(http.clone(), api, name, token)),
+            untagged_content: ghcr.is_some() || host == "ghcr.io",
+            ghcr,
             http,
             no_redirect: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
@@ -227,7 +234,14 @@ impl Oci {
         }
         let (realm, service) = parse_challenge(challenge)
             .ok_or_else(|| Error::InvalidResponse(format!("WWW-Authenticate: {challenge}")))?;
-        let mut q = vec![("scope", format!("repository:{}:pull,push", self.name))];
+        // Without credentials ask for pull only: GHCR denies the whole token
+        // request when an anonymous client asks for push as well.
+        let actions = if self.basic.is_some() {
+            "pull,push"
+        } else {
+            "pull"
+        };
+        let mut q = vec![("scope", format!("repository:{}:{actions}", self.name))];
         if let Some(s) = service {
             q.push(("service", s));
         }
@@ -598,7 +612,7 @@ impl Oci {
         prefix: &str,
         limit: Option<u64>,
     ) -> Result<Option<Vec<Listed>>, Error> {
-        if self.ghcr.is_some() && !matches!(kind(prefix), "" | "g" | "h" | "c") {
+        if self.untagged_content && !matches!(kind(prefix), "" | "g" | "h" | "c") {
             return Ok(None);
         }
         Ok(self.tags(prefix, limit).await?.map(|tags| {

@@ -215,20 +215,35 @@ it, as `envoy-bin`) and skips otherwise. It checks that
   the list, and drains go on;
 - no plan fails while a node stops, and the node gets none afterwards.
 
-The stress test runs builders and readers through Envoy while nodes are
-killed, stopped, restarted, added and taken out of the list at random:
+The stress test runs builders and readers through Envoy while things
+go wrong at random:
 
 ```
 cargo test --release --test envoy stress -- --ignored --nocapture
 ```
 
-`HESTIA_STRESS_SECONDS`, `_NODES`, `_BUILDERS`, `_READERS`, `_PATHS`,
-`_SIZE` and `_SEED` set its scale, `HESTIA_STRESS_QUIET=1` leaves the
-nodes alone, and `HESTIA_STRESS_TIMELINE=1` prints every node event and
-failed drain in order. It fails when an acknowledged path is not served
-with the right bytes within 15 s of being asked for, when a node told
-to stop does not exit cleanly, or when the bucket alone does not have
-every acknowledged path with every chunk in a pack.
+| `HESTIA_STRESS_` | What it sets | Default |
+|---|---|---|
+| `SECONDS`, `NODES`, `BUILDERS`, `READERS`, `PATHS`, `SIZE`, `SEED` | the scale | 20 s, 4, 8, 8, 3000, 2048 bytes a file, 1 |
+| `FAULTS` | what goes wrong, a list: `nodes` (killed, stopped, started, added, taken out of Envoy's list), `pause` (SIGSTOP for up to 3 s), `bucket` (a node's connection to the bucket stalls or is cut for up to 3 s) | all three |
+| `RTT` | latency of the bucket in ms | 0 |
+| `STRAY` | percent of drains sent to a node the proxy would not have picked | 10 |
+| `REPEAT` | percent of drains that push paths another drain pushed or is pushing | 20 |
+| `GC` | a garbage collection every so many seconds, one in three given up half way | off |
+| `CACHE` | size of each node's pack cache | 100G |
+| `TIMELINE` | 1 prints every event and failed drain in order | 0 |
+
+The paths share names and chunks, sixteen names with eight shared files
+each, so a drain finds chunks of other paths stored.
+
+It fails when an acknowledged path is not served with the right bytes
+within 15 s of being asked for, when a node told to stop does not exit
+cleanly, or when the bucket alone does not have every acknowledged path
+with every chunk in a pack. A garbage collection drops what no drain
+named since the one before, so with `GC` an acknowledged path may be
+gone; then a path the proxy has a narinfo for has to be served, what the
+proxy serves and what the bucket has must agree, and every stored path
+needs all its packs.
 
 One run of 30 s on 4 cores: 4 to 6 nodes, 8 builders, 8 readers, 2 KiB
 paths, a fake bucket without latency, 33 node events of which 3 kills
@@ -255,11 +270,59 @@ What the stress test changed in hestia:
   served, took 0.5 to 2 s for that. It now lists once and publishes
   all shards in one round: a stop of an idle node takes 120 to 190 ms.
 
-Seen and left alone: every node rewrites the one head index of the
-store when it publishes, and loses that race to another node a few
-times in a run ("head index changed under us"). The index is rebuilt
-from a listing, so nothing is lost; with many nodes it will be
-rewritten constantly.
+Two faults that lose a path were found while the stress test was
+widened. Neither showed in a random run: each needs one exact order of
+events, and was found by reading for it and then confirmed with a test
+that forces the order.
+
+- **One path, two NAR hashes.** Two builders build a derivation that is
+  not reproducible and both plan before either commits. The store then
+  has the path twice. The NAR handler took the first entry it found and
+  answered 404 when its NAR hash was not the one asked for, so the
+  narinfo that named the other entry, which nix keeps for 30 days, led
+  to a NAR that was gone. The NAR is now looked up by path and NAR
+  hash, and a node that commits a path the store serves with another
+  NAR hash leaves the stored one in place: the first push stays.
+  A compaction or a GC that merges two segments holding both still
+  keeps one of them only.
+- **A leftover pack reused during a GC.** A drain that dies after its
+  upload leaves a pack no segment names, and a GC deletes it once it is
+  older than `min_age`. A later drain of the same path found the pack
+  stored and published a segment naming it. When a running GC had
+  listed the heads before that, it deleted the pack over its age, and
+  the acknowledged path lost its chunks. A writer that finds a pack
+  stored now writes it again before it publishes, which makes it young
+  (a HEAD, as before, changed nothing on a bucket), and the GC lists the
+  objects again after its record is out and deletes for age only what
+  is still old. A reuse between that second listing and the delete is
+  still lost, a matter of a few requests instead of the whole run: a
+  bucket has no delete that is conditional on age.
+
+Seen and left alone:
+
+- Every node rewrites the one head index of the store when it
+  publishes, and loses that race to another node a few times in a run
+  ("head index changed under us"). The index is rebuilt from a listing,
+  so nothing is lost; with many nodes it will be rewritten constantly.
+- A node that cannot reach the bucket still passes its health check,
+  so Envoy keeps sending it its shards. Requests to the bucket have a
+  connect timeout and no other, so over a connection that stalls a
+  drain or a first read of a shard waits until the bucket answers
+  again. Reads of what the node has on disk go on.
+- A commit round costs about nine round trips to the bucket, one after
+  the other: a listing with the compaction records, the segment's
+  three objects, the head, a HEAD and a PUT of the head index, and a
+  second listing to serve what was published. With the bucket 30 ms
+  away that is 270 ms a round and 0.9 s a drain, where the same load
+  takes 0.26 s a drain with no latency (8 builders, nodes left alone).
+  Rounds of one node run one after the other.
+- Every listing fetches every compaction record again, 17 GETs a
+  listing in that run, although a record never changes under its name.
+- A GC of 3000 small paths in 32 shards took 5 to 11 s against a
+  bucket without latency. It reads and deletes one object at a time.
+- The GC command compares the bucket's timestamps with the clock of
+  the machine it runs on. A clock an hour ahead makes every pack of a
+  drain in flight look old enough to delete. Not tested.
 
 Not built, and what follows from it:
 

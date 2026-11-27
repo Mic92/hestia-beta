@@ -185,6 +185,45 @@ async fn pull_only_credentials_read_but_cannot_write() {
     .await;
 }
 
+/// GHCR refuses a token to an anonymous client that asks for push, so a
+/// reader without credentials must ask for pull alone.
+#[tokio::test]
+async fn anonymous_reads_where_push_scope_is_denied() {
+    timed(async {
+        let fake = FakeOci::start().await;
+        fake.strict_anonymous();
+        let http = reqwest::Client::new();
+        let data = Bytes::from_static(b"blob");
+        fake.backend(&http)
+            .put(&key("seg", &data), data.clone())
+            .await
+            .unwrap();
+        let ro = fake.anonymous(&http);
+        assert_eq!(
+            ro.get(&key("seg", &data), None).await.unwrap().unwrap(),
+            data
+        );
+        assert!(!ro.probe_writable().await.unwrap());
+    })
+    .await;
+}
+
+/// GHCR content manifests are untagged also for a reader without the
+/// packages API token, so packs must not be listed (and found missing) by tag.
+#[tokio::test]
+async fn anonymous_ghcr_reader_does_not_list_packs_by_tag() {
+    let anonymous = hestia::backend::Backend::Oci(
+        hestia::backend::oci::Oci::new(
+            "ghcr.io/owner/repo/hestia",
+            None,
+            None,
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    assert!(anonymous.list("pack-", None).await.unwrap().is_none());
+}
+
 /// htpasswd registries (distribution, Nexus) challenge with Basic and
 /// have no token service.
 #[tokio::test]

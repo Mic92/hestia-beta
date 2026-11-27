@@ -53,6 +53,9 @@ struct Inner {
     requests: u64,
     tag_lag: u64,
     deny_push: bool,
+    /// GHCR's token endpoint: an anonymous request for push is denied
+    /// outright instead of being narrowed to pull.
+    strict_anonymous: bool,
     /// htpasswd-style registry: Basic challenge, no token service.
     basic_only: bool,
     /// Every blob GET as (digest, Range header).
@@ -212,7 +215,13 @@ async fn token(
 ) -> Response {
     let wants_push = q.scope.as_deref().is_some_and(|s| s.contains("push"));
     let authed = basic_ok(&headers);
-    let deny = state.inner.lock().unwrap().deny_push;
+    let (deny, strict) = {
+        let inner = state.inner.lock().unwrap();
+        (inner.deny_push, inner.strict_anonymous)
+    };
+    if wants_push && !authed && strict {
+        return error(StatusCode::FORBIDDEN, "DENIED");
+    }
     // Like registries do: grant the subset the caller is entitled to.
     let t = if wants_push && authed && !deny {
         PUSH_TOKEN
@@ -612,6 +621,11 @@ impl FakeOci {
 
     pub fn basic_only(&self) {
         self.inner.lock().unwrap().basic_only = true;
+    }
+
+    /// Token endpoint denies anonymous requests that ask for push, as GHCR does.
+    pub fn strict_anonymous(&self) {
+        self.inner.lock().unwrap().strict_anonymous = true;
     }
 
     /// Token endpoint hands out pull-only tokens whatever the credentials.

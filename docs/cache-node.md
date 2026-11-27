@@ -260,6 +260,20 @@ remain are drains cut off by a kill (5) and drains planned at one node
 and committed at another after their shard moved (12). A read answered
 late got a miss or an error first; the slowest took 177 ms.
 
+Runs of 40 s with the wider set of faults, after the fixes below. None
+broke a rule.
+
+| Run | Drains | Failed attempts | Reads | Answered late | Slowest drain |
+|---|---|---|---|---|---|
+| All faults, seed 7 | 419 | 21 | 16 647 | 54 | 6.1 s |
+| All faults, 40 % stray and 50 % repeated drains, seed 8 | 561 | 35 | 20 130 | 49 | 6.9 s |
+| All faults, bucket 30 ms away, seed 9 | 149 | 38 | 26 969 | 63 | 7.7 s |
+| Node faults and a GC every 4 s, seed 5 | 1031 | 102 | 36 229 | 14 | 2.9 s |
+| Node faults, a GC, 400 KiB files, 8 MiB pack cache, seed 3 | 191 | 26 | 1 724 | 2 | 1.5 s |
+
+A drain or a read that takes seconds waited for a paused node or for a
+node whose bucket was gone, both of which come back after 3 s here.
+
 What the stress test changed in hestia:
 
 - A stopping node used to take plans until it exited and then dropped

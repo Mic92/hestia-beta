@@ -2,14 +2,20 @@
 //! --sharded` processes as cache nodes, a real Envoy in front of them
 //! (`tests/fixtures/envoy.yaml`), and the fake bucket behind them.
 //!
-//! Nodes can be killed, stopped, started again and taken in and out of
-//! Envoy's node list while builders drain and readers fetch through the
+//! Nodes can be killed, stopped, paused, started again and taken in and
+//! out of Envoy's node list, and each node's connection to the bucket can
+//! be stalled or cut, while builders drain and readers fetch through the
 //! proxy.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::watch;
 
 use hestia::node::NodeClient;
 use hestia::pipeline::PipelineContext;
@@ -34,6 +40,66 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// A node's connection to the bucket.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Link {
+    Open,
+    /// Nothing gets through and nothing is closed: requests hang.
+    Stalled,
+    /// Connections are closed, new ones at once.
+    Cut,
+}
+
+/// What a node reaches the bucket through.
+struct Gate {
+    port: u16,
+    link: Arc<watch::Sender<Link>>,
+}
+
+impl Gate {
+    async fn start(upstream: String) -> Gate {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let link = Arc::new(watch::channel(Link::Open).0);
+        let state = link.clone();
+        tokio::spawn(async move {
+            while let Ok((near, _)) = listener.accept().await {
+                if *state.borrow() == Link::Cut {
+                    continue;
+                }
+                let Ok(far) = tokio::net::TcpStream::connect(&upstream).await else {
+                    continue;
+                };
+                let (near_read, near_write) = near.into_split();
+                let (far_read, far_write) = far.into_split();
+                tokio::spawn(pump(near_read, far_write, state.subscribe()));
+                tokio::spawn(pump(far_read, near_write, state.subscribe()));
+            }
+        });
+        Gate { port, link }
+    }
+}
+
+async fn pump(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, mut link: watch::Receiver<Link>) {
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = tokio::select! {
+            read = from.read(&mut buffer) => read,
+            _ = link.wait_for(|l| *l == Link::Cut) => return,
+        };
+        let Ok(n @ 1..) = read else {
+            return;
+        };
+        match link.wait_for(|l| *l != Link::Stalled).await {
+            Ok(now) if *now == Link::Open => {}
+            _ => return,
+        }
+        if to.write_all(&buffer[..n]).await.is_err() {
+            return;
+        }
+    }
+}
+
 /// One `hestia serve --sharded` process. It keeps its port and its pack
 /// cache directory over restarts.
 pub struct Node {
@@ -41,6 +107,8 @@ pub struct Node {
     pub port: u16,
     dir: PathBuf,
     starts: u32,
+    gate: Gate,
+    pub paused: bool,
 }
 
 impl Node {
@@ -50,6 +118,15 @@ impl Node {
 
     pub fn running(&self) -> bool {
         self.child.is_some()
+    }
+
+    pub fn link(&self) -> Link {
+        *self.gate.link.borrow()
+    }
+
+    /// Running, not paused, and reaching the bucket.
+    pub fn well(&self) -> bool {
+        self.running() && !self.paused && self.link() == Link::Open
     }
 
     /// What the node wrote to stderr, all starts.
@@ -70,6 +147,7 @@ pub struct Cluster {
     pub url: String,
     db_path: PathBuf,
     follow: Option<u64>,
+    arguments: Vec<String>,
     dir: tempfile::TempDir,
     pub http: reqwest::Client,
 }
@@ -92,6 +170,16 @@ impl Cluster {
     /// reloads the shards it holds, in seconds; `None` for never.
     /// `None` when Envoy is not on PATH.
     pub async fn start(nodes: usize, follow: Option<u64>, store: &ScratchStore) -> Option<Self> {
+        Self::start_with(nodes, follow, store, Vec::new()).await
+    }
+
+    /// [`Self::start`] with further arguments to every `hestia serve`.
+    pub async fn start_with(
+        nodes: usize,
+        follow: Option<u64>,
+        store: &ScratchStore,
+        arguments: Vec<String>,
+    ) -> Option<Self> {
         let envoy_bin = which("envoy")?;
         let dir = tempfile::tempdir().unwrap();
         let port = free_port();
@@ -122,8 +210,13 @@ impl Cluster {
             url: format!("http://127.0.0.1:{port}"),
             db_path: store.db_path(),
             follow,
+            arguments,
             dir,
-            http: reqwest::Client::new(),
+            // A paused node answers nothing.
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap(),
         };
         for _ in 0..nodes {
             cluster.add_node().await;
@@ -138,11 +231,14 @@ impl Cluster {
         let index = self.nodes.len();
         let dir = self.dir.path().join(format!("node-{index}"));
         std::fs::create_dir_all(&dir).unwrap();
+        let upstream = self.s3.endpoint().trim_start_matches("http://");
         self.nodes.push(Node {
             child: None,
             port: free_port(),
             dir,
             starts: 0,
+            gate: Gate::start(upstream.to_owned()).await,
+            paused: false,
         });
         self.start_node(index).await;
         index
@@ -167,8 +263,12 @@ impl Cluster {
             .arg(&self.db_path)
             .arg("--pack-cache")
             .arg(node.dir.join("packs"))
+            .args(&self.arguments)
             .env("HESTIA_S3", self.s3.url())
-            .env("HESTIA_S3_ENDPOINT", self.s3.endpoint())
+            .env(
+                "HESTIA_S3_ENDPOINT",
+                format!("http://127.0.0.1:{}", node.gate.port),
+            )
             .env("AWS_REGION", REGION)
             .env("AWS_ACCESS_KEY_ID", ACCESS_KEY)
             .env("AWS_SECRET_ACCESS_KEY", SECRET_KEY)
@@ -199,6 +299,23 @@ impl Cluster {
         let mut child = self.nodes[index].child.take().expect("node is running");
         child.kill().unwrap();
         child.wait().unwrap();
+        self.nodes[index].paused = false;
+    }
+
+    /// SIGSTOP or SIGCONT: the node stands still, as under a long pause
+    /// of its machine, and goes on where it was.
+    pub fn pause(&mut self, index: usize, paused: bool) {
+        let node = &mut self.nodes[index];
+        let pid = node.child.as_ref().expect("node is running").id() as i32;
+        let signal = if paused { libc::SIGSTOP } else { libc::SIGCONT };
+        // SAFETY: the pid is our own child, not yet waited for.
+        unsafe { libc::kill(pid, signal) };
+        node.paused = paused;
+    }
+
+    /// Change what gets through between a node and the bucket.
+    pub fn set_link(&self, index: usize, link: Link) {
+        self.nodes[index].gate.link.send_replace(link);
     }
 
     /// SIGTERM, and wait until the node has exited by itself.
@@ -228,7 +345,7 @@ impl Cluster {
         std::fs::write(&next, eds(&ports)).unwrap();
         std::fs::rename(&next, self.dir.path().join("eds.yaml")).unwrap();
         self.routed = nodes;
-        if self.routed.iter().any(|&n| self.nodes[n].running()) {
+        if self.routed.iter().any(|&n| self.nodes[n].well()) {
             self.wait_ready().await;
         }
     }
@@ -333,6 +450,40 @@ pub fn add_fixtures(
         })
         .collect();
     // The command line has a length limit.
+    sources
+        .chunks(500)
+        .flat_map(|chunk| store.add_paths(chunk))
+        .collect()
+}
+
+/// How many names the packages of [`add_packages`] share.
+const PACKAGE_NAMES: u64 = 16;
+
+/// The files of package `seed`: one of its own and two out of the eight
+/// that the packages of its name share.
+pub fn package_files(seed: u64, size: usize) -> Vec<Vec<u8>> {
+    let name = seed % PACKAGE_NAMES;
+    let shared = |pick: u64| fixture_data((1 << 40) | (name << 8) | (pick % 8), size);
+    vec![
+        fixture_data(seed, size),
+        shared(seed / PACKAGE_NAMES),
+        shared(seed / PACKAGE_NAMES / 8 + 1),
+    ]
+}
+
+/// Add `count` store paths that share names and chunks, as versions of
+/// a package do: a drain of one finds chunks of the others stored.
+pub fn add_packages(store: &ScratchStore, scratch: &Path, count: u64, size: usize) -> Vec<PathBuf> {
+    let sources: Vec<PathBuf> = (0..count)
+        .map(|seed| {
+            let dir = scratch.join(format!("{seed}/pkg-{}", seed % PACKAGE_NAMES));
+            std::fs::create_dir_all(&dir).unwrap();
+            for (n, file) in package_files(seed, size).iter().enumerate() {
+                std::fs::write(dir.join(format!("file-{n}")), file).unwrap();
+            }
+            dir
+        })
+        .collect();
     sources
         .chunks(500)
         .flat_map(|chunk| store.add_paths(chunk))

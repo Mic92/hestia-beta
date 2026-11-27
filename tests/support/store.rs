@@ -179,6 +179,38 @@ impl ScratchStore {
         paths
     }
 
+    /// Give the one file `file` of `store_path` other contents of the
+    /// same size, as a second build of a derivation that is not
+    /// reproducible does: the same store path with another NAR hash.
+    pub fn rebuild_differently(&self, store_path: &Path, file: &str, contents: &[u8]) {
+        let target = store_path.join(file);
+        let chmod = |mode: &str| {
+            let mut chmod = Command::new("chmod");
+            chmod.arg("-R").arg(mode).arg(store_path);
+            assert!(chmod.status().unwrap().success());
+        };
+        chmod("u+w");
+        assert_eq!(std::fs::read(&target).unwrap().len(), contents.len());
+        std::fs::write(&target, contents).unwrap();
+        chmod("a-w");
+        let dump = self
+            .nix_store_cmd()
+            .arg("--dump")
+            .arg(store_path)
+            .output()
+            .expect("running nix-store --dump failed");
+        assert!(dump.status.success());
+        let hash = format!("sha256:{}", Hash32::digest(&dump.stdout).to_hex());
+        let db = rusqlite::Connection::open(self.db_path()).unwrap();
+        let changed = db
+            .execute(
+                "update ValidPaths set hash = ?1 where path = ?2",
+                (hash, store_path.to_str().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+
     /// Create a deterministic fixture tree (multi-chunk blob, executable,
     /// symlink, empty file) and add it to the store.
     ///

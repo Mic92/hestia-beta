@@ -368,6 +368,18 @@ impl FakeS3 {
         self.inner.lock().unwrap().clock = t;
     }
 
+    /// Keep the clock at the time of day from now on, as a garbage
+    /// collection running beside real nodes needs it.
+    pub fn follow_the_clock(&self) {
+        let inner = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            while let Some(inner) = inner.upgrade() {
+                inner.lock().unwrap().clock = hestia::pipeline::now_unix();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+    }
+
     pub fn clock(&self) -> Clock {
         let inner = self.inner.clone();
         Arc::new(move || inner.lock().unwrap().clock)
